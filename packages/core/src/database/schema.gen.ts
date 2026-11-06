@@ -1,9 +1,16 @@
+// 从 effect 导入 Effect：用于以函数式效果（effect）风格编排建表逻辑
 import { Effect } from "effect"
+// 仅导入类型 DatabaseMigration：数据库迁移（migration）的定义接口
 import type { DatabaseMigration } from "./migration.js"
 
+// schema：初始建表（bootstrap schema）定义——省略 id 字段，
+// 因为引导建表不算一次增量迁移，只复用其 up 逻辑
 const schema: Omit<DatabaseMigration.Migration, "id"> = {
+  // up：在单个事务（transaction）中一次性创建全部表与索引
   up(tx) {
+    // 用 Effect.gen 以生成器（generator）写法串联多条 SQL 操作
     return Effect.gen(function* () {
+      // 执行 SQL：创建 account_state（账户状态）表，记录当前激活的账户与组织
       yield* tx.run(`
         CREATE TABLE \`account_state\` (
           \`id\` integer PRIMARY KEY,
@@ -12,6 +19,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_account_state_active_account_id_account_id_fk\` FOREIGN KEY (\`active_account_id\`) REFERENCES \`account\`(\`id\`) ON DELETE SET NULL
         );
       `)
+      // 创建 account（账户）表：邮箱、站点地址与访问/刷新令牌（token）信息
       yield* tx.run(`
         CREATE TABLE \`account\` (
           \`id\` text PRIMARY KEY,
@@ -24,6 +32,8 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`time_updated\` integer NOT NULL
         );
       `)
+      // 创建 control_account（控制端账户）表：以 (email, url) 为复合主键，
+      // 存放控制平面账户的令牌与激活标记
       yield* tx.run(`
         CREATE TABLE \`control_account\` (
           \`email\` text NOT NULL,
@@ -37,6 +47,8 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`control_account_pk\` PRIMARY KEY(\`email\`, \`url\`)
         );
       `)
+      // 创建 credential（凭据）表：按集成（integration）或连接器
+      // （connector）存放认证凭据值
       yield* tx.run(`
         CREATE TABLE \`credential\` (
           \`id\` text PRIMARY KEY,
@@ -50,6 +62,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`time_updated\` integer NOT NULL
         );
       `)
+      // 创建 event_sequence（事件序列）表：按聚合（aggregate）记录事件序号
       yield* tx.run(`
         CREATE TABLE \`event_sequence\` (
           \`aggregate_id\` text PRIMARY KEY,
@@ -57,6 +70,8 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`owner_id\` text
         );
       `)
+      // 创建 event（事件）表：事件溯源（event sourcing）的事件存储，
+      // 外键关联序列表并级联删除
       yield* tx.run(`
         CREATE TABLE \`event\` (
           \`id\` text PRIMARY KEY,
@@ -68,6 +83,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_event_aggregate_id_event_sequence_aggregate_id_fk\` FOREIGN KEY (\`aggregate_id\`) REFERENCES \`event_sequence\`(\`aggregate_id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 job（后台任务）表：以通知标识为主键的任务及其恢复上下文
       yield* tx.run(`
         CREATE TABLE \`job\` (
           \`notification_id\` text PRIMARY KEY,
@@ -84,6 +100,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`time_updated\` integer NOT NULL
         );
       `)
+      // 创建 kv（键值存储）表：通用键值对存储
       yield* tx.run(`
         CREATE TABLE \`kv\` (
           \`key\` text PRIMARY KEY,
@@ -92,6 +109,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`time_updated\` integer NOT NULL
         );
       `)
+      // 创建 permission（权限）表：项目级权限规则
       yield* tx.run(`
         CREATE TABLE \`permission\` (
           \`id\` text PRIMARY KEY,
@@ -103,6 +121,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_permission_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 project_directory（项目目录）表：项目关联的目录与策略
       yield* tx.run(`
         CREATE TABLE \`project_directory\` (
           \`project_id\` text NOT NULL,
@@ -114,6 +133,8 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_project_directory_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 project（项目）表：工作树位置、版本控制信息、图标、
+      // 各类时间戳与沙箱（sandbox）/命令配置
       yield* tx.run(`
         CREATE TABLE \`project\` (
           \`id\` text PRIMARY KEY,
@@ -132,6 +153,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`commands\` text
         );
       `)
+      // 创建 schedule（定时计划）表：会话的定时触发规则与执行统计
       yield* tx.run(`
         CREATE TABLE \`schedule\` (
           \`id\` text PRIMARY KEY,
@@ -158,6 +180,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_schedule_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 blob_ref（内容块引用）表：消息对二进制内容块的引用关系
       yield* tx.run(`
         CREATE TABLE \`blob_ref\` (
           \`session_id\` text NOT NULL,
@@ -169,6 +192,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_blob_ref_hash_blob_hash_fk\` FOREIGN KEY (\`hash\`) REFERENCES \`blob\`(\`hash\`) ON DELETE CASCADE
         );
       `)
+      // 创建 blob（二进制大对象）表：按哈希去重的附件内容
       yield* tx.run(`
         CREATE TABLE \`blob\` (
           \`hash\` text PRIMARY KEY,
@@ -180,12 +204,15 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`time_created\` integer NOT NULL
         );
       `)
+      // 创建 instruction_blob（指令内容块）表：按哈希去重的指令正文
       yield* tx.run(`
         CREATE TABLE \`instruction_blob\` (
           \`hash\` text PRIMARY KEY,
           \`value\` text
         );
       `)
+      // 创建 instruction_entry（指令条目）表：会话引用的指令键值，
+      // removed 标记删除（墓碑记录）
       yield* tx.run(`
         CREATE TABLE \`instruction_entry\` (
           \`session_id\` text NOT NULL,
@@ -198,6 +225,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_instruction_entry_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 instruction_state（指令状态）表：会话指令纪元的同步进度与取值
       yield* tx.run(`
         CREATE TABLE \`instruction_state\` (
           \`session_id\` text PRIMARY KEY,
@@ -208,6 +236,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_instruction_state_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 session_inbox（会话收件箱）表：待投递给会话的消息队列
       yield* tx.run(`
         CREATE TABLE \`session_inbox\` (
           \`id\` text PRIMARY KEY,
@@ -220,6 +249,8 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_session_inbox_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 session_message（会话消息）表：消息投影（projection）存储，
+      // seq 为聚合内顺序号
       yield* tx.run(`
         CREATE TABLE \`session_message\` (
           \`id\` text PRIMARY KEY,
@@ -232,6 +263,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_session_message_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 session_part（消息分片）表：消息内容的分片存储
       yield* tx.run(`
         CREATE TABLE \`session_part\` (
           \`message_id\` text NOT NULL,
@@ -247,6 +279,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_session_part_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 session_v2（第二代会话）表：会话的完整元数据、用量统计与运行状态
       yield* tx.run(`
         CREATE TABLE \`session_v2\` (
           \`id\` text PRIMARY KEY,
@@ -289,6 +322,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_session_v2_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 workspace（工作区）表：提供方与绑定（binding）信息
       yield* tx.run(`
         CREATE TABLE \`workspace\` (
           \`id\` text PRIMARY KEY,
@@ -298,6 +332,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`last_used_at\` integer NOT NULL
         );
       `)
+      // 创建 worktree（工作树）表：项目的工作树目录与策略
       yield* tx.run(`
         CREATE TABLE \`worktree\` (
           \`project_id\` text NOT NULL,
@@ -308,42 +343,63 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_worktree_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      // 创建 event 表的 (aggregate_id, seq) 唯一索引：保证事件序号不重复
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
+      // 创建 event 表的 (aggregate_id, type, seq) 索引：按类型读取事件流
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
+      // 创建 job 表按 session_id 查询的索引
       yield* tx.run(`CREATE INDEX \`job_session_idx\` ON \`job\` (\`session_id\`);`)
+      // 创建 job 表按 child_session_id（子会话）反查的索引
       yield* tx.run(`CREATE INDEX \`job_child_session_idx\` ON \`job\` (\`child_session_id\`);`)
+      // 创建 job 表按自身 id 查询的索引
       yield* tx.run(`CREATE INDEX \`job_id_idx\` ON \`job\` (\`id\`);`)
+      // 创建 permission 表的唯一索引：防止同一项目下重复的权限规则
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )
+      // 创建 schedule 表按 session_id 查询的索引
       yield* tx.run(`CREATE INDEX \`schedule_session_idx\` ON \`schedule\` (\`session_id\`);`)
+      // 创建 schedule 表的到期扫描部分索引：仅覆盖激活且有下次到期时间的行
       yield* tx.run(
         `CREATE INDEX \`schedule_due_idx\` ON \`schedule\` (\`next_due_at\`) WHERE "schedule"."status" = 'active' and "schedule"."next_due_at" is not null;`,
       )
+      // 创建 blob_ref 表按 hash 反查引用的索引
       yield* tx.run(`CREATE INDEX \`blob_ref_hash_idx\` ON \`blob_ref\` (\`hash\`);`)
+      // 创建 blob_ref 表按会话顺序读取的索引
       yield* tx.run(`CREATE INDEX \`blob_ref_session_seq_idx\` ON \`blob_ref\` (\`session_id\`,\`seq\`);`)
+      // 创建 session_inbox 表按投递方式取件的索引
       yield* tx.run(
         `CREATE INDEX \`session_inbox_session_delivery_seq_idx\` ON \`session_inbox\` (\`session_id\`,\`delivery\`,\`enqueued_seq\`);`,
       )
+      // 创建 session_inbox 表入队序号唯一索引
       yield* tx.run(
         `CREATE UNIQUE INDEX \`session_inbox_session_enqueued_seq_idx\` ON \`session_inbox\` (\`session_id\`,\`enqueued_seq\`);`,
       )
+      // 创建 session_message 表 (session_id, seq) 唯一索引：消息顺序号唯一
       yield* tx.run(
         `CREATE UNIQUE INDEX \`session_message_session_seq_idx\` ON \`session_message\` (\`session_id\`,\`seq\`);`,
       )
+      // 创建 session_message 表按类型有序查询的索引
       yield* tx.run(
         `CREATE INDEX \`session_message_session_type_seq_idx\` ON \`session_message\` (\`session_id\`,\`type\`,\`seq\`);`,
       )
+      // 创建 session_message 表按时间有序查询的索引
       yield* tx.run(
         `CREATE INDEX \`session_message_session_time_created_id_idx\` ON \`session_message\` (\`session_id\`,\`time_created\`,\`id\`);`,
       )
+      // 创建 session_message 表跨会话按时间检索的索引
       yield* tx.run(`CREATE INDEX \`session_message_time_created_idx\` ON \`session_message\` (\`time_created\`);`)
+      // 创建 session_part 表按会话读取分片的索引
       yield* tx.run(
         `CREATE INDEX \`session_part_session_message_idx\` ON \`session_part\` (\`session_id\`,\`message_id\`,\`ordinal\`);`,
       )
+      // 创建 session_v2 表按 project_id 查询的索引
       yield* tx.run(`CREATE INDEX \`session_v2_project_idx\` ON \`session_v2\` (\`project_id\`);`)
+      // 创建 session_v2 表按 workspace_id 查询的索引
       yield* tx.run(`CREATE INDEX \`session_v2_workspace_idx\` ON \`session_v2\` (\`workspace_id\`);`)
+      // 创建 session_v2 表按 parent_id（父会话）查询的索引
       yield* tx.run(`CREATE INDEX \`session_v2_parent_idx\` ON \`session_v2\` (\`parent_id\`);`)
+      // 创建 session_v2 表挂起时间部分索引：仅覆盖仍在挂起的会话
       yield* tx.run(
         `CREATE INDEX \`session_v2_time_suspended_idx\` ON \`session_v2\` (\`time_suspended\`) WHERE "session_v2"."time_suspended" is not null;`,
       )
@@ -351,4 +407,5 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
   },
 }
 
+// 以默认导出（default export）暴露 schema，供迁移引导流程使用
 export default schema
