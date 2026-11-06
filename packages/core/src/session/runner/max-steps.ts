@@ -1,3 +1,4 @@
+// 达到最大步数（max steps）时注入模型的提示词：要求只回复文本总结，禁止任何工具调用
 export const MAX_STEPS_PROMPT = `CRITICAL - MAXIMUM STEPS REACHED
 
 The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.
