@@ -1,11 +1,18 @@
-// Current Session tool presentation grouped by visual family.
+// 会话工具展示（Web 版）：当前会话中各工具调用的 UI 渲染，按视觉形态分组
+// （行内工具、文件读取、diff 补丁、shell 输出、子代理等）。
+// 本模块是 session-ui 的"工具渲染中枢"：接收工具分片（part），解码宽松的输入/元数据，
+// 分派到对应的展示组件；数据容错优先——单字段损坏只丢该字段，不影响整体渲染。
 import {
+  // Component：类组件基类
   Component,
+  // batch：合并多次信号更新
   batch,
+  // createComputed：创建计算信号
   createComputed,
   createEffect,
   createMemo,
   createSignal,
+  // createUniqueId：生成组件内唯一 ID
   createUniqueId,
   For,
   Match,
@@ -13,39 +20,65 @@ import {
   onMount,
   Show,
   Switch,
+  // Index：按索引渲染列表
   Index,
   on,
+  // untrack：脱离响应式追踪执行读取
   untrack,
   type JSX,
 } from "solid-js"
+// createStore：细粒度可变状态对象
 import { createStore } from "solid-js/store"
+// createResizeObserver：监听 DOM 尺寸变化
 import { createResizeObserver } from "@solid-primitives/resize-observer"
+// effect 库：Effect 组合、Option 可选值、Schema 校验
 import { Effect, Option, Schema } from "effect"
+// diff 库：两文件 patch 生成与逐行 diff
 import { createTwoFilesPatch, diffLines } from "diff"
+// Dynamic：动态渲染 HTML 标签或组件
 import { Dynamic } from "solid-js/web"
+// 会话数据上下文与摘要类型
 import { type SessionSummary, useData } from "../context"
+// 文件组件上下文（可替换的文件链接渲染）
 import { useFileComponent } from "@opencode/ui/context/file"
+// i18n 上下文与类型
 import { type UiI18n, useI18n } from "@opencode/ui/context/i18n"
+// BasicTool/GenericTool：工具行与通用工具的基座组件
 import { BasicTool, GenericTool } from "../components/basic-tool"
+// createDisclosure：展开/收起状态
 import { createDisclosure } from "../components/disclosure"
+// FileIcon/Icon：文件图标与通用图标
 import { FileIcon } from "@opencode/ui/file-icon"
 import { Icon } from "@opencode/ui/icon"
+// ToolErrorCard：工具错误卡片
 import { ToolErrorCard } from "../components/tool-error-card"
+// DiffChanges：增删行数统计徽标
 import { DiffChanges } from "@opencode/ui/diff-changes"
+// Markdown 渲染与图片提取、图片预览
 import { Markdown } from "../components/markdown"
 import { createMarkdownImages } from "../components/markdown-image"
 import { createImagePreview } from "../components/image-preview"
+// markdown 渲染上下文
 import { useMarkdown } from "../context/markdown"
+// 路径工具：取目录/文件名
 import { getDirectory, getFilename } from "@opencode/util/path"
+// checksum：内容校验和（缓存键）
 import { checksum } from "@opencode/util/encode"
+// Tooltip 与对话框系列组件
 import { Tooltip } from "@opencode/ui/tooltip"
 import { useDialog } from "@opencode/ui/context/dialog"
 import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode/ui/dialog"
+// IconButton：图标按钮
 import { IconButton } from "@opencode/ui/icon-button"
+// TextShimmer：微光加载占位
 import { TextShimmer } from "@opencode/ui/text-shimmer"
+// AnimatedNumber：数字滚动动画
 import { AnimatedNumber } from "@opencode/ui/animated-number"
+// apply-patch 文件分组与变更 diff
 import { changedFileDiff, patchFileGroups } from "../components/apply-patch-file"
+// animate：弹簧动画
 import { animate } from "@kitlangton/solid-motion"
+// 会话进度指示器（V2 设计）
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 import type {
   FileDiffInfo,
@@ -54,21 +87,29 @@ import type {
   SessionMessageShell,
 } from "@opencode/client/promise"
 import {
+  // 工具状态读取器：错误/分组读/输入/元数据/输出
   currentToolError,
   currentToolGroupedRead,
   currentToolInput,
   currentToolMetadata,
   currentToolOutput,
+  // execute 工具的子调用参数/列表/副标题
   executeToolCallArgs,
   executeToolCalls,
   executeToolSubtitle,
+  // 图片读取路径
   readImagePath,
   type ExecuteToolCall,
 } from "../message/current-tool-state"
+// 助手推理内容组件
 import { AssistantReasoningContent } from "../message/message-content"
+// 复制反馈 hook
 import { createCopyFeedback } from "../components/copy"
+// stripAnsi：去 ANSI 转义
 import { stripAnsi } from "./ansi"
+// createShellFollower：跟随 shell 输出流
 import { createShellFollower } from "./shell-output"
+// 运行状态机：shell/subagent 的运行态与视图映射
 import {
   createShellRunState,
   shellRunProps,
@@ -81,8 +122,10 @@ import {
   type ShellRunEvent,
   type SubagentRunState,
 } from "./run-machine"
+// LinkedText：自动识别链接/文件路径的文本
 import { LinkedText } from "../components/linked-text"
 
+/** ShellSubmessage：shell 工具副标题文本——首次出现时做宽度展开与淡入模糊动画。 */
 function ShellSubmessage(props: { text: string; animate?: boolean }) {
   let widthRef: HTMLSpanElement | undefined
   let valueRef: HTMLSpanElement | undefined
@@ -90,10 +133,12 @@ function ShellSubmessage(props: { text: string; animate?: boolean }) {
   onMount(() => {
     if (!props.animate) return
     requestAnimationFrame(() => {
+      // 宽度从 0 弹簧展开到 auto
       if (widthRef) {
         animate(widthRef, { width: "auto" }, { type: "spring", visualDuration: 0.25, bounce: 0 })
       }
 
+      // 文本值做透明度+模糊淡入
       if (valueRef) {
         valueRef.animate?.(
           { opacity: [0, 1], filter: ["blur(2px)", "blur(0px)"] },
@@ -122,15 +167,16 @@ function ShellSubmessage(props: { text: string; animate?: boolean }) {
   )
 }
 
-// Tool input and metadata are open records shared by every tool. Each field decodes on its own,
-// so a malformed value drops only that field. Plugin tools are untyped at runtime, so a record that
-// is not an object reads as empty instead of failing the render.
+// 工具输入与元数据是所有工具共享的开放记录。每个字段独立解码，
+// 某个字段损坏只会丢弃该字段；插件工具运行时无类型，非对象记录按空处理而不是渲染失败。
 function optional<S extends Schema.ConstraintCodec<unknown, unknown>>(schema: S) {
   const field = Schema.optional(schema)
 
+  // 解码失败的字段返回 none，等于该字段缺失
   return Schema.catchDecoding<typeof field>(() => Effect.succeed(Option.none()))(field)
 }
 
+// toolInput：各工具输入的宽松结构解码器（整体解码失败则回退为空对象）
 const toolInput = Schema.decodeUnknownSync(
   Schema.Struct({
     path: optional(Schema.String),
@@ -153,6 +199,7 @@ const toolInput = Schema.decodeUnknownSync(
   }).pipe(Schema.catchDecoding(() => Effect.succeed(Option.some({})))),
 )
 
+// toolMetadata：工具元数据的宽松结构解码器（provider/shellID/文件列表/诊断等）
 const toolMetadata = Schema.decodeUnknownSync(
   Schema.Struct({
     name: optional(Schema.String),
@@ -175,12 +222,16 @@ type ToolInput = ReturnType<typeof toolInput>
 
 type ToolMetadata = ReturnType<typeof toolMetadata>
 
+// decodeString：未知值安全解为字符串（失败返回 none）
 const decodeString = Schema.decodeUnknownOption(Schema.String)
 
+// decodeQuestion：问题结构 { question: string } 的安全解码
 const decodeQuestion = Schema.decodeUnknownOption(Schema.Struct({ question: Schema.String }))
 
+// decodeAnswer：答案数组（字符串列表）的安全解码
 const decodeAnswer = Schema.decodeUnknownOption(Schema.Array(Schema.String))
 
+// decodeDiagnostic：诊断结构（位置区间 + 消息 + 可选严重级别）的安全解码
 const decodeDiagnostic = Schema.decodeUnknownOption(
   Schema.Struct({
     range: Schema.Struct({ start: Schema.Struct({ line: Schema.Number, character: Schema.Number }) }),
@@ -191,10 +242,12 @@ const decodeDiagnostic = Schema.decodeUnknownOption(
 
 type Diagnostic = Option.Option.Value<ReturnType<typeof decodeDiagnostic>>
 
+// questions：从工具输入解析问题列表（解码失败的问题被丢弃）
 function questions(input: ToolInput) {
   return (input.questions ?? []).flatMap((question) => Option.toArray(decodeQuestion(question)))
 }
 
+// getDiagnostics：按文件路径取诊断，只保留 error 级（severity===1），最多 3 条
 function getDiagnostics(diagnosticsByFile: ToolMetadata["diagnostics"], filePath: string | undefined) {
   if (!filePath) return []
 
@@ -203,6 +256,7 @@ function getDiagnostics(diagnosticsByFile: ToolMetadata["diagnostics"], filePath
     .slice(0, 3)
 }
 
+/** DiagnosticsDisplay：诊断错误列表展示（标签 + 行列位置 + 消息）。 */
 function DiagnosticsDisplay(props: { diagnostics: readonly Diagnostic[] }): JSX.Element {
   const i18n = useI18n()
 
@@ -225,6 +279,8 @@ function DiagnosticsDisplay(props: { diagnostics: readonly Diagnostic[] }): JSX.
   )
 }
 
+// relativizeProjectPath：把绝对路径转为相对项目目录的展示路径。
+// 目录为空/根目录时原样返回；路径即目录本身时返回空串；不在目录前缀下则原样返回。
 function relativizeProjectPath(path: string, directory?: string) {
   if (!path) return ""
 
@@ -236,6 +292,7 @@ function relativizeProjectPath(path: string, directory?: string) {
 
   if (path === directory) return ""
 
+  // 依据目录中出现的分隔符判断平台风格
   const separator = directory.includes("\\") ? "\\" : "/"
   const prefix = directory.endsWith(separator) ? directory : directory + separator
 
@@ -244,6 +301,7 @@ function relativizeProjectPath(path: string, directory?: string) {
   return path.slice(directory.length)
 }
 
+// displayDirectory：取路径的目录部分并相对化（用于展示）
 function displayDirectory(path: string | undefined) {
   const data = useData()
 
@@ -252,6 +310,7 @@ function displayDirectory(path: string | undefined) {
 
 import { resolveFileDiff } from "../components/session-diff"
 
+// taskAgentName：把代理原始名匹配到已知代理列表的显示名；无匹配则首字母大写兜底。
 export function taskAgentName(raw: string | undefined, list?: readonly { name: string }[]) {
   if (!raw) return undefined
   const key = raw.toLowerCase()
@@ -262,11 +321,13 @@ export function taskAgentName(raw: string | undefined, list?: readonly { name: s
   )
 }
 
+// 网页搜索服务商的显示名映射
 const webSearchProviderNames = new Map([
   ["tinyfish", "TinyFish"],
   ["opencode", "OpenCode"],
 ])
 
+// webSearchProviderLabel：服务商名转可读标签（i18n），无服务商时用通用文案
 function webSearchProviderLabel(provider: string | undefined, i18n: ReturnType<typeof useI18n>) {
   if (!provider) return i18n.t("ui.tool.websearch")
   const name = webSearchProviderNames.get(provider) ?? `${provider[0].toUpperCase()}${provider.slice(1)}`
@@ -274,6 +335,7 @@ function webSearchProviderLabel(provider: string | undefined, i18n: ReturnType<t
   return i18n.t("ui.tool.websearch.provider", { provider: name })
 }
 
+// readArgs：把读取的 offset/limit 参数格式化为摘要片段
 function readArgs(input: ToolInput) {
   return [
     ...(input.offset === undefined ? [] : [`offset=${input.offset}`]),
@@ -281,15 +343,17 @@ function readArgs(input: ToolInput) {
   ]
 }
 
+// skillToolName：技能工具的名称——元数据优先，其次输入的 id/name
 function skillToolName(input: ToolInput, metadata: ToolMetadata) {
   return metadata.name ?? input.id ?? input.name
 }
 
+// currentSkillName：从工具分片直接解析技能名
 function currentSkillName(tool: SessionMessageAssistantTool) {
   return skillToolName(toolInput(currentToolInput(tool)), toolMetadata(currentToolMetadata(tool)))
 }
 
-// Context group labels name each tool once; detailed subtitles belong to the tool rows.
+// toolTitle：分组标题只为工具命名一次；详细副标题属于具体的工具行。
 function toolTitle(tool: SessionMessageAssistantTool, i18n: UiI18n) {
   switch (tool.name) {
     case "read":
@@ -305,6 +369,7 @@ function toolTitle(tool: SessionMessageAssistantTool, i18n: UiI18n) {
     case "webfetch":
       return i18n.t("ui.tool.webfetch")
     case "websearch":
+      // 网页搜索带服务商名
       return webSearchProviderLabel(toolMetadata(currentToolMetadata(tool)).provider, i18n)
     case "subagent":
       return i18n.t("ui.tool.agent.default")
@@ -323,10 +388,12 @@ function toolTitle(tool: SessionMessageAssistantTool, i18n: UiI18n) {
     case "skill":
       return i18n.t("ui.tool.skill")
     default:
+      // 未知工具直接显示原始名
       return tool.name
   }
 }
 
+// urls：从文本中提取去重后的 URL 列表（剔除尾部标点）
 function urls(text: string | undefined) {
   if (!text) return []
 
@@ -335,12 +402,14 @@ function urls(text: string | undefined) {
   ]
 }
 
+// sessionLink：会话 ID 转链接（有 href 工厂才生成）
 function sessionLink(id: string | undefined, href?: (id: string) => string | undefined) {
   if (!id) return undefined
 
   return href?.(id)
 }
 
+// taskSession：按描述与父会话 ID 找子代理会话——取最新创建且未归档的匹配项。
 function taskSession(
   description: string | undefined,
   parentID: string | undefined,
@@ -354,12 +423,15 @@ function taskSession(
     .sort((a, b) => (b.time.created ?? 0) - (a.time.created ?? 0))[0]?.id
 }
 
+/** ExaOutput：网页搜索结果输出——展示提取出的链接列表（最多 10 条），余下的可展开。 */
 function ExaOutput(props: { output?: string }) {
   const i18n = useI18n()
   const [showAll, setShowAll] = createSignal(false)
+  // "查看更多"展开后的第一个链接（用于聚焦）
   let firstRevealedRef: HTMLAnchorElement | undefined
   const links = createMemo(() => urls(props.output))
 
+  // 可见链接：默认只显示前 10 条
   const visibleLinks = createMemo(() => {
     const all = links()
 
@@ -411,11 +483,17 @@ function ExaOutput(props: { output?: string }) {
   )
 }
 
+// 上下文分组条目类型：工具分片 / 推理分片（带 id 与流式标记）/ 通知或 shell 或文本（自带渲染函数）
 export type ContextGroupPart =
   | SessionMessageAssistantTool
   | (SessionMessageAssistantReasoning & { id: string; streaming?: boolean })
   | { type: "notice" | "shell" | "text"; id: string; render: () => JSX.Element }
 
+/**
+ * CurrentContextToolGroup：当前上下文工具分组（折叠条）。
+ * 把一次回合中的工具/推理/通知折叠成一行"N used X"，展开后逐条渲染；
+ * 相邻的文件修改/读取/技能调用会聚合展示；运行中显示 Thinking/计时状态。
+ */
 export function CurrentContextToolGroup(props: {
   parts: ContextGroupPart[]
   busy: boolean
@@ -433,12 +511,15 @@ export function CurrentContextToolGroup(props: {
   patchGroupKey?: (tools: SessionMessageAssistantTool[]) => string
 }) {
   const i18n = useI18n()
+  // 纯工具分片列表
   const tools = createMemo(() => props.parts.filter((part) => part.type === "tool"))
 
+  // 是否有进行中的工作：父级忙碌或任一工具在流式/运行
   const pending = createMemo(
     () => props.busy || tools().some((tool) => tool.state.status === "streaming" || tool.state.status === "running"),
   )
 
+  // 分组内出现过的工具名（去重后 i18n 列表化）
   const names = createMemo(() =>
     i18n.list([
       ...new Set(
@@ -452,9 +533,10 @@ export function CurrentContextToolGroup(props: {
   )
 
   const reasoning = createMemo(() => props.parts.flatMap((part) => (part.type === "reasoning" ? [part] : [])))
-  // Thoughts alone are not finished work yet, so the live group reads as Thinking, in place of Working, rather than
-  // "Used 1 Thought".
+  // 只有思考还不算已完成的工作，因此进行中的分组显示 Thinking 而不是 Working，
+  // 也不会显示"用了 1 次思考"。
   const thinking = createMemo(() => props.busy && reasoning().length > 0 && reasoning().length === props.parts.length)
+  // 当前时间信号（驱动思考计时）
   const [now, setNow] = createSignal(Date.now())
 
   createEffect(() => {
@@ -464,6 +546,7 @@ export function CurrentContextToolGroup(props: {
     onCleanup(() => clearInterval(timer))
   })
 
+  // 思考耗时文案（秒/分秒/时分，本地化数字格式）
   const elapsed = createMemo(() => {
     const started = reasoning()[0]?.time?.created
 
@@ -485,6 +568,7 @@ export function CurrentContextToolGroup(props: {
     })
   })
 
+  // 分组标题的拆分：把 i18n 文案拆成 前缀 + 数字 + 中缀 + 标题 + 后缀，便于分段渲染样式
   const label = createMemo(() => {
     const thoughts = reasoning().length
 
@@ -521,10 +605,12 @@ export function CurrentContextToolGroup(props: {
     }
   })
 
+  // 展开时把分片聚合为渲染条目：相邻的文件修改/分组读取/同名技能合并成数组，其余单独成条
   const items = createMemo(() =>
     (props.open ? props.parts : []).reduce<
       (SessionMessageAssistantTool[] | Exclude<ContextGroupPart, SessionMessageAssistantTool>)[]
     >((groups, tool) => {
+      // 非工具条目直接进列表
       if (tool.type !== "tool") {
         groups.push(tool)
 
@@ -533,12 +619,14 @@ export function CurrentContextToolGroup(props: {
 
       const previous = groups.at(-1)
 
+      // 相邻文件修改工具合并
       if (isFileChangeTool(tool) && Array.isArray(previous) && previous[0] && isFileChangeTool(previous[0])) {
         previous.push(tool)
 
         return groups
       }
 
+      // 相邻可分组的读取工具合并
       if (
         currentToolGroupedRead(tool) &&
         Array.isArray(previous) &&
@@ -550,6 +638,7 @@ export function CurrentContextToolGroup(props: {
         return groups
       }
 
+      // 相邻同名技能（非错误）合并
       if (
         tool.name === "skill" &&
         tool.state.status !== "error" &&
@@ -570,6 +659,7 @@ export function CurrentContextToolGroup(props: {
     }, []),
   )
 
+  // 文件修改组的键（供外层 diff 组渲染对齐）
   const patchKeys = createMemo(() => {
     const keys = new Map<SessionMessageAssistantTool, string>()
     items().forEach((item) => {
@@ -583,9 +673,9 @@ export function CurrentContextToolGroup(props: {
 
   let root: HTMLDivElement | undefined
 
+  // change：切换展开状态。从吸顶（stuck）头部收起时，先把视口滚回首部位置，
+  // 否则内容变短会先钳制滚动位置，导致视口停在离分组很远的地方。
   const change = (open: boolean) => {
-    // Collapsing from the stuck header would leave the viewport far below the group, so keep the header in place.
-    // Scroll before collapsing because the shorter content would clamp the scroll position first.
     const trigger = root?.querySelector(':scope > [data-component="collapsible"] > [data-slot="collapsible-trigger"]')
     const stuck = !open && root && trigger ? trigger.getBoundingClientRect().top - root.getBoundingClientRect().top : 0
 
@@ -600,6 +690,7 @@ export function CurrentContextToolGroup(props: {
       data-component="collapsed-tool-group"
       data-timeline-part-ids={props.parts.map((part) => part.id).join(",")}
     >
+      {/* 折叠条本体：眼镜图标 + 状态 + 标题触发行 */}
       <BasicTool
         icon="glasses"
         status={pending() ? "running" : "completed"}
@@ -618,6 +709,7 @@ export function CurrentContextToolGroup(props: {
                   </Show>
                   <Show when={label().count}>
                     {(count) => (
+                      // 数字滚动动画
                       <span data-slot="context-tool-group-count">
                         <AnimatedNumber value={count()} />
                       </span>
@@ -631,6 +723,7 @@ export function CurrentContextToolGroup(props: {
               <Show when={label().title}>
                 {(title) => (
                   <span data-slot="basic-tool-tool-title">
+                    {/* 思考中标题做微光效果 */}
                     <Show when={thinking()} fallback={title()}>
                       <TextShimmer text={title()} active />
                     </Show>
@@ -648,6 +741,7 @@ export function CurrentContextToolGroup(props: {
         <div data-component="context-tool-group-list">
           <Index each={items()}>
             {(item) => {
+              // 三类条目：工具组 / 推理 / 回调渲染
               const group = createMemo(() => {
                 const value = item()
 
@@ -676,6 +770,7 @@ export function CurrentContextToolGroup(props: {
                     <Show
                       when={reasoning()}
                       fallback={
+                        // 回调条目：直接调用其 render 函数
                         <Show when={callback()}>
                           {(part) => <div data-slot="context-tool-group-item">{part().render()}</div>}
                         </Show>
@@ -687,7 +782,7 @@ export function CurrentContextToolGroup(props: {
                             id={part().id}
                             content={part()}
                             streaming={part().streaming ?? false}
-                            // The group already reads as Thinking, so opening it shows the thoughts themselves.
+                            // 分组标题已表达"Thinking"，展开即显示思考内容本身。
                             defaultOpen={thinking() || props.reasoningDefaultOpen}
                             open={props.reasoningOpen?.(part().id)}
                             onOpenChange={(open) => props.onReasoningOpenChange?.(part().id, open)}
@@ -699,6 +794,7 @@ export function CurrentContextToolGroup(props: {
                   }
                 >
                   {(group) => {
+                    // 工具组：以第一个工具为代表
                     const tool = createMemo(() => group()[0]!)
                     const trigger = createMemo(() => currentContextToolTrigger(tool(), i18n))
 
@@ -710,6 +806,7 @@ export function CurrentContextToolGroup(props: {
                       }),
                     )
 
+                    // i18n 文案中的占位标记（用于拆分前后缀）
                     const marker = "__OPENCODE_LOADED_SKILL__"
 
                     const loaded = createMemo(() =>
@@ -721,6 +818,7 @@ export function CurrentContextToolGroup(props: {
                         <Show
                           when={!currentToolGroupedRead(tool())}
                           fallback={
+                            // 可分组的读取：渲染为读取工具组
                             <CurrentReadToolGroup
                               tools={group()}
                               open={props.toolOpen?.(tool().id)}
@@ -740,6 +838,7 @@ export function CurrentContextToolGroup(props: {
                                   <Show
                                     when={isFileChangeTool(tool())}
                                     fallback={
+                                      // 普通单个工具：直接渲染 ToolDisplay
                                       <ToolDisplay
                                         id={tool().id}
                                         tool={tool().name}
@@ -757,6 +856,7 @@ export function CurrentContextToolGroup(props: {
                                       />
                                     }
                                   >
+                                    {/* 文件修改组：渲染文件级折叠组（键前缀保证状态对齐） */}
                                     <CurrentFileToolGroup
                                       tools={group()}
                                       fileOpen={
@@ -773,6 +873,7 @@ export function CurrentContextToolGroup(props: {
                                   </Show>
                                 }
                               >
+                                {/* 多技能加载：显示"Loaded skills: a, b, c"样式行 */}
                                 <div
                                   data-component="tool-loaded-item"
                                   data-timeline-part-ids={group()
@@ -810,6 +911,7 @@ export function CurrentContextToolGroup(props: {
                               </Show>
                             }
                           >
+                            {/* glob/grep/list 组的触发行：标题 + 副标题 + 参数 + 命中数 */}
                             <div data-component="tool-trigger">
                               <div data-slot="basic-tool-tool-trigger-content">
                                 <div data-slot="basic-tool-tool-info">
@@ -857,6 +959,10 @@ export function CurrentContextToolGroup(props: {
   )
 }
 
+/**
+ * CurrentReadToolGroup：读取工具组——一行列出本次读取的多个文件名（含 offset/limit 参数）。
+ * 单行放不下时显示箭头，点击展开完整列表；运行中标题带微光动画。
+ */
 export function CurrentReadToolGroup(props: {
   tools: SessionMessageAssistantTool[]
   open?: boolean
@@ -873,6 +979,7 @@ export function CurrentReadToolGroup(props: {
     props.tools.some((tool) => tool.state.status === "streaming" || tool.state.status === "running"),
   )
 
+  // 每个工具解析出 { id, 文件名, 参数摘要 }
   const files = createMemo(() =>
     props.tools.flatMap((tool) => {
       const input = toolInput(currentToolInput(tool))
@@ -884,6 +991,7 @@ export function CurrentReadToolGroup(props: {
 
   let list: HTMLSpanElement | undefined
 
+  // measure：检测文件名列表是否溢出（scrollWidth > clientWidth）
   const measure = () => {
     if (!list || open()) return
     setState("truncated", list.scrollWidth > list.clientWidth)
@@ -908,6 +1016,7 @@ export function CurrentReadToolGroup(props: {
       aria-expanded={expandable() ? open() : undefined}
       onClick={toggle}
       onKeyDown={(event) => {
+        // 键盘可达：Enter/空格切换展开
         if (event.key !== "Enter" && event.key !== " ") return
         event.preventDefault()
         toggle()
@@ -951,17 +1060,23 @@ export function CurrentReadToolGroup(props: {
   )
 }
 
+/**
+ * CurrentFileToolGroup：文件修改工具组（edit/write/patch）——
+ * 汇总各工具涉及的文件 diff，交给注册的 patch 渲染器统一展示。
+ * 文件信息优先取元数据；元数据缺失时从输入参数现算 patch（edit 的新旧串、write 的全文）。
+ */
 export function CurrentFileToolGroup(props: {
   tools: SessionMessageAssistantTool[]
   fileOpen?: (path: string) => boolean | undefined
   onFileOpenChange?: (path: string, open: boolean) => void
   onSizeChange?: () => void
 }) {
+  // files：带记忆的 memo——增量合并新旧文件条目，避免滚动或局部更新时重建整个列表。
   const files = createMemo((previous: { key: string; toolID: string; value: FileDiffInfo }[]) => {
     const next = props.tools.flatMap((tool) => {
       const files = toolMetadata(currentToolMetadata(tool)).files ?? []
 
-      // Invalid entries render nothing, but metadata files still replace the input-derived preview.
+      // 无效条目不渲染，但元数据里的 files 仍会替换基于输入的预览。
       if (files.length > 0)
         return files.flatMap((value, index) =>
           changedFileDiff(value) ? [{ key: `${tool.id}:${index}`, toolID: tool.id, value }] : [],
@@ -970,6 +1085,7 @@ export function CurrentFileToolGroup(props: {
 
       if (input.path === undefined) return []
 
+      // edit：由新旧字符串现算 diff 与增删行数
       if (tool.name === "edit" && input.oldString !== undefined && input.newString !== undefined) {
         const changes = diffLines(input.oldString, input.newString)
 
@@ -998,6 +1114,7 @@ export function CurrentFileToolGroup(props: {
         ]
       }
 
+      // write：内容全量新增
       if (tool.name !== "write" || !input.content) return []
 
       return [
@@ -1021,6 +1138,7 @@ export function CurrentFileToolGroup(props: {
 
     const result = [
       ...previous.flatMap((entry) => {
+        // 只保留仍属于当前工具集的旧条目
         if (!owners.has(entry.toolID)) return []
         const value = updates.get(entry.key)
 
@@ -1031,6 +1149,7 @@ export function CurrentFileToolGroup(props: {
       ...next.filter((entry) => !existing.has(entry.key)),
     ]
 
+    // 完全一致时返回旧引用，避免下游重渲染
     return result.length === previous.length && result.every((entry, index) => entry === previous[index])
       ? previous
       : result
@@ -1044,6 +1163,7 @@ export function CurrentFileToolGroup(props: {
     props.tools.some((tool) => tool.state.status === "streaming" || tool.state.status === "running"),
   )
 
+  // patch 渲染器：注册了专用组件就用它，否则退回通用渲染
   const render = ToolRegistry.render("patch") ?? GenericTool
 
   const tool = createMemo(() => {
@@ -1074,6 +1194,7 @@ export function CurrentFileToolGroup(props: {
   )
 }
 
+// scrollParent：向上查找最近的可滚动祖先元素
 function scrollParent(element: HTMLElement): HTMLElement | undefined {
   const parent = element.parentElement
 
@@ -1084,10 +1205,12 @@ function scrollParent(element: HTMLElement): HTMLElement | undefined {
   return scrollParent(parent)
 }
 
+// isFileChangeTool：非错误的 edit/write/patch 工具算文件修改类
 function isFileChangeTool(tool: SessionMessageAssistantTool) {
   return tool.state.status !== "error" && (tool.name === "edit" || tool.name === "write" || tool.name === "patch")
 }
 
+// samePatchFile：判断两个文件 diff 信息是否完全一致（引用相等或各字段相等）
 function samePatchFile(a: FileDiffInfo, b: FileDiffInfo) {
   return (
     a === b ||
@@ -1099,6 +1222,7 @@ function samePatchFile(a: FileDiffInfo, b: FileDiffInfo) {
   )
 }
 
+// currentContextToolTrigger：list/glob/grep 组触发行的标题/副标题/参数/命中数
 function currentContextToolTrigger(tool: SessionMessageAssistantTool, i18n: ReturnType<typeof useI18n>) {
   const input = toolInput(currentToolInput(tool))
   const metadata = toolMetadata(currentToolMetadata(tool))
@@ -1128,8 +1252,8 @@ function currentContextToolTrigger(tool: SessionMessageAssistantTool, i18n: Retu
   }
 }
 
-// SAFETY: tool input and metadata are open per-tool records. GenericTool shows arbitrary input keys, and
-// renderers decode the fields they read with `toolInput` and `toolMetadata`.
+// SAFETY: 工具输入与元数据是各工具共享的开放记录。GenericTool 会展示任意输入键，
+// 各渲染器用 `toolInput`/`toolMetadata` 解码自己关心的字段。
 export interface ToolProps {
   // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- see SAFETY above
   input: Record<string, unknown>
@@ -1149,7 +1273,7 @@ export interface ToolProps {
   deferContent?: boolean
   virtualizeDiff?: boolean
   onContentRendered?: () => void
-  /** Paths the patch view lists, without change counts or diffs, instead of `metadata.files`. */
+  /** patch 视图改为列出这些路径（不含变更统计与 diff），替代 `metadata.files`。 */
   pendingFiles?: readonly string[]
   forceOpen?: boolean
   locked?: boolean
@@ -1157,6 +1281,7 @@ export interface ToolProps {
 
 type ToolComponent = Component<ToolProps>
 
+// 工具注册表：名称 -> 渲染组件
 const state: Record<
   string,
   {
@@ -1165,21 +1290,25 @@ const state: Record<
   }
 > = {}
 
+// registerTool：登记工具渲染器
 function registerTool(input: { name: string; render?: ToolComponent }) {
   state[input.name] = input
 
   return input
 }
 
+// getTool：按名称取渲染器
 function getTool(name: string) {
   return state[name]?.render
 }
 
+// ToolRegistry：对外暴露注册与查询
 export const ToolRegistry = {
   register: registerTool,
   render: getTool,
 }
 
+/** FileTool：文件类工具的基座——代码行图标 + 标题 + 文件计数副标题，始终展开。 */
 function FileTool(props: ToolProps & { title: string; count: number; children?: JSX.Element }) {
   const i18n = useI18n()
 
@@ -1203,16 +1332,19 @@ function FileTool(props: ToolProps & { title: string; count: number; children?: 
   )
 }
 
+/** FileAccordionGroup：手风琴组容器——实现 Up/Down/Home/End 的键盘漫游（WAI-ARIA 模式）。 */
 function FileAccordionGroup(props: { children: JSX.Element }) {
   return (
     <div
       data-component="accordion"
       data-scope="apply-patch"
       onKeyDown={(event) => {
+        // 已被处理或带修饰键时不拦截
         if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
 
         if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return
 
+        // 只响应组内的手风琴触发按钮
         if (!(event.target instanceof HTMLButtonElement) || event.target.dataset.slot !== "accordion-trigger") return
 
         if (event.target.closest('[data-component="accordion"]') !== event.currentTarget) return
@@ -1231,6 +1363,7 @@ function FileAccordionGroup(props: { children: JSX.Element }) {
         if (event.key === "Home") return triggers[0]?.focus()
 
         if (event.key === "End") return triggers.at(-1)?.focus()
+        // 环形移动焦点
         triggers[(index + (event.key === "ArrowDown" ? 1 : -1) + triggers.length) % triggers.length]?.focus()
       }}
     >
@@ -1239,6 +1372,7 @@ function FileAccordionGroup(props: { children: JSX.Element }) {
   )
 }
 
+/** FileAccordionItem：单个手风琴项——可粘性吸顶的头部按钮 + 按需渲染的内容区。 */
 function FileAccordionItem(props: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -1289,6 +1423,7 @@ function FileAccordionItem(props: {
   )
 }
 
+/** ToolFileAccordion：工具文件的手风琴包装——文件图标 + 目录/文件名头部，支持延迟挂载内容。 */
 function ToolFileAccordion(props: {
   path: string
   actions?: JSX.Element
@@ -1318,6 +1453,7 @@ function ToolFileAccordion(props: {
               <FileIcon node={{ path: props.path, type: "file" }} />
               <div data-slot="apply-patch-file-name-container">
                 <Show when={props.path.includes("/")}>
+                  {/* \u202A/\u202C：LRM 控制字符包裹目录，防止 RTL 文本反向渲染 */}
                   <span data-slot="apply-patch-directory">{`\u202A${displayDirectory(props.path)}\u202C`}</span>
                 </Show>
                 <span data-slot="apply-patch-filename">{getFilename(props.path)}</span>
@@ -1330,12 +1466,18 @@ function ToolFileAccordion(props: {
           </div>
         }
       >
+        {/* defer 模式下只有首次展开后才挂载内容 */}
         <Show when={!props.defer || disclosure.mounted()}>{props.children}</Show>
       </FileAccordionItem>
     </FileAccordionGroup>
   )
 }
 
+/**
+ * ToolDisplay：单个工具分片的对外渲染入口。
+ * todowrite 不展示；运行中的 question 隐藏；有错误渲染错误卡片（可跳转子代理会话），
+ * 否则交给注册的工具渲染器。
+ */
 export function ToolDisplay(
   props: ToolProps & {
     id: string
@@ -1348,6 +1490,7 @@ export function ToolDisplay(
   if (props.tool === "todowrite") return null
   const hideQuestion = () => props.tool === "question" && (props.status === "streaming" || props.status === "running")
 
+  // 子代理会话 ID（用于错误卡片跳转）
   const taskId = createMemo(() => {
     if (props.tool !== "subagent") return undefined
 
@@ -1374,6 +1517,7 @@ export function ToolDisplay(
             {(error) => {
               const cleaned = error().replace("Error: ", "")
 
+              // 用户关闭的提问：渲染为右侧的弱化文案而不是错误卡
               if (props.tool === "question" && cleaned.includes("dismissed this question")) {
                 return (
                   <div style="width: 100%; display: flex; justify-content: flex-end;">
@@ -1399,6 +1543,7 @@ export function ToolDisplay(
                   subtitle={taskSubtitle() ?? errorSubtitle()}
                   href={taskHref()}
                   onSubtitleClick={(event) => {
+                    // 仅左键且无修饰键时跳转到子代理会话
                     if (!data.navigateToSession) return
 
                     if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
@@ -1421,8 +1566,8 @@ export function ToolDisplay(
   )
 }
 
-// Each branch must stay in sync with its tool trigger's subtitle expression so
-// failed rows read like their non-error counterparts ("Shell sleep 30").
+// toolErrorSubtitle：错误态的副标题。各分支必须与对应工具触发行副标题保持一致，
+// 让失败行看起来与非错误行一致（如 "Shell sleep 30"）。
 function toolErrorSubtitle(props: ToolProps, i18n: UiI18n) {
   const input = toolInput(props.input)
   const metadata = toolMetadata(props.metadata)
@@ -1459,8 +1604,8 @@ function toolErrorSubtitle(props: ToolProps, i18n: UiI18n) {
   return undefined
 }
 
+// toolDisplayError：错误态展示的字符串。execute 的失败已内联在执行调用列表中，不再重复显示。
 function toolDisplayError(props: ToolProps & { error?: string }) {
-  // Code Mode failures render inline in the execution's call list.
   if (props.tool === "execute") return undefined
 
   if (props.status === "error") return props.error
@@ -1468,11 +1613,13 @@ function toolDisplayError(props: ToolProps & { error?: string }) {
   return undefined
 }
 
+// 注册 read 工具渲染：读取的图片内容 + 附加加载文件列表
 ToolRegistry.register({
   name: "read",
   render(props) {
     const data = useData()
     const i18n = useI18n()
+    // 完成态才解析图片路径
     const image = createMemo(() => (props.status === "completed" ? readImagePath(props.input) : undefined))
 
     const loaded = createMemo(() => {
@@ -1481,6 +1628,7 @@ ToolRegistry.register({
       return (toolMetadata(props.metadata).loaded ?? []).flatMap((path) => Option.toArray(decodeString(path)))
     })
 
+    // 相对化展示路径（去掉开头的分隔符）
     const paths = createMemo(() =>
       loaded().map((filepath) => {
         const relative = relativizeProjectPath(filepath, data.directory)
@@ -1564,6 +1712,7 @@ function ReadImage(props: { path: string; onContentRendered?: () => void }) {
   )
 }
 
+// 注册 list 工具渲染：目录列表，输出用 markdown 展示（可滚动区域）
 ToolRegistry.register({
   name: "list",
   render(props) {
@@ -1595,6 +1744,7 @@ ToolRegistry.register({
   },
 })
 
+// 注册 glob 工具渲染：模式匹配的文件列表
 ToolRegistry.register({
   name: "glob",
   render(props) {
@@ -1628,6 +1778,7 @@ ToolRegistry.register({
   },
 })
 
+// 注册 grep 工具渲染：内容搜索（pattern/include 参数）
 ToolRegistry.register({
   name: "grep",
   render(props) {
@@ -1666,6 +1817,7 @@ ToolRegistry.register({
   },
 })
 
+// 注册 webfetch 工具渲染：标题 + 可点击的 URL 链接（新窗口打开）
 ToolRegistry.register({
   name: "webfetch",
   render(props) {
@@ -1706,6 +1858,7 @@ ToolRegistry.register({
   },
 })
 
+// 注册 websearch 工具渲染：搜索查询 + 服务商标题，输出展示为链接列表
 ToolRegistry.register({
   name: "websearch",
   render(props) {
@@ -1731,6 +1884,8 @@ ToolRegistry.register({
   },
 })
 
+// 注册 subagent 工具渲染：子代理卡片——代理名/描述/会话链接，
+// 用状态机区分委托中/运行中/后台/完成等视图。
 ToolRegistry.register({
   name: "subagent",
   render(props) {
@@ -1740,12 +1895,14 @@ ToolRegistry.register({
     const input = createMemo(() => toolInput(props.input))
     const metadata = createMemo(() => toolMetadata(props.metadata))
 
+    // 子代理会话 ID：元数据优先；缺失时按"描述 + 父会话"在会话列表里推断
     const childSessionId = createMemo(
       () => metadata().sessionID || taskSession(input().description, data.sessionID, data.store.session),
     )
 
     const title = createMemo(() => taskAgentName(input().agent, data.store.agent) ?? i18n.t("ui.tool.agent.default"))
 
+    // 运行状态机：结合工具状态与子会话忙碌状态推导
     const run = createMemo((state: SubagentRunState) => {
       const id = childSessionId()
       const childBusy = !!id && (data.store.session_status[id]?.type ?? "idle") !== "idle"
@@ -1779,6 +1936,7 @@ ToolRegistry.register({
     }
 
     const navigate = (event: MouseEvent) => {
+      // 仅左键且无修饰键时跳转
       if (!data.navigateToSession) return
 
       if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
@@ -1846,6 +2004,7 @@ ToolRegistry.register({
   },
 })
 
+/** ConsoleOutput：命令行输出块——命令区与输出区各自带复制按钮，输出支持链接识别。 */
 function ConsoleOutput(props: { command?: string; output: string }) {
   const i18n = useI18n()
 
@@ -1885,7 +2044,7 @@ function ConsoleOutput(props: { command?: string; output: string }) {
   )
 }
 
-// The button sits beside its section's <pre>, not inside it, so selecting and copying text never picks it up.
+// 复制按钮放在区块 <pre> 的旁边而不是内部，这样选择并复制文本时永远不会带上按钮本身。
 function ConsoleCopy(props: { text: string; label: string }) {
   const i18n = useI18n()
   const copy = createCopyFeedback()
@@ -1898,6 +2057,7 @@ function ConsoleCopy(props: { text: string; label: string }) {
           icon={<Icon name={copy.copied() ? "check" : "outline-copy"} size="small" />}
           size="normal"
           variant="ghost-muted"
+          // 阻止按钮获得焦点，避免破坏文本选择
           onMouseDown={(event) => event.preventDefault()}
           onClick={() => copy.copy(props.text)}
           aria-label={label()}
@@ -1907,6 +2067,8 @@ function ConsoleCopy(props: { text: string; label: string }) {
   )
 }
 
+// 注册 execute 工具渲染（Code Mode 脚本执行）：
+// 行内显示脚本标题与子调用列表；运行失败时错误归属到失败的调用行。
 ToolRegistry.register({
   name: "execute",
   render(props) {
@@ -1917,7 +2079,7 @@ ToolRegistry.register({
     const subtitle = createMemo(() => executeToolSubtitle(calls()))
     const code = createMemo(() => (toolInput(props.input).code ?? "").trimEnd())
 
-    // A runtime failure shows its output on the failing row; a successful script shows its result below the calls.
+    // 运行时失败把输出显示在失败行；成功的脚本把结果显示在调用列表下方。
     const error = createMemo(() => {
       if (props.status !== "error" && props.metadata.error !== true) return undefined
       const fallback = i18n.t("ui.toolErrorCard.failed")
@@ -1934,12 +2096,12 @@ ToolRegistry.register({
             .trim(),
     )
 
-    // A runtime failure belongs to the call that raised it; scripts can also fail outside any call.
+    // 运行时失败归属于抛出它的那个调用；脚本也可能在所有调用之外失败。
     const owner = createMemo(() => calls().findLastIndex((call) => call.status === "error"))
 
     const sawPending = pending()
 
-    // The script is complete once the call leaves streaming, so the dialog can show it while it runs.
+    // 调用一旦离开 streaming 脚本就算已成形，对话框可以在运行期间展示它。
     const viewable = () => props.status !== "streaming" && !!code()
 
     const openDetails = () =>
@@ -1994,15 +2156,17 @@ ToolRegistry.register({
   },
 })
 
+// decodeJson：判断文本是否为合法 JSON（决定输出用 json 高亮还是纯文本）
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown))
 
+/** ExecuteDetails：execute 脚本详情对话框——代码区 + 输出/错误区，均带复制按钮。 */
 function ExecuteDetails(props: { code: string; output: string; error?: string; calls: number; status?: string }) {
   const i18n = useI18n()
   const fileComponent = useFileComponent()
   const lineCount = (text: string) => text.split("\n").length
   const lines = (text: string) => i18n.plural("ui.tool.execute.lines", lineCount(text))
 
-  // Code and output share one number gutter, sized to the longer block, so their content starts on the same column.
+  // 代码与输出共用一条行号槽，宽度取较长区块的位数，保证两段内容起始列对齐。
   const numberDigits = () =>
     String(Math.max(lineCount(props.code), props.output && !props.error ? lineCount(props.output) : 0)).length
 
@@ -2051,7 +2215,7 @@ function ExecuteDetails(props: { code: string; output: string; error?: string; c
                       component={fileComponent}
                       mode="text"
                       file={{
-                        // Code Mode returns structured results as JSON; highlight those, leave anything else plain.
+                        // Code Mode 的结构化结果是 JSON，用 json 高亮；其余按纯文本。
                         name: Option.isSome(decodeJson(output())) ? "output.json" : "output.txt",
                         contents: output(),
                         cacheKey: checksum(output()),
@@ -2079,6 +2243,7 @@ function ExecuteDetails(props: { code: string; output: string; error?: string; c
   )
 }
 
+/** ExecuteDetailsSection：详情对话框的单个区块——标签/元信息/复制按钮 + 内容。 */
 function ExecuteDetailsSection(props: {
   label: string
   meta?: string
@@ -2150,15 +2315,18 @@ function ExecuteOutputRow(props: { output: string }) {
   )
 }
 
+/** ExecuteCallRow：execute 的单条子调用行——折叠显示工具名与参数摘要，可展开输入/错误。 */
 function ExecuteCallRow(props: { call?: ExecuteToolCall; error?: string }) {
   const [open, setOpen] = createSignal(false)
   const args = createMemo(() => (props.call ? executeToolCallArgs(props.call) : []))
   const input = createMemo(() => Object.entries(props.call?.input ?? {}))
+  // 无调用（纯错误）或调用出错都算失败
   const failed = () => !props.call || props.call.status === "error"
   const expandable = () => input().length > 0 || !!props.error
   const summary = () => (props.call ? args().join(", ") : props.error?.split("\n", 1)[0])
 
   const toggle = () => {
+    // 有文本选区时不切换（用户在复制内容）
     if (!expandable() || window.getSelection()?.toString()) return
     setOpen((value) => !value)
   }
@@ -2228,12 +2396,15 @@ function ExecuteCallRow(props: { call?: ExecuteToolCall; error?: string }) {
   )
 }
 
+// 注册 shell 工具渲染：用运行状态机管理 写入中/运行中/后台/完成 各阶段，
+// 后台 shell 通过 follower 持续接收输出流。
 ToolRegistry.register({
   name: "shell",
   render(props) {
     const i18n = useI18n()
     const data = useData()
 
+    // 计算当前应由状态机消费的 props（结合 shell 是否仍在注册表中运行）
     const runProps = () =>
       shellRunProps(
         {
@@ -2253,10 +2424,10 @@ ToolRegistry.register({
       if (next !== untrack(run)) setRun(next)
     }
 
-    // Synchronous, so the row never renders a pass with the previous phase.
+    // 同步派发 sync 事件，保证这一行永远不会以旧阶段渲染一帧。
     createComputed(on(runProps, (value) => dispatch({ type: "sync", props: value }), { defer: true }))
     const view = createMemo(() => viewShellRun(run()))
-    // The trigger animates the command in only when the row mounted while the model was still writing it.
+    // 只有当行挂载时模型还在写命令，触发行才播放命令入场动画。
     const animateCommand = untrack(run).status === "writing"
 
     function Output() {
@@ -2321,6 +2492,7 @@ ToolRegistry.register({
   },
 })
 
+/** SessionShellMessage：独立的 shell 消息（用户手动执行）——复用 shell 工具渲染器。 */
 export function SessionShellMessage(props: {
   message: SessionMessageShell
   defaultOpen?: boolean
@@ -2330,6 +2502,7 @@ export function SessionShellMessage(props: {
   const i18n = useI18n()
   const render = ToolRegistry.render("shell") ?? GenericTool
 
+  // 归纳错误文案：超时/被取消/非零退出
   const error = createMemo(() => {
     const message = props.message
 
@@ -2344,6 +2517,7 @@ export function SessionShellMessage(props: {
 
   return (
     <div data-component="session-shell-message" data-timeline-part-id={props.message.id}>
+      {/* 以 shell 工具的形态渲染消息本体 */}
       <Dynamic
         component={render}
         tool="shell"
@@ -2367,6 +2541,7 @@ export function SessionShellMessage(props: {
   )
 }
 
+// 注册 edit 工具渲染：编辑 diff 手风琴（元数据补丁优先，缺失时回退到输入的新旧字符串）
 ToolRegistry.register({
   name: "edit",
   render(props) {
@@ -2381,6 +2556,7 @@ ToolRegistry.register({
 
     const pending = () => props.status === "streaming" || props.status === "running"
 
+    // diff 数据源：只在文件或补丁文本变化时更新，避免中间态抖动
     const diffSource = createMemo(
       () => {
         const source = diff()
@@ -2395,6 +2571,8 @@ ToolRegistry.register({
       },
     )
 
+    // 文件组件 props：能解析补丁就用 fileDiff（部分补丁用简化分隔符），
+    // 解析失败/缺失时退回 before/after 双文本。
     const fileCompProps = createMemo(() => {
       try {
         const source = diffSource()
@@ -2430,6 +2608,7 @@ ToolRegistry.register({
               forceOpen={props.forceOpen}
               defer={props.deferContent !== false}
               actions={
+                // 头部操作区：完成后显示增删行数徽标
                 <Show when={!pending() ? diff() : undefined}>
                   {(diff) => <DiffChanges appearance="standard" changes={diff()} />}
                 </Show>
@@ -2453,6 +2632,7 @@ ToolRegistry.register({
   },
 })
 
+// 注册 write 工具渲染：写入的完整文件内容（文本模式）+ 诊断
 ToolRegistry.register({
   name: "write",
   render(props) {
@@ -2493,6 +2673,8 @@ ToolRegistry.register({
   },
 })
 
+// 注册 patch 工具渲染：多文件补丁手风琴——每个文件一项，
+// 头部显示创建/删除徽标或增删统计，内容为按需挂载的 diff 视图。
 ToolRegistry.register({
   name: "patch",
   render(props) {
@@ -2501,6 +2683,7 @@ ToolRegistry.register({
 
     const files = createMemo(
       () =>
+        // pendingFiles 只是待写入路径清单（无 diff），先造占位条目
         props.pendingFiles?.map((path) => ({
           path,
           type: "update" as const,
@@ -2524,7 +2707,7 @@ ToolRegistry.register({
           <FileAccordionGroup>
             <Index each={files()}>
               {(file) => {
-                // Each file opens on its own: the owner's `fileOpen` controls it, otherwise it keeps its own state.
+                // 每个文件独立开合：有 fileOpen 时受拥有者控制，否则用自身状态。
                 const disclosure = createDisclosure({
                   open: () => (props.fileOpen ? props.fileOpen(file().path) === true : undefined),
                   defer: () => props.deferContent !== false,
@@ -2598,6 +2781,7 @@ ToolRegistry.register({
   },
 })
 
+// 注册 question 工具渲染：提问列表——完成后自动展开显示问答对
 ToolRegistry.register({
   name: "question",
   render(props) {
@@ -2654,6 +2838,7 @@ ToolRegistry.register({
   },
 })
 
+// 注册 skill 工具渲染：技能加载行（"Loaded skill: xx"），加载中显示微光占位
 ToolRegistry.register({
   name: "skill",
   render(props) {
