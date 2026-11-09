@@ -1,9 +1,20 @@
+// 模块职责：时间线（Timeline）的端到端回归测试——验证消息时间线的静态投影、流式更新、
+// 分组/折叠、Working 指示、后台任务、压缩（compaction）、引用（quote）选择与发送等核心行为。
+// 在系统中的位置：packages/app 的 e2e 回归套件，通过 setupTimeline 搭建受控页面并用 transport 注入事件。
+// 关键设计：固定的时间戳/ID 夹具保证可重复；用 data-timeline-* 属性定位；断言文本保持协议原文不变。
+// Playwright 测试 API（expect/test/定位器类型）
 import { expect, test, type Locator, type Page } from "@playwright/test"
+// 客户端的消息/会话类型（助手消息与消息信息）
 import type { SessionMessageAssistant, SessionMessageInfo, ShellInfo } from "@opencode/client/promise"
+// 时间线详情预设（Messages only/Quiet/Compact/Detailed/Everything）
 import { timelinePresets } from "@opencode/session-ui/timeline/detail"
+// diff 库：构造统一的双文件补丁（edit 工具的 metadata 用）
 import { createTwoFilesPatch } from "diff"
+// 草稿工具：读取会话草稿文本（验证草稿已持久化后再刷新）
 import { readSessionDraftText } from "../utils/drafts"
+// 应用工具：holdRoute 阻塞指定路由以制造在途请求
 import { holdRoute } from "../utils/app"
+// 时间线夹具工具：搭建页面、构造各类消息/部件/事件与状态
 import {
   assistantID,
   assistantMessage,
@@ -32,10 +43,13 @@ import {
   userText,
 } from "../utils/timeline"
 
+// "Detailed" 详情预设的配置值（多数测试的时间线设置基线）
 const detailed = timelinePresets[2].value
 
+// 固定的用户消息夹具（多个测试复用）
 const user = { id: "msg_user", type: "user", text: "Run it", time: { created: 1 } } satisfies SessionMessageInfo
 
+// 固定的已完成助手消息夹具（含一条文本部件）
 const completed = {
   id: "msg_assistant",
   type: "assistant",
@@ -45,13 +59,16 @@ const completed = {
   time: { created: 2, completed: 3 },
 } satisfies SessionMessageAssistant
 
+// 静态投影测试组：只验证初始消息投影（不注入事件）
 test.describe("static projection", () => {
   test("renders current protocol notices in CLI order", async ({ page }) => {
+    // 收集 Solid "createRoot 之外创建计算" 的控制台警告（回归保护）
     const ownerWarnings: string[] = []
     page.on("console", (message) => {
       if (message.text().includes("computations created outside a `createRoot` or `render`"))
         ownerWarnings.push(message.text())
     })
+    // 搭建页面：单独放置 notice 行，消息含 agent 切换/子代理结果/重启续传/技能提示
     await setupTimeline(page, {
       settings: { timelineDetail: { ...detailed, notices: { placement: "separate" } } },
       sessionMessages: [
@@ -77,12 +94,14 @@ test.describe("static projection", () => {
       ],
     })
 
+    // 校验 notice 数量、顺序与文本（与 CLI 输出一致）
     const notices = page.locator('[data-slot="session-timeline-notice"]')
     await expect(notices).toHaveCount(4)
     await expect(notices.nth(0)).toHaveText(/^Agent changed\s*Explore$/)
     await expect(notices.nth(1)).toContainText("Explore finished · Search code")
     await expect(notices.nth(2)).toContainText("Continuing after restart")
     await expect(notices.nth(3)).toContainText("Skill · Review")
+    // 每条 notice 都应为弱化样式（faint），没有 base 样式
     await expect(notices).toHaveClass([
       /text-v2-text-text-faint/,
       /text-v2-text-text-faint/,
@@ -90,10 +109,12 @@ test.describe("static projection", () => {
       /text-v2-text-text-faint/,
     ])
     await expect(notices.locator(".text-v2-text-text-base")).toHaveCount(0)
+    // 不允许出现任何所有权警告
     expect(ownerWarnings).toEqual([])
   })
 
   test("projects gaps, dividers, assistant parts, and errors together", async ({ page }) => {
+    // 第一轮用户消息：附 11 个摘要差异（制造 TurnGap）
     const firstUser = userMessage(
       [
         userText("Keep this stable", { id: "prt_comment" }),
@@ -102,17 +123,20 @@ test.describe("static projection", () => {
       { summary: { diffs: Array.from({ length: 11 }, (_, index) => summaryDiff(index)) } },
     )
 
+    // 被用户中止的助手消息
     const aborted = assistantMessage([{ id: "prt_before_abort", type: "text", text: "Before interruption" }], {
       id: "msg_1001_assistant_aborted",
       error: { type: "MessageAbortedError", message: "Stopped" },
     })
 
+    // 提供商报错的助手消息
     const failed = assistantMessage([{ id: "prt_after_abort", type: "text", text: "After interruption" }], {
       id: "msg_1002_assistant_failed",
       error: { type: "APIError", message: "Visible provider failure" },
       created: 1700000003000,
     })
 
+    // 第二轮的用户与助手消息
     const nextUser = userMessage([userText("Second turn", { id: "prt_second_user" })], {
       id: "msg_2000_second_user",
       created: 1700000005000,
@@ -130,17 +154,21 @@ test.describe("static projection", () => {
     })
 
     await timeline.send(status("idle"))
+    // 滚动容器：含时间线行的视口
     const scroller = page.locator(".scroll-view__viewport", { has: page.locator("[data-timeline-row]") })
     await scroller.evaluate((element) => (element.scrollTop = 0))
 
+    // 顶部应有一个回合分隔线；中断与失败文本可见
     await expect(page.locator('[data-timeline-row="TurnDivider"]')).toHaveCount(1)
     await expect(page.getByText("Before interruption", { exact: true })).toBeVisible()
     await expect(page.getByText("Visible provider failure")).toBeVisible()
+    // 滚到底部：回合间隙（TurnGap）可见
     await scroller.evaluate((element) => (element.scrollTop = element.scrollHeight))
     await expect(page.locator('[data-timeline-row="TurnGap"]')).toBeVisible()
   })
 
   test("does not repeat a review comment file as an attachment", async ({ page }) => {
+    // 用户消息：文本 + 评论文件 + 无关文件
     const message = userMessage([
       userText("what's goin on here", { id: "prt_user_review_comment" }),
       {
@@ -159,6 +187,7 @@ test.describe("static projection", () => {
       },
     ])
 
+    // 元数据标记该文件来自 review 评论（应显示为评论引用而非附件）
     message.metadata = {
       displayText: "what's goin on here",
       comments: [
@@ -173,7 +202,9 @@ test.describe("static projection", () => {
     await setupTimeline(page, { messages: [message, assistantMessage()] })
 
     const row = page.locator('[data-component="user-message"]')
+    // 评论文件以 "文件:行区间" 形式展示
     await expect(row.getByText("LiveRuntime.ts:14-32", { exact: true })).toBeVisible()
+    // 附件区不得重复出现该文件；无关文件仍正常显示
     const attachments = row.locator('[data-slot="user-message-attachments"]')
     await expect(attachments.getByText("LiveRuntime.ts", { exact: true })).toHaveCount(0)
     await expect(attachments.getByText("notes.txt", { exact: true })).toBeVisible()
@@ -197,6 +228,7 @@ test.describe("static projection", () => {
       ],
     })
 
+    // 同一次 read 加载的指令文件合并为一个条目展示
     const loaded = page.locator(`[data-timeline-part-id="${id}"] [data-component="tool-loaded-item"]`)
     await expect(loaded).toHaveCount(1)
     await expect(loaded).toHaveAttribute(
@@ -210,6 +242,7 @@ test.describe("static projection", () => {
   })
 
   test("groups only consecutive successful skill tools", async ({ page }) => {
+    // skill→skill→skill→read→skill：中间的 read 打断连续分组
     const parts = [
       toolPart("prt_skill_first", "skill", "completed", { id: "ocpr" }),
       toolPart("prt_skill_second", "skill", "completed", { id: "effect" }),
@@ -223,6 +256,7 @@ test.describe("static projection", () => {
       messages: [userMessage(), assistantMessage(parts)],
     })
 
+    // 展开分组后应有两段：前三连读 + 被打断后的最后一个
     const group = page.locator(`[data-timeline-part-ids="${parts.map((part) => part.id).join(",")}"]`)
     await group.getByRole("button").click()
     const loaded = group.locator('[data-component="tool-loaded-item"]')
@@ -243,17 +277,21 @@ test.describe("static projection", () => {
       settings: { shellToolPartsExpanded: true },
     })
 
+    // 设置强制展开的 shell 不参与折叠分组
     await expect(page.locator('[data-timeline-part-id="prt_expanded_shell"]')).toBeVisible()
+    // 其余 patch/read 归入 "Used 2" 折叠组
     const group = page.locator('[data-timeline-part-ids="prt_collapsed_patch,prt_collapsed_read"]')
     await expect(group.getByRole("button", { name: "Used 2 Patch, Read", exact: true })).toBeVisible()
     await expect(group.locator('[data-component="context-tool-group-trigger"]')).toHaveAttribute(
       "aria-label",
       "Used 2 Patch, Read",
     )
+    // 工具行距为 8px（紧凑）
     await expect(page.locator('[data-timeline-spacing="tool"]')).toHaveCSS("padding-top", "8px")
   })
 })
 
+// 相邻 patch 调用与重复文件合并为一个分组
 test("combines adjacent patch calls and repeated files into one group", async ({ page }) => {
   const [first, second] = ["prt_patch_first", "prt_patch_second"]
 
@@ -273,6 +311,7 @@ test("combines adjacent patch calls and repeated files into one group", async ({
     ],
   })
 
+  // 展开第一个 patch 的 update 文件并标记该行为"稳定"，供后续重挂载对比
   const initial = page.locator(`[data-timeline-part-id="${first}"]`)
   const initialFile = initial.locator('[data-scope="apply-patch"] [data-type="update"]')
   await expect(initialFile.getByRole("button")).toHaveAttribute("aria-expanded", "false")
@@ -284,14 +323,17 @@ test("combines adjacent patch calls and repeated files into one group", async ({
     if (row) row.dataset.patchRow = "stable"
   })
 
+  // 第二个 patch（running）到达：与第一个合并进同一分组
   await timeline.send(partUpdated(toolPart(second, "patch", "running", { patchText: "Update more files" })))
   const group = page.locator(`[data-timeline-part-ids="${first},${second}"]`)
   const row = group.locator("xpath=ancestor::*[@data-timeline-key]")
   const updated = group.locator('[data-scope="apply-patch"] [data-type="update"] button')
+  // 分组重挂载后保留展开状态与已有文件名
   await expect(row).toHaveAttribute("data-patch-row", "stable")
   await expect(group.locator('[data-slot="apply-patch-filename"]')).toHaveText(["first.ts"])
   await expect(updated).toHaveAttribute("aria-expanded", "true")
 
+  // 第二个 patch 完成：first.ts（modified）与 second.ts（added）都在分组里
   await timeline.send(
     partUpdated(
       toolPart(
@@ -305,13 +347,16 @@ test("combines adjacent patch calls and repeated files into one group", async ({
   )
   await expect(group.locator('[data-slot="apply-patch-filename"]')).toHaveText(["first.ts", "second.ts"])
   await expect(updated).toHaveAttribute("aria-expanded", "true")
+  // add 类型的文件保持折叠
   await expect(group.locator('[data-scope="apply-patch"] [data-type="add"] button')).toHaveAttribute(
     "aria-expanded",
     "false",
   )
+  // 单独的 part 节点已被分组替代
   await expect(page.locator(`[data-timeline-part-id="${first}"], [data-timeline-part-id="${second}"]`)).toHaveCount(0)
 })
 
+// 分组中一个 patch 失败：失败者留在 Used 中展开可看错误，存活者的文件展开选择不丢失
 test("keeps a failed patch in Used without losing the surviving file choice", async ({ page }) => {
   const failed = "prt_grouped_patch_failed"
   const surviving = "prt_grouped_patch_surviving"
@@ -339,6 +384,7 @@ test("keeps a failed patch in Used without losing the surviving file choice", as
   const group = page.locator('[data-component="collapsed-tool-group"]')
   const used = group.locator(':scope > [data-component="collapsible"] > [data-slot="collapsible-trigger"]')
   await used.click()
+  // 展开存活 patch 的文件折叠器并给行打身份标记
   const file = group.locator('[data-scope="apply-patch"] button')
   await expect(file).toHaveAttribute("aria-expanded", "false")
   await file.click()
@@ -349,6 +395,7 @@ test("keeps a failed patch in Used without losing the surviving file choice", as
     if (row) row.dataset.groupIdentity = "preserved"
   })
 
+  // 失败事件到达：该 patch 转入 error 状态
   await timeline.send(
     partUpdated(
       toolPart(failed, "patch", "error", { patchText: "Update src/failed.ts" }, { error: "Patch failed visibly" }),
@@ -361,18 +408,23 @@ test("keeps a failed patch in Used without losing the surviving file choice", as
     has: page.locator(`[data-timeline-part-id="${surviving}"]`),
   })
 
+  // 失败者仍在分组中（不拆行），分组保持展开；两者的行键都迁移为 context 键
   await expect(group).toHaveAttribute("data-timeline-part-ids", `${failed},${surviving}`)
   await expect(used).toHaveAttribute("aria-expanded", "true")
   await expect(failedRow).toHaveAttribute("data-timeline-key", /^assistant-part:context:/)
   await expect(survivingRow).toHaveAttribute("data-timeline-key", /^assistant-part:context:/)
+  // 展开失败 patch 可见错误文本
   await group.locator(`[data-timeline-part-id="${failed}"] [data-slot="collapsible-trigger"]`).click()
   await expect(failedRow.getByText("Patch failed visibly")).toBeVisible()
+  // 存活者的行身份与文件展开状态原样保留
   await expect(survivingRow).toHaveAttribute("data-group-identity", "preserved")
   await expect(survivingRow.locator('[data-scope="apply-patch"] button')).toHaveAttribute("aria-expanded", "true")
 })
 
+// 兄弟部件到达时不得重挂载 edit diff（保持 DOM 身份与 shadow root 数量不变）
 test("does not remount an edit diff when a sibling part arrives", async ({ page }) => {
   const editID = "prt_0001_edit"
+  // 注入探针：统计 attachShadow 调用次数，暴露 __shadowRoots.reset/count
   await page.addInitScript(() => {
     let count = 0
     const attachShadow = Element.prototype.attachShadow
@@ -438,6 +490,7 @@ test("does not remount an edit diff when a sibling part arrives", async ({ page 
   const tool = page.locator(`[data-timeline-part-id="${editID}"]`)
   await expect(tool.locator('[data-component="file"][data-mode="diff"]')).toBeVisible()
 
+  // 读取探针标记：工具/diff/行/框架四层节点的 data-timeline-probe 与 shadow root 计数
   const markers = () =>
     tool.evaluate((element) => {
       const nodes = [
@@ -454,6 +507,7 @@ test("does not remount an edit diff when a sibling part arrives", async ({ page 
       }
     })
 
+  // 给四层节点打上 "before" 标记并清零 shadow root 计数
   await tool.evaluate((element) => {
     ;[
       element,
@@ -471,11 +525,13 @@ test("does not remount an edit diff when a sibling part arrives", async ({ page 
     probe.__shadowRoots!.reset()
   })
 
+  // 兄弟文本部件流入：四层节点保持原 DOM（未被重挂载），无新 shadow root
   await timeline.send(partUpdated(textPart("prt_sibling_text", "Streaming added a later assistant text part.")))
   await timeline.waitForPart("prt_sibling_text")
   expect(await markers()).toEqual({ markers: ["before", "before", "before", "before"], shadowRoots: 0 })
 })
 
+// 三种边界转换（推理结束/idle/重试）都应停掉进行中的 Thinking 行
 for (const transition of ["reasoning-end", "idle", "retry"] as const) {
   test(`stops active Thinking on ${transition} without a following tool`, async ({ page }) => {
     const id = `prt_reasoning_stop_${transition}`
@@ -488,12 +544,16 @@ for (const transition of ["reasoning-end", "idle", "retry"] as const) {
 
     const part = page.locator(`[data-timeline-part-id="${renderedPartID(id)}"]`)
     const trigger = part.locator('[data-slot="collapsible-trigger"]')
+    // 初始为进行中的 Thinking（单独行、折叠）
     await expect(page.locator('[data-timeline-row="Thinking"]')).toBeVisible()
     await expect(trigger).toHaveAttribute("aria-expanded", "false")
+    // 发送对应转换事件
     await timeline.send(transition === "reasoning-end" ? partUpdated(reasoningPart(id, text)) : status(transition))
+    // 触发器文案变为 Thought，Thinking 行消失（重试场景出现 Retry 行）
     await expect(trigger).toContainText("Thought")
     await expect(page.locator('[data-timeline-row="Thinking"]')).toHaveCount(0)
     await expect(page.locator('[data-timeline-row="Retry"]')).toHaveCount(transition === "retry" ? 1 : 0)
+    // 展开后仍能看到完整推理文本
     await trigger.click()
     await expect(trigger).toHaveAttribute("aria-expanded", "true")
     await expect(part.getByText("The timeline is ready for the next step.", { exact: true })).toBeVisible()
@@ -501,6 +561,7 @@ for (const transition of ["reasoning-end", "idle", "retry"] as const) {
 }
 
 // Separate placement keeps each part standalone, so the user's disclosure choice must survive completion.
+// 单独放置使每个部件独立成行，因此用户的手风琴开合选择必须在完成后依然保留
 for (const shellDefault of ["collapsed", "expanded"] as const) {
   test(`keeps separate shell and reasoning disclosure through completion from the ${shellDefault} shell default`, async ({
     page,
@@ -528,6 +589,7 @@ for (const shellDefault of ["collapsed", "expanded"] as const) {
     const shellTrigger = page.locator(`[data-timeline-part-id="${shellID}"] [data-slot="collapsible-trigger"]`)
     const group = page.locator('[data-component="collapsed-tool-group"]')
     // One row opens the thought, the other opens and then closes it again.
+    // collapsed 默认时用户意图是"展开思考"；expanded 默认时是"展开后再合上"
     const thoughtOpen = shellDefault === "collapsed"
     await expect(page.locator('[data-timeline-row="Thinking"]')).toBeVisible()
     await expect(thought).toHaveAttribute("aria-expanded", "false")
@@ -536,18 +598,22 @@ for (const shellDefault of ["collapsed", "expanded"] as const) {
     if (!thoughtOpen) await thought.click()
     await expect(thought).toHaveAttribute("aria-expanded", String(thoughtOpen))
 
+    // shell 开始流式输出：Thinking 行消失、无折叠组；shell 的展开状态遵循其默认值
     await timeline.send(partUpdated(shell(shellID, "running", output(3))))
     await expect(page.locator('[data-timeline-row="Thinking"]')).toHaveCount(0)
     await expect(group).toHaveCount(0)
     await expect(shellTrigger).toHaveAttribute("aria-expanded", String(shellDefault === "expanded"))
+    // 用户手动切换 shell 的开合
     await shellTrigger.click()
     await expect(shellTrigger).toHaveAttribute("aria-expanded", String(shellDefault !== "expanded"))
 
+    // 完成 + 兄弟内容 + 消息完成 + idle：各项折叠状态全部保留
     await timeline.send(partUpdated(shell(shellID, "completed", output(6))))
     await timeline.send(partUpdated(textPart(`prt_separate_sibling_${shellDefault}`, "Sibling content")))
     await timeline.send(messageUpdated(completedAssistantInfo(assistant)))
     await timeline.send(status("idle"))
     await expect(page.getByText("Sibling content", { exact: true })).toBeVisible()
+    // shell 的 shimmer 应已停止
     await expect(page.locator(`[data-timeline-part-id="${shellID}"] [data-component="text-shimmer"]`)).toHaveAttribute(
       "data-active",
       "false",
@@ -558,6 +624,7 @@ for (const shellDefault of ["collapsed", "expanded"] as const) {
   })
 }
 
+// 后台子代理的结果以独立行的形式出现在它结束的位置，而不是并入前后任一分组
 test("shows a background subagent's outcome as its own row where it finished", async ({ page }) => {
   const childID = "ses_background_outcome"
   const after = assistantMessage([], { id: "msg_after", completed: false })
@@ -602,8 +669,10 @@ test("shows a background subagent's outcome as its own row where it finished", a
     sessions: [session(), session({ id: childID, parentID: sessionID, title: "Map the inbox" })],
   })
 
+  // 初始只有前一段 work（Used 1 Read）
   await expect(page.getByText(/^Used\s*1\s*Read$/)).toBeVisible()
 
+  // 注入事件：后台结果入队并投递，随后新一步启动并完成
   await timeline.send([
     inboxEnqueued({
       sessionID,
@@ -628,6 +697,7 @@ test("shows a background subagent's outcome as its own row where it finished", a
   ])
 
   // The outcome sits between the work before and after it instead of folding into either group.
+  // 结果行夹在前后两段 work 之间，而不是并入任何一侧分组
   const notice = page.locator('[data-slot="session-timeline-notice"]')
   await expect(page.getByText(/^Used\s*1\s*Read$/).or(notice)).toHaveText([
     /^Used\s*1\s*Read$/,
@@ -636,17 +706,20 @@ test("shows a background subagent's outcome as its own row where it finished", a
   ])
   await expect(notice).toHaveAttribute("data-outcome", "completed")
 
+  // notice 无图标；点击跳转到子会话
   await expect(notice.locator('[data-slot="icon-svg"]')).toHaveCount(0)
   await notice.click()
   await expect(page).toHaveURL(new RegExp(`/session/${childID}$`))
 })
 
+// 未投递的输入在其位置保持不动：上方的实时状态来去不影响它
 test("holds undelivered input still while live status above it comes and goes", async ({ page }) => {
   const timeline = await setupTimeline(page, {
     sessionStatus: { [sessionID]: { type: "busy" } },
     messages: [
       userMessage(),
       // Streaming text stands in for Working, so live status has nothing to show.
+      // 用流式文本顶替 Working，让实时状态没有可展示的内容
       assistantMessage([textPart("prt_streaming_answer", "It ships as soon as it's ready.")], { completed: false }),
     ],
   })
@@ -654,6 +727,7 @@ test("holds undelivered input still while live status above it comes and goes", 
   const answer = page.getByText("It ships as soon as it's ready.", { exact: true })
   const working = page.locator('[data-component="session-working"]')
   const activity = page.locator('[data-timeline-key="activity"]')
+  // activity 行的高度（"车道"高度）
   const lane = async () => (await activity.boundingBox())?.height
 
   const outcome = (id: string, description: string) =>
@@ -671,8 +745,10 @@ test("holds undelivered input still while live status above it comes and goes", 
       },
     })
 
+  // 第一条等待投递的结果 notice
   const first = page.locator('[data-slot="session-timeline-notice"]').filter({ hasText: "Audit constraints" })
 
+  // 顶部答案与 notice 之间的空隙高度
   const gap = async () => {
     const [above, below] = await Promise.all([answer.boundingBox(), first.boundingBox()])
 
@@ -684,9 +760,11 @@ test("holds undelivered input still while live status above it comes and goes", 
   await expect(first).toHaveText(/^General finished · Audit constraints$/)
   await expect(working).toHaveCount(0)
   // Live status moves above the waiting notice, but takes no room while it has nothing to show.
+  // 实时状态移到等待 notice 的上方，但没有内容时不占空间（车道高度 0）
   await expect.poll(lane).toBe(0)
   const pending = await gap()
 
+  // 投递后：activity 行消失，空隙不变（输入未移动）
   await timeline.send(inboxDelivered({ sessionID, inboxID: "msg_pending_outcome" }))
   await expect(activity).toHaveCount(0)
   await expect.poll(gap).toBe(pending)
@@ -696,6 +774,7 @@ test("holds undelivered input still while live status above it comes and goes", 
   await expect.poll(lane).toBe(0)
 
   // A finished read keeps Working on; the next streaming text hides it again. Once shown, the lane stays.
+  // 完成的 read 让 Working 出现；下一段流式文本再次隐藏它。但车道一旦出现就保留
   await timeline.send(partUpdated(toolPart("prt_live_read", "read", "completed", { filePath: "README.md" })))
   await expect(working).toBeVisible()
   await expect.poll(lane).toBe(36)
@@ -705,6 +784,7 @@ test("holds undelivered input still while live status above it comes and goes", 
   await expect.poll(lane).toBe(36)
 })
 
+// 从完成的 shell notice 点击跳转到时间线里的原始调用并展开
 test("jumps from a finished shell's notice to its call", async ({ page }) => {
   await setupTimeline(page, {
     settings: { timelineDetail: detailed },
@@ -736,14 +816,17 @@ test("jumps from a finished shell's notice to its call", async ({ page }) => {
   const notice = page.getByRole("button", { name: /^Shell finished/ })
   const shellTrigger = page.locator('[data-timeline-part-id="prt_notice_shell"] [data-slot="collapsible-trigger"]')
 
+  // notice 在视口内；原始调用的触发器此时不可见
   await expect(notice).toBeInViewport()
   await expect(shellTrigger).toHaveCount(0)
   await notice.click()
 
+  // 点击后：调用展开并滚动到视口
   await expect(shellTrigger).toHaveAttribute("aria-expanded", "true")
   await expect(shellTrigger).toBeInViewport()
 })
 
+// Working 指示器行为测试组
 test.describe("Working", () => {
   test("shows Working between busy and reasoning states", async ({ page }) => {
     const timeline = await setupTimeline(page, {
@@ -755,6 +838,7 @@ test.describe("Working", () => {
 
     const working = page.locator('[data-component="session-working"]')
     const shimmer = working.locator('[data-component="text-shimmer"]')
+    // busy 状态：Working 以 status 角色展示，shimmer 激活、行高 16px
     await expect(working).toHaveCount(1)
     await expect(working).toHaveRole("status")
     await expect(shimmer).toHaveAttribute("aria-label", "Working")
@@ -763,17 +847,20 @@ test.describe("Working", () => {
     await expect(shimmer).toHaveCSS("line-height", "16px")
     await expect(page.locator('[data-timeline-row="Thinking"]')).toHaveCount(0)
 
+    // 步骤开始后 Working 仍在；空的推理部件让位给 Thinking 行
     await timeline.send(stepStarted(assistantMessage([], { completed: false })))
     await expect(working).toBeVisible()
     await timeline.send(partUpdated(reasoningPart("prt_working_reasoning", "")))
     await expect(page.locator('[data-timeline-row="Thinking"]')).toBeVisible()
     await expect(working).toHaveCount(0)
 
+    // 推理有内容后 Thinking 行消失、Working 回归
     await timeline.send(partUpdated(reasoningPart("prt_working_reasoning", "The inspection is complete.")))
     await expect(page.locator('[data-timeline-row="Thinking"]')).toHaveCount(0)
     await expect(shimmer).toHaveAttribute("aria-label", "Working")
     await expect(working).toBeInViewport()
 
+    // idle 后 Working 消失
     await timeline.send(status("idle"))
     await expect(working).toHaveCount(0)
   })
@@ -790,6 +877,7 @@ test.describe("Working", () => {
     })
 
     // reasoningPart starts at 1700000001000, so the pause lands 8m 12s into the thought.
+    // reasoningPart 从 1700000001000 开始，因此暂停落在思考的 8 分 12 秒处
     await page.clock.install({ time: 1700000001000 })
     await page.reload()
     await timeline.transport.waitForConnection()
@@ -798,24 +886,31 @@ test.describe("Working", () => {
     const group = page.locator('[data-component="collapsed-tool-group"]')
     const trigger = group.locator('[data-component="context-tool-group-trigger"]')
     const elapsed = trigger.locator('[data-slot="basic-tool-tool-subtitle"]')
+    // 推理作为唯一的 Thinking 分组出现
     await expect(group).toHaveAttribute("data-timeline-part-ids", `${assistantID}:reasoning:0`)
     // The jump below fires the 60 s timeout of any request still in flight, so the busy status must land first.
+    // 下面的时钟跳进会触发在途请求的 60 秒超时，所以必须先等 busy 状态落地
     await expect(trigger).toHaveAttribute("aria-label", "Thinking")
     await page.clock.pauseAt(1700000001000 + 492_000)
+    // 暂停在 8m12s：shimmer 激活、已用时长正确；无 Working、无 "Used 1 Thought"
     await expect(trigger.locator('[data-component="text-shimmer"]')).toHaveAttribute("data-active", "true")
     await expect(elapsed).toHaveText("8m 12s")
     await expect(working).toHaveCount(0)
     await expect(page.getByRole("button", { name: "Used 1 Thought" })).toHaveCount(0)
 
+    // 快进 1 秒：已用时长随之更新
     await page.clock.fastForward(1_000)
     await expect(elapsed).toHaveText("8m 13s")
 
+    // 展开可看到推理全文
     await trigger.click()
     await expect(group.getByText("Still considering the answer.", { exact: true })).toBeVisible()
 
     // Event delivery schedules timers, so let time run again before streaming the next part.
+    // 事件投递依赖定时器，所以在流式发送下一个部件前恢复时钟
     await page.clock.resume()
 
+    // 新的 read 加入：分组变为 Thinking+Read，标签更新，Working 回归
     await timeline.send(partUpdated(toolPart("prt_after_thought", "read", "running", { filePath: "package.json" })))
     await expect(group).toHaveAttribute("data-timeline-part-ids", `${assistantID}:reasoning:0,prt_after_thought`)
     await expect(trigger).toHaveAttribute("aria-label", "Used 1 Read")
@@ -823,6 +918,7 @@ test.describe("Working", () => {
     await expect(working).toBeVisible()
   })
 
+  // shell/patch/subagent 三种工具：输入与执行期间隐藏 Working，完成后恢复
   for (const name of ["shell", "patch", "subagent"] as const) {
     test(`hides Working during ${name} input and execution, then restores it on completion`, async ({ page }) => {
       const timeline = await setupTimeline(page, {
@@ -837,6 +933,7 @@ test.describe("Working", () => {
 
       const id = `prt_working_${name}`
 
+      // 各工具的流式输入载荷
       const input = {
         shell: { command: "printf ready" },
         patch: {
@@ -847,20 +944,24 @@ test.describe("Working", () => {
 
       await timeline.send(partUpdated(toolPart(id, name, "streaming", input)))
       const tool = page.locator(`[data-timeline-part-id="${id}"]`)
+      // streaming 阶段：工具卡片可见，Working 隐藏
       await expect(tool).toBeVisible()
       await expect(working).toHaveCount(0)
 
+      // patch 完成时补上文件元数据
       const metadata =
         name === "patch"
           ? { files: [{ ...patchFile("src/working.ts", "added"), patch: "@@ -0,0 +1 @@\n+export const ready = true" }] }
           : {}
 
+      // running 阶段：卡片显示各自的关键内容，Working 仍隐藏
       await timeline.send(partUpdated(toolPart(id, name, "running", input, { metadata })))
       await expect(tool).toContainText(
         { shell: "printf ready", patch: "working.ts", subagent: "Inspect working indicator" }[name],
       )
       await expect(working).toHaveCount(0)
 
+      // completed：无折叠组，Working 恢复并保持激活
       await timeline.send(partUpdated(toolPart(id, name, "completed", input, { metadata })))
       await expect(tool).toBeVisible()
       await expect(page.locator('[data-component="collapsed-tool-group"]')).toHaveCount(0)
@@ -870,6 +971,7 @@ test.describe("Working", () => {
     })
   }
 
+  // 独立 read 分组接纳新成员时 Working 保持
   test("keeps Working while a new read joins a standalone read group", async ({ page }) => {
     const timeline = await setupTimeline(page, {
       messages: [
@@ -887,9 +989,11 @@ test.describe("Working", () => {
     const working = page.locator('[data-component="session-working"]')
     const group = page.locator('[data-component="read-tool-group"]')
     const shimmer = group.locator('[data-component="text-shimmer"]')
+    // 三个已完成的 read 组成一个分组
     await expect(group).toHaveAttribute("data-timeline-part-ids", "prt_read_one,prt_read_two,prt_read_three")
     await expect(working).toBeVisible()
 
+    // 第四个 read streaming 加入：分组扩容、shimmer 激活
     await timeline.send(partUpdated(toolPart("prt_read_four", "read", "streaming", { path: "src/four.ts" })))
     await expect(group).toHaveAttribute(
       "data-timeline-part-ids",
@@ -898,17 +1002,20 @@ test.describe("Working", () => {
     await expect(shimmer).toHaveAttribute("data-active", "true")
     await expect(working).toBeVisible()
 
+    // running：副标题列出全部四个文件名
     await timeline.send(partUpdated(toolPart("prt_read_four", "read", "running", { path: "src/four.ts" })))
     await expect(group.locator('[data-slot="basic-tool-tool-subtitle"]')).toHaveText(
       "one.ts, two.ts, three.ts, four.ts",
     )
     await expect(working).toBeVisible()
 
+    // completed：shimmer 停止但 Working 保持
     await timeline.send(partUpdated(toolPart("prt_read_four", "read", "completed", { path: "src/four.ts" })))
     await expect(shimmer).toHaveAttribute("data-active", "false")
     await expect(working).toBeVisible()
   })
 
+  // 后台运行中的 shell：分组与独立两种呈现
   for (const grouped of [false, true]) {
     test(`uses ${grouped ? "grouped" : "standalone"} background shell presentation`, async ({ page }) => {
       await setupTimeline(page, {
@@ -945,12 +1052,14 @@ test.describe("Working", () => {
       const working = page.locator('[data-component="session-working"]')
 
       if (!grouped) {
+        // 独立呈现：活动卡片可见，无 Working
         await expect(page.locator('[data-timeline-part-id="prt_background_active"]')).toBeVisible()
         await expect(working).toHaveCount(0)
 
         return
       }
 
+      // 分组呈现："Used 2 Shell" 触发器折叠，Working 可见；展开后 Working 仍在
       const trigger = page
         .locator('[data-component="collapsed-tool-group"]')
         .getByRole("button", { name: "Used 2 Shell", exact: true, includeHidden: true })
@@ -963,6 +1072,7 @@ test.describe("Working", () => {
     })
   }
 
+  // Retry 行替换 Working，恢复后 Working 回归
   test("replaces Working with Retry and restores it on recovery", async ({ page }) => {
     const assistant = assistantMessage([], { completed: false })
     const timeline = await setupTimeline(page, { messages: [userMessage(), assistant] })
@@ -971,10 +1081,12 @@ test.describe("Working", () => {
 
     await timeline.send(status("retry"))
     const retry = page.locator('[data-timeline-row="Retry"]')
+    // retry 状态：显示限流原因，Working 与 Thinking 都消失
     await expect(retry).toContainText("Rate limited")
     await expect(working).toHaveCount(0)
     await expect(page.locator('[data-timeline-row="Thinking"]')).toHaveCount(0)
 
+    // 新步骤开始：Retry 行消失，Working 恢复
     await timeline.send(stepStarted(assistant))
     await expect(retry).toHaveCount(0)
     await expect(page.locator('[data-timeline-row="Thinking"]')).toHaveCount(0)
@@ -982,6 +1094,7 @@ test.describe("Working", () => {
     await expect(working).toBeVisible()
   })
 
+  // 助手文本流式期间隐藏 Working
   test("hides Working while assistant text streams", async ({ page }) => {
     const timeline = await setupTimeline(page, {
       messages: [userMessage(), assistantMessage([], { completed: false })],
@@ -990,6 +1103,7 @@ test.describe("Working", () => {
     const working = page.locator('[data-component="session-working"]')
     await expect(working).toBeVisible()
 
+    // 文本开始事件
     await timeline.send({
       id: "evt_working_text_started",
       type: "session.text.started",
@@ -998,6 +1112,7 @@ test.describe("Working", () => {
       durable: { aggregateID: sessionID, seq: 0, version: 1 },
       data: { sessionID, assistantMessageID: assistantID, ordinal: 0 },
     })
+    // 文本增量事件
     await timeline.send({
       id: "evt_working_text_delta",
       type: "session.text.delta",
@@ -1005,6 +1120,7 @@ test.describe("Working", () => {
       location: { directory },
       data: { sessionID, assistantMessageID: assistantID, ordinal: 0, delta: "The response is streaming." },
     })
+    // 文本可见后 Working 消失
     await expect(page.locator(`[data-timeline-part-id="${assistantID}:text:0"]`)).toContainText(
       "The response is streaming.",
     )
@@ -1012,9 +1128,12 @@ test.describe("Working", () => {
   })
 })
 
+// 流式增长行不产生 ResizeObserver loop 错误
 test("grows a streaming row without a ResizeObserver loop error", async ({ page }) => {
   // Each streamed paragraph grows its row. An observer on the content that holds every row saw that height inside the
   // row observer's own delivery, and Chrome reported every such frame as an uncaught error.
+  // 每段流式段落都会撑高所在行。承载所有行的内容上的观察器会在行观察器自己的投递里
+  // 看到那次高度变化，Chrome 会把每个这样的帧都报告成未捕获错误
   await page.addInitScript(() => {
     window.addEventListener("error", (event) => {
       if (!event.message.startsWith("ResizeObserver loop")) return
@@ -1030,15 +1149,18 @@ test("grows a streaming row without a ResizeObserver loop error", async ({ page 
 
   const text = page.locator(`[data-timeline-part-id="${renderedPartID("prt_growth")}"]`)
 
+  // 连续追加 6 个段落
   for (const line of [1, 2, 3, 4, 5, 6]) {
     await timeline.send(partDelta("prt_growth", `\n\nParagraph ${line}.`))
     await expect(text).toContainText(`Paragraph ${line}.`)
   }
 
   await expect(text.locator("p")).toHaveCount(7)
+  // 全程没有记录到 ResizeObserver loop 错误
   expect(await page.evaluate(() => document.documentElement.dataset.resizeObserverLoops)).toBeUndefined()
 })
 
+// 后台快捷键测试组
 test.describe("background shortcut", () => {
   test("offers a standalone running subagent to the background with Ctrl+B", async ({ page }) => {
     await setupTimeline(page, {
@@ -1046,10 +1168,12 @@ test.describe("background shortcut", () => {
       sessionMessages: [user, runningSubagent()],
     })
     const card = page.locator('[data-component="task-tool-card"]')
+    // 独立运行的子代理卡片：无 "(background)" 标注，也无内联后台控件
     await expect(card).toContainText("Inspect code")
     await expect(card).not.toContainText("(background)")
     await expect(page.getByText("Called `subagent`", { exact: false })).toHaveCount(0)
     await expect(page.locator('[data-component="background-tool-control"]')).toHaveCount(0)
+    // 后台提示行可见（Ctrl+B），且与卡片左对齐、位于其下方
     const hint = backgroundHint(page)
     await expect(hint).toBeVisible()
     await expect(page.locator('[data-timeline-row="Thinking"]')).toHaveCount(0)
@@ -1062,9 +1186,11 @@ test.describe("background shortcut", () => {
         return { aligned: Math.abs(cardBox.x - hintBox.x) < 2, ordered: cardBox.y < hintBox.y }
       })
       .toEqual({ aligned: true, ordered: true })
+    // Ctrl+B 发出后台请求
     await expectBackgroundRequest(page)
   })
 
+  // 分组运行中的 read/shell：保持 Working 与快捷键
   for (const name of ["read", "shell"] as const) {
     test(`keeps Working and the shortcut for a grouped running ${name}`, async ({ page }) => {
       await setupTimeline(page, {
@@ -1093,10 +1219,12 @@ test.describe("background shortcut", () => {
       await expect(working).toBeInViewport()
 
       if (name === "shell") {
+        // shell 场景：后台提示行可见且高 24px
         await expect(backgroundHint(page)).toBeInViewport()
         await expect(page.locator('[data-component="session-background-hint-row"]')).toHaveCSS("height", "24px")
       }
 
+      // 反复开合触发器：Working 始终保持
       await trigger.click()
       await expect(trigger).toHaveAttribute("aria-expanded", "true")
       await expect(group.locator('[data-component="text-shimmer"][data-active="true"]')).toBeVisible()
@@ -1109,6 +1237,7 @@ test.describe("background shortcut", () => {
     })
   }
 
+  // 活动面板锚定在右置/中置的胶囊上
   for (const placement of ["right", "center"] as const) {
     test(`anchors the activity panel to a ${placement}-placed capsule`, async ({ page }) => {
       await setupTimeline(page, {
@@ -1152,6 +1281,7 @@ test.describe("background shortcut", () => {
       })
 
       // The open menu hides the rest of the page from the accessibility tree, the capsule included.
+      // 打开的菜单把页面其余部分从无障碍树中隐藏，胶囊也不例外——所以要 includeHidden
       const capsule = page.getByRole("button", { name: "1 shell", exact: true, includeHidden: true })
       const list = page.getByRole("menu", { name: "1 shell", exact: true })
       const closed = (await capsule.boundingBox())!
@@ -1159,6 +1289,7 @@ test.describe("background shortcut", () => {
 
       await capsule.click()
       // Right placement shares the capsule's end edge and mirrors its inset there; centre placement shares its centre.
+      // 右置：面板右缘与胶囊右缘对齐并镜像其内边距；中置：与胶囊中心对齐
       await expect
         .poll(async () => {
           const panel = (await list.boundingBox())!
@@ -1181,12 +1312,14 @@ test.describe("background shortcut", () => {
     })
   }
 
+  // 后台子代理的计数依据是"其会话是否在跑"，而不是其调用是否仍显示 running
   test("counts a backgrounded subagent while its session runs, not while its call still reads running", async ({
     page,
   }) => {
     const childID = "ses_background_stale_call"
 
     // As after a lost completion notice: the call still reads running, while the child session has finished.
+    // 模拟丢失完成通知后的状态：调用仍显示 running，而子会话其实已经结束
     const timeline = await setupTimeline(page, {
       settings: { timelineDetail: detailed },
       sessionMessages: [
@@ -1218,14 +1351,17 @@ test.describe("background shortcut", () => {
 
     const capsule = page.locator('[data-slot="session-activity-chip"]')
 
+    // 卡片带后台标注；子会话空闲时无活动胶囊
     await expect(page.locator('[data-timeline-part-id="call_stale"]')).toContainText("Stale task (background)")
     await expect(capsule).toHaveCount(0)
+    // 子会话 busy：出现活动按钮；idle 后消失
     await timeline.transport.send(status("busy", 1, childID))
     await expect(page.getByRole("button", { name: "1 subagent", exact: true })).toBeVisible()
     await timeline.transport.send(status("idle", 1, childID))
     await expect(capsule).toHaveCount(0)
   })
 
+  // 阻塞中的工作与已后台化的工作分两行展示
   test("separates blocking and already-backgrounded work into two rows", async ({ page }) => {
     const backgroundID = "ses_background_existing"
     const blockingID = "ses_background_blocking"
@@ -1300,6 +1436,7 @@ test.describe("background shortcut", () => {
       },
     })
 
+    // 注入 shell.created 事件（后台 shell 上线）
     await timeline.transport.send({
       id: "evt_background_shell_created",
       created: 3,
@@ -1320,6 +1457,7 @@ test.describe("background shortcut", () => {
     })
     const backgroundCard = page.locator('[data-timeline-part-id="call_backgrounded"]')
     const blockingCard = page.locator('[data-timeline-part-id="call_blocking"]')
+    // 后台卡片带 (background)，阻塞卡片不带
     await expect(backgroundHint(page)).toBeVisible()
     await expect(backgroundCard).toContainText("Background task (background)")
     await expect(blockingCard).toContainText("Foreground task")
@@ -1334,19 +1472,24 @@ test.describe("background shortcut", () => {
     const activity = page.getByRole("button", { name: "2 subagents · 1 shell", exact: true })
     const list = page.getByRole("menu", { name: "2 subagents · 1 shell", exact: true })
     // The open menu hides the rest of the page from the accessibility tree, the capsule included.
+    // 打开的菜单把页面其余部分从无障碍树隐藏，胶囊也在其中——所以 includeHidden
     const capsule = page.getByRole("button", { name: "2 subagents · 1 shell", exact: true, includeHidden: true })
     const label = capsule.getByText("2 subagents · 1 shell", { exact: true })
+    // 记录胶囊上图标与文本的几何基准
     const glyph = await capsule.locator('[data-component="session-progress-indicator-v2"]').boundingBox()
     const text = await label.boundingBox()
     const inset = glyph!.x - (await capsule.boundingBox())!.x
 
     await activity.click()
+    // 面板打开：无分组标签/分隔线；胶囊自身隐藏，标签仍在（includeHidden）
     await expect(list.locator('[data-slot="menu-v2-group-label"], [data-slot="menu-v2-separator"]')).toHaveCount(0)
     await expect(list.getByText("2 subagents · 1 shell", { exact: true })).toHaveCount(0)
     await expect(label).toBeVisible()
 
     // The panel opens above the capsule on its grid: row glyphs on the capsule's glyph, names and commands on its
     // label, and run times ending as far from the panel's end as the glyphs start from its start.
+    // 面板按胶囊的网格在其上方打开：行图标对齐胶囊图标、名称对齐其标签、
+    // 运行时长距面板末端的距离等于图标距起点的距离
     await expect
       .poll(async () => {
         const panel = await list.boundingBox()
@@ -1378,16 +1521,19 @@ test.describe("background shortcut", () => {
       .toBe(true)
     await expect(list.getByRole("menuitem")).toHaveText([
       // The fixture starts every task near the epoch, so each row ends with an hours-long run time.
+      // 夹具把每个任务的开始时间都设得接近纪元，所以每行的运行时长都是小时级
       /^Build\s*Foreground task\d+h \d{2}m$/,
       /^Explore\s*Background task\d+h \d{2}m$/,
       /^sleep 120\d+h \d{2}m$/,
     ])
     // A shell opens its output in the menu rather than revealing its call in the timeline.
+    // shell 在菜单内打开输出，而不是在时间线里展开其调用
     await list.getByRole("menuitem", { name: /sleep 120/ }).click()
     await expect(list).toHaveAttribute("data-view", "shell")
     await expect(used).toHaveAttribute("aria-expanded", "false")
     await list.getByRole("menuitem", { name: "Back to background work", exact: true }).click()
 
+    // 中断前台子代理：等待中断请求
     const interrupt = page.waitForRequest(
       (request) =>
         request.method() === "POST" && new URL(request.url()).pathname === `/api/session/${blockingID}/interrupt`,
@@ -1400,6 +1546,7 @@ test.describe("background shortcut", () => {
     await interrupt
     await expect(list).toBeVisible()
 
+    // 删除后台 shell：等待 DELETE 请求
     const kill = page.waitForRequest(
       (request) => request.method() === "DELETE" && new URL(request.url()).pathname === "/api/shell/shell_backgrounded",
     )
@@ -1409,6 +1556,7 @@ test.describe("background shortcut", () => {
     await kill
     await page.keyboard.press("Escape")
     await expect(list).toHaveCount(0)
+    // 后台卡片仍显示后台状态与进度图标；展开 Used 后 shell 的 shimmer 重新激活
     await expect(backgroundCard).toContainText("Background task (background)")
     await expect(backgroundCard.locator('[data-component="session-progress-indicator-v2"]')).toBeVisible()
     await used.click()
@@ -1418,6 +1566,8 @@ test.describe("background shortcut", () => {
 
     // SAFETY: the transport forwards this payload unchanged, and the client marks a session idle from
     // `type` and `data.sessionID` alone; the child session's event needs no durable metadata here.
+    // 传输层原样转发该载荷；客户端仅凭 `type` 与 `data.sessionID` 即可将会话置为 idle，
+    // 子会话事件在这里无需持久化元数据
     await timeline.transport.send({
       id: "evt_background_succeeded",
       created: Date.now(),
@@ -1428,14 +1578,18 @@ test.describe("background shortcut", () => {
     await expect(backgroundCard).toContainText("Background task (background)")
   })
 
+  // 展开的调用应停在卡住的分组头下方（三种初始滚动位置）
   for (const fixture of [
     { name: "from far below", before: 40, searches: 40, after: 80 },
     // The collapsed timeline fits the viewport, so it only becomes scrollable once the group opens.
+    // 折叠时间线恰好占满视口，只有分组展开后才可滚动
     { name: "that opens the last row", before: 0, searches: 40, after: 0 },
     // Reaching the shell lands on the end of the timeline, which would otherwise follow new content again.
+    // 到达 shell 时已位于时间线末尾，否则会继续跟随新内容滚动
     { name: "at the end of the timeline", before: 40, searches: 0, after: 0 },
   ]) {
     // A starting subagent call is the pill's row that reveals its call; grouping subagents puts it inside the group.
+    // 处于开头的 subagent 调用是胶囊所在行上揭示其调用的入口；分组模式把它收进组内
     test(`holds a revealed call ${fixture.name} just under its stuck group header`, async ({ page }) => {
       const timeline = await setupTimeline(page, {
         settings: { timelineDetail: { ...detailed, subagents: { placement: "grouped" } } },
@@ -1448,6 +1602,7 @@ test.describe("background shortcut", () => {
               ...searches(0, 42 - fixture.searches),
               toolPart("prt_far_call", "subagent", "running", { description: "Map the far code", agent: "explore" }),
               // The open group outgrows the viewport, so aligning the group instead of the call misses it.
+              // 展开的分组超出视口，因此对齐分组（而非调用本身）会错过它
               ...searches(42 - fixture.searches, fixture.searches),
               ...(fixture.after ? [textPart("prt_follow_up", notes("Follow-up", fixture.after))] : []),
             ],
@@ -1462,6 +1617,7 @@ test.describe("background shortcut", () => {
 
       const call = page.locator('[data-timeline-part-id="prt_far_call"]')
 
+      // 轮询"调用行顶 == 分组头底"
       const aligned = () =>
         expect
           .poll(async () => {
@@ -1471,10 +1627,12 @@ test.describe("background shortcut", () => {
           })
           .toBe(0)
 
+      // 初始视口停在远处（或分组本身）
       await expect(
         fixture.after ? page.getByText(`Follow-up note ${fixture.after}.`, { exact: true }) : group,
       ).toBeInViewport()
       await expect(call).toHaveCount(0)
+      // 从活动菜单跳转到该调用：分组展开、调用进入视口
       await page.getByRole("button", { name: "1 subagent", exact: true }).click()
       await page
         .getByRole("menu", { name: "1 subagent", exact: true })
@@ -1485,17 +1643,21 @@ test.describe("background shortcut", () => {
       await expect(call).toBeInViewport()
 
       // A call at the very end cannot rise under the header until more content arrives below it.
+      // 位于末尾的调用只有在下方有更多内容后才可能升到分组头之下
       if (fixture.searches) await aligned()
       // Nothing covers the row, so it takes the next click.
+      // 行未被遮挡，下一次点击可以命中
       await call.click({ trial: true })
 
       // The agent keeps writing below the call; the call stays where it was revealed.
+      // 代理继续在下方写入；调用保持在揭示位置不动
       await timeline.send(partUpdated(textPart("prt_late", notes("Late", 30))))
       await expect(page.getByText("Late note 30.", { exact: true })).toBeAttached()
       await aligned()
     })
   }
 
+  // 运行中子代理的 Working 指示器显示在标题旁
   test("shows a running subagent's working indicator beside its title", async ({ page }) => {
     const childID = "ses_only_running_child"
 
@@ -1510,6 +1672,7 @@ test.describe("background shortcut", () => {
 
     const header = page.locator("[data-session-title]")
 
+    // 从活动菜单跳进子会话
     await page.getByRole("button", { name: "1 subagent", exact: true }).click()
     await page.getByRole("menuitem", { name: /Only running task/ }).click()
     await expect(page).toHaveURL(new RegExp(`/session/${childID}$`))
@@ -1519,6 +1682,7 @@ test.describe("background shortcut", () => {
 
     await expect(working.locator('[data-component="session-progress-indicator-v2"]')).toBeVisible()
 
+    // 指示器与标题之间的间距应为 8px
     const gap = await working.evaluate((element) => {
       const title = document.createRange()
 
@@ -1531,6 +1695,7 @@ test.describe("background shortcut", () => {
 
     const title = header.getByRole("heading")
     const before = await title.boundingBox()
+    // 暂停退出动画，以便逐帧检查标题回位
     const exit = await pauseExitAnimations(working)
 
     await timeline.transport.send(status("idle", 1, childID))
@@ -1554,7 +1719,9 @@ test.describe("background shortcut", () => {
   })
 })
 
+// 压缩（compaction）测试组
 test.describe("compaction", () => {
+  // 按顺序展示压缩进度、摘要与结果
   test("renders compaction progress, summary, and outcome in order", async ({ page }) => {
     const timeline = await setupTimeline(page, {
       settings: { timelineDetail: { ...detailed, notices: { placement: "separate" } } },
@@ -1562,6 +1729,7 @@ test.describe("compaction", () => {
       sessionStatus: { [sessionID]: { type: "busy" } },
     })
 
+    // 压缩开始：起始文案 + Compacting 状态 + 激活的 shimmer；无结果文案；有 Stop 按钮；无 Working
     await timeline.send(compactionStarted({ sessionID, reason: "manual", recent: "" }))
     const compaction = page.locator('[data-component="session-compaction-message"]')
     await expect(compaction.getByText("Session compaction started", { exact: true })).toBeVisible()
@@ -1571,9 +1739,11 @@ test.describe("compaction", () => {
     await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible()
     await expect(page.locator('[data-component="session-working"]')).toHaveCount(0)
 
+    // 窄视口下起始行仍在视口内
     await page.setViewportSize({ width: 480, height: 900 })
     await expect(compaction.getByText("Session compaction started", { exact: true })).toBeInViewport()
 
+    // 增量到达：摘要标题与流式正文出现；Compacting 状态位于摘要下方
     await timeline.send(compactionDelta({ sessionID, text: "## Checkpoint\n\nStreamed implementation details." }))
     await expect(compaction.getByRole("heading", { name: "Checkpoint" })).toBeVisible()
     await expect(compaction).toContainText("Streamed implementation details.")
@@ -1589,6 +1759,7 @@ test.describe("compaction", () => {
       .toBe(true)
     await expect(compaction.getByText("Session compacted", { exact: true })).toHaveCount(0)
 
+    // 压缩结束：最终摘要替换流式内容，起始与完成文案并存，完成行位于摘要下方
     await timeline.send(
       compactionEnded({
         sessionID,
@@ -1614,6 +1785,7 @@ test.describe("compaction", () => {
     await expect(page.locator('[data-component="session-working"]')).toBeVisible()
   })
 
+  // 开启后台压缩时，自动压缩只显示一条安静的分割线
   test("shows an automatic compaction as one quiet divider with background compaction on", async ({ page }) => {
     const config = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/config")
 
@@ -1625,6 +1797,7 @@ test.describe("compaction", () => {
 
     await config
 
+    // 自动压缩进行中：分割线为 running，不显示摘要与起始文案
     await timeline.send(compactionStarted({ sessionID, reason: "auto" }))
     await timeline.send(compactionDelta({ sessionID, text: "Partial automatic summary." }))
     const compaction = page.locator('[data-component="session-compaction-message"]')
@@ -1633,6 +1806,7 @@ test.describe("compaction", () => {
     await expect(compaction).not.toContainText("Partial automatic summary.")
     await expect(compaction).not.toContainText("Session compaction started")
 
+    // 结束后：分割线变为 done（无障碍名 Compacted），点击才展开摘要
     await timeline.send(compactionEnded({ sessionID, reason: "auto", text: "## Checkpoint\n\nAutomatic details." }))
     await expect(divider).toHaveAttribute("data-state", "done")
     await expect(divider).toHaveAccessibleName("Compacted")
@@ -1641,6 +1815,7 @@ test.describe("compaction", () => {
     await expect(compaction).toContainText("Automatic details.")
   })
 
+  // 三种结局的夹具：失败（展示提供商错误）、取消（隐藏细节）、中断（隐藏细节）
   const outcomes = {
     failed: {
       reason: "auto",
@@ -1671,6 +1846,7 @@ test.describe("compaction", () => {
   const labels = Object.values(outcomes).map((outcome) => outcome.label)
 
   // Failed then cancelled share one history, so each boundary must keep its own outcome.
+  // failed 与 cancelled 共享同一段历史，因此每个边界都必须保留自己的结局
   for (const names of [["failed", "cancelled"], ["interrupted"]] as const) {
     test(`ends running compactions as ${names.join(", then ")}`, async ({ page }) => {
       const timeline = await setupTimeline(
@@ -1682,6 +1858,7 @@ test.describe("compaction", () => {
 
       const compactions = page.locator('[data-component="session-compaction-message"]')
 
+      // 逐个发起压缩并以其结局终止
       for (const [index, name] of names.entries()) {
         const outcome = outcomes[name]
         await timeline.send(compactionStarted({ sessionID, reason: outcome.reason, recent: "" }))
@@ -1691,6 +1868,7 @@ test.describe("compaction", () => {
         await expect(compaction).toContainText(outcome.partial)
 
         if (name === "interrupted") {
+          // 中断结局：通过 Stop 按钮发出中断请求
           await expect(compaction.getByRole("status").getByLabel("Compacting", { exact: true })).toBeVisible()
 
           const request = page.waitForRequest(
@@ -1708,6 +1886,7 @@ test.describe("compaction", () => {
 
       await expect(compactions).toHaveCount(names.length)
 
+      // 每段压缩各自保留：起始与结局文案正确、无其他结局、无完成文案、流式摘要被丢弃
       for (const [index, name] of names.entries()) {
         const outcome = outcomes[name]
         const compaction = compactions.nth(index)
@@ -1728,21 +1907,25 @@ test.describe("compaction", () => {
   }
 })
 
+// 归约器加固：idle 早于最终部件与消息完成到达时仍收敛
 test("reducer-hardening: converges when idle arrives before final part and message completion", async ({ page }) => {
   const textID = "prt_event_order_text"
   const assistant = assistantMessage([textPart(textID, "Partial")], { completed: false })
   const timeline = await setupTimeline(page, { messages: [userMessage(), assistant] })
+  // 先 busy 再 idle，之后才送来最终文本与消息完成
   await timeline.send(status("busy"))
   await timeline.send(status("idle"))
   await timeline.send(partUpdated(textPart(textID, "Final after early idle")))
   await timeline.send(messageUpdated(completedAssistantInfo(assistant)))
 
+  // 无 Thinking 残留；最终文本被正确展示
   await expect(page.locator('[data-timeline-row="Thinking"]')).toHaveCount(0)
   await expect(page.locator(`[data-timeline-part-id="${renderedPartID(textID)}"]`)).toContainText(
     "Final after early idle",
   )
 })
 
+// 时间线预设切换与自定义 thinking 详情的持久化
 test("changes timeline presets and saves custom thinking details", async ({ page }) => {
   await setupTimeline(page, {
     messages: [
@@ -1754,23 +1937,27 @@ test("changes timeline presets and saves custom thinking details", async ({ page
   })
   const part = page.locator(`[data-timeline-part-id="${assistantID}:reasoning:0"]`)
   const settings = page.getByTestId("settings-screen")
+  // 打开设置页
   await page.keyboard.press("Control+,")
   const slider = settings.getByRole("slider", { name: "Timeline detail", exact: true })
   await expect(slider).toBeEnabled()
   await slider.press("Home")
 
+  // 五档预设逐档校验：值与可读名一一对应
   for (const [index, name] of ["Messages only", "Quiet", "Compact", "Detailed", "Everything"].entries()) {
     if (index) await slider.press("ArrowRight")
     await expect(slider).toHaveValue(String(index))
     await expect(slider).toHaveAttribute("aria-valuetext", name)
   }
 
+  // 跳到末档并进入高级：两个开关原为关
   await slider.press("End")
   await settings.getByRole("button", { name: "Advanced", exact: true }).click()
   const grouped = settings.getByRole("switch", { name: "Thinking grouped", exact: true })
   const collapsed = settings.getByRole("switch", { name: "Thinking collapsed", exact: true })
   await expect(grouped).not.toBeChecked()
   await expect(collapsed).not.toBeChecked()
+  // 切换两个开关：滑杆显示 Custom，且 localStorage 已写入该组合
   await settings.locator('[data-category="thinking"][data-field="placement"] [data-slot="switch-control"]').click()
   await settings.locator('[data-category="thinking"][data-field="details"] [data-slot="switch-control"]').click()
   await expect(grouped).toBeChecked()
@@ -1781,6 +1968,7 @@ test("changes timeline presets and saves custom thinking details", async ({ page
       page.evaluate(() => JSON.parse(localStorage.getItem("settings.v3") ?? "{}").general?.timelineDetail?.thinking),
     )
     .toEqual({ placement: "grouped", details: "collapsed" })
+  // 返回应用：自定义设置生效（折叠的 Thought 分组）
   await settings.getByRole("button", { name: "Back to app", exact: true }).click()
   await expect(settings).toBeHidden()
   await page.getByRole("button", { name: "Used 1 Thought", exact: true }).click()
@@ -1789,7 +1977,9 @@ test("changes timeline presets and saves custom thinking details", async ({ page
   await expect(part.getByText("The selected mode controls these details.", { exact: true })).toBeVisible()
 })
 
+// shell 完成测试组
 test.describe("shell completion", () => {
+  // 运行中的后台 shell 夹具
   const background = {
     id: "sh_background",
     status: "running",
@@ -1802,11 +1992,13 @@ test.describe("shell completion", () => {
   } satisfies ShellInfo
 
   // Every exit status takes the same completion path, so one grouped and one standalone row cover it.
+  // 所有退出状态走同一条完成路径，因此分组与独立各一行即可覆盖
   for (const { grouped, exit } of [
     { grouped: false, exit: "exited" },
     { grouped: true, exit: "killed" },
   ] as const) {
     test(`stops ${grouped ? "grouped" : "standalone"} background shell shimmer when ${exit}`, async ({ page }) => {
+      // 分组模式下多带一个前置 read
       const message: SessionMessageAssistant = {
         id: "msg_background",
         type: "assistant",
@@ -1845,12 +2037,15 @@ test.describe("shell completion", () => {
         time: { created: 2, completed: 3 },
       }
 
+      // 完成状态与请求计数
       const state = { finished: false, requests: 0 }
       // Larger than one server page (65,536 bytes), so the final output is read in two pages. The card shows its most
       // recent 64 KiB.
+      // 超过一个服务端分页（65,536 字节），最终输出分两页读取。卡片显示最近 64 KiB
       const finished = `Checking project\n${Array.from({ length: 8_192 }, (_, index) => `step ${String(index + 1).padStart(5, "0")}\n`).join("")}Check finished\n`
       const tail = finished.slice(-64 * 1024)
       // Byte cursors of this shell's output reads.
+      // 记录该 shell 输出读取的字节游标
       const reads: number[] = []
       page.on("request", (request) => {
         const url = new URL(request.url())
@@ -1867,6 +2062,7 @@ test.describe("shell completion", () => {
           { id: "msg_user", type: "user", text: "Run two independent checks.", time: { created: 1 } },
           message,
         ],
+        // shell 列表按状态动态返回；输出按 id 返回（完成后才给全文）
         shellCommands: () => [...(state.finished ? [] : [background]), { ...background, id: "sh_other" }],
         shellOutput: ({ id }) => {
           if (id !== background.id) return "Checking project\n"
@@ -1876,6 +2072,7 @@ test.describe("shell completion", () => {
         },
       })
 
+      // 安装受控时钟后重载页面
       await page.clock.install()
       await page.reload()
       await timeline.transport.waitForConnection()
@@ -1885,6 +2082,7 @@ test.describe("shell completion", () => {
         .locator(':scope > [data-component="collapsible"] > [data-slot="collapsible-trigger"]')
 
       if (grouped) {
+        // 分组模式：三部件同组，展开分组
         await expect(page.locator('[data-component="collapsed-tool-group"]')).toHaveAttribute(
           "data-timeline-part-ids",
           "call_read,call_sh_background,call_sh_other",
@@ -1893,15 +2091,18 @@ test.describe("shell completion", () => {
         await groupTrigger.click()
       }
 
+      // 两个 shell 的 shimmer 都激活
       const card = page.locator(`[data-timeline-part-id="call_${background.id}"]`)
       const shimmer = card.locator('[data-component="text-shimmer"]')
       const other = page.locator('[data-timeline-part-id="call_sh_other"] [data-component="text-shimmer"]')
       await expect(shimmer).toHaveAttribute("data-active", "true")
       await expect(other).toHaveAttribute("data-active", "true")
 
+      // 展开卡片可见运行中的输出
       if (grouped) await card.locator('[data-slot="collapsible-trigger"]').click()
       await expect(card.locator('[data-slot="bash-result"]')).toHaveText("Checking project")
 
+      // shell 退出：该卡片 shimmer 停止、显示最终输出的 64 KiB 尾部；另一个仍在跑
       state.finished = true
       await timeline.transport.send({
         id: "evt_shell_exited",
@@ -1914,13 +2115,16 @@ test.describe("shell completion", () => {
       await expect(other).toHaveAttribute("data-active", "true")
       await expect(card.locator('[data-slot="bash-result"]')).toHaveText(tail)
       // The first page from the running output's cursor ends 65,536 bytes later; the second page starts there.
+      // 第一页从运行输出的游标起 65,536 字节后结束；第二页从那里开始
       expect(reads).toContain(17 + 65_536)
       await expect(card.locator('[data-slot="collapsible-trigger"]')).toHaveAttribute("aria-expanded", "true")
 
+      // 快进 5 秒：不应再发起任何输出读取（无轮询）
       const requests = state.requests
       await page.clock.fastForward(5_000)
       expect(state.requests).toBe(requests)
 
+      // 刷新后重新验证（游标清零）
       reads.length = 0
       await page.reload()
 
@@ -1929,12 +2133,14 @@ test.describe("shell completion", () => {
       await expect(other).toHaveAttribute("data-active", "true")
 
       // An expanded card reads the exited shell's final output from the start, again in two pages.
+      // 独立展开的卡片从头读取已退出的 shell 的最终输出，同样分两页
       if (grouped) return
       await expect(card.locator('[data-slot="bash-result"]')).toHaveText(tail)
       expect(reads).toContain(65_536)
     })
   }
 
+  // 流式 shell 输出之后，以权威的前台结果为准
   test("shows the authoritative foreground result after streaming shell output", async ({ page }) => {
     const timeline = await setupTimeline(page, {
       settings: { shellToolPartsExpanded: true },
@@ -1966,8 +2172,10 @@ test.describe("shell completion", () => {
 
     const card = page.locator('[data-timeline-part-id="call_foreground"]')
     const shimmer = card.locator('[data-component="text-shimmer"]')
+    // 流式阶段显示部分输出
     await expect(shimmer).toHaveAttribute("data-active", "true")
     await expect(card.locator('[data-slot="bash-result"]')).toHaveText("Checking project")
+    // 工具成功事件：以事件内容为权威结果，shimmer 停止
     await timeline.transport.send({
       id: "evt_foreground_complete",
       created: 3,
@@ -1989,7 +2197,9 @@ test.describe("shell completion", () => {
   })
 })
 
+// 引用时间线文本进输入框：带或不带评论均可
 test("quotes plain timeline text into the composer, with or without a comment", async ({ page }) => {
+  // 捕获提交的提示与元数据
   const prompts: string[] = []
   const metadata: unknown[] = []
   await setupTimeline(page, {
@@ -2003,11 +2213,13 @@ test("quotes plain timeline text into the composer, with or without a comment", 
     },
   })
 
+  // 用户文本与回答文本的选择器
   const user = '[data-slot="user-message-text"]'
   const answer = `[data-timeline-part-id="${renderedPartID("prt_quote_answer")}"] [data-slot="text-part-body"]`
   await expect(page.locator(answer).getByText("bundle", { exact: true })).toBeVisible()
   await expect(page.locator('[data-component="composer-editor"]')).toBeFocused()
 
+  // 用 Range 从 from 元素开头选到 to 元素末尾
   const select = (from: string, to: string) =>
     page.evaluate(
       (selectors) => {
@@ -2024,6 +2236,7 @@ test("quotes plain timeline text into the composer, with or without a comment", 
     )
 
   // A selection across the user's message and the answer quotes their text, not the controls between them.
+  // 跨用户消息与回答的选择只引用它们的文本，不含两者之间的控件
   await select(user, answer)
   const toolbar = page.getByRole("toolbar", { name: "Quote selection" })
   await toolbar.getByRole("button", { name: "Quote", exact: true }).click()
@@ -2031,6 +2244,7 @@ test("quotes plain timeline text into the composer, with or without a comment", 
   const chips = page.locator('[data-component="composer-attachments"] [data-component="attachment-card"]')
   await expect(chips).toHaveCount(1)
   await expect(chips).toContainText("Explain the build")
+  // 弹出可选评论框：占位符与单个 Done 按钮（带 mask 图标）
   const comment = page.locator('[data-component="composer-quote-comment"] textarea')
   await expect(comment).toBeFocused()
   await expect(comment).toHaveAttribute("placeholder", "Add an optional comment...")
@@ -2045,6 +2259,7 @@ test("quotes plain timeline text into the composer, with or without a comment", 
   await expect(chips).toHaveCount(1)
 
   // A quote's chip takes its comment; saving an emptied comment clears it again.
+  // 引用的 chip 保存其评论；清空后保存会再次清除
   await select(answer, answer)
   await toolbar.getByRole("button", { name: "Quote", exact: true }).click()
   await expect(chips).toHaveCount(2)
@@ -2055,6 +2270,7 @@ test("quotes plain timeline text into the composer, with or without a comment", 
   await comment.press("Alt+Enter")
   await expect(comment).toHaveCount(0)
   await expect(chips.nth(1)).toContainText("Why three?")
+  // 重新打开 chip 的评论框：Save 按钮出现
   await chips.nth(1).click()
   await expect(comment).toHaveValue("Why three?")
   await expect(popover.getByRole("button")).toHaveCount(1)
@@ -2073,6 +2289,7 @@ test("quotes plain timeline text into the composer, with or without a comment", 
   await expect(chips.nth(1)).toContainText("Why two?")
 
   // The shell turns selection off, so select all in the timeline selects its conversation and offers to quote it.
+  // shell 会关闭选区，因此时间线里的全选选中其会话并给出引用入口
   await page.locator(answer).getByText("bundle", { exact: true }).click()
   await page.keyboard.press(
     await page.evaluate(() => (/(Mac|iPod|iPhone|iPad)/.test(navigator.platform) ? "Meta+a" : "Control+a")),
@@ -2081,6 +2298,7 @@ test("quotes plain timeline text into the composer, with or without a comment", 
   await page.keyboard.press("Escape")
   await expect(toolbar).toHaveCount(0)
 
+  // 提交：提示文本由引用块与评论组成（Markdown 引用格式）
   const editor = page.locator('[data-component="composer-editor"]')
   await editor.press("Enter")
   await expect
@@ -2112,6 +2330,7 @@ test("quotes plain timeline text into the composer, with or without a comment", 
   await expect(chips).toHaveCount(0)
 })
 
+// 引用弹窗独立发送：不吞掉草稿或其他引用
 test("quote popup sends independently without consuming the draft or other quotes", async ({ page }) => {
   const sent: string[] = []
 
@@ -2131,10 +2350,12 @@ test("quote popup sends independently without consuming the draft or other quote
     .getByRole("button", { name: "Quote", exact: true })
 
   await expect(answer).toHaveText("Keep this quoted passage.")
+  // 先写草稿，Alt 点击直接添加引用（不弹评论框）
   await editor.fill("Keep my separate draft")
   await selectQuoteText(answer)
   await quote.click({ modifiers: ["Alt"] })
   await expect(editor).toBeFocused()
+  // 普通点击打开评论弹窗
   await selectQuoteText(answer)
   await quote.click()
   const popup = page.locator('[data-component="composer-quote-comment"]')
@@ -2145,6 +2366,7 @@ test("quote popup sends independently without consuming the draft or other quote
 
   const modifier = await page.evaluate(() => (/(Mac|iPod|iPhone|iPad)/.test(navigator.platform) ? "Meta" : "Control"))
 
+  // 评论框内按修饰键+Enter：以 "Send quote" 独立发送（steer）
   await expect(comment).toBeFocused()
   await comment.fill("Explain this please")
   await action.focus()
@@ -2154,6 +2376,7 @@ test("quote popup sends independently without consuming the draft or other quote
   await page.keyboard.up(modifier)
   await expect(popup).toHaveCount(0)
   await expect.poll(() => sent).toEqual(["steer"])
+  // 草稿原样保留，其余引用未受影响
   await expect(editor).toHaveText("Keep my separate draft")
   const remaining = page.locator('[data-component="composer-attachments"] [data-component="attachment-card"]')
 
@@ -2162,6 +2385,7 @@ test("quote popup sends independently without consuming the draft or other quote
   await expect(remaining).not.toContainText("Explain this please")
 })
 
+// 待发送的引用隐藏提及且评论只读
 test("a pending quote send hides mentions and keeps the comment read-only", async ({ page }) => {
   const sent: string[] = []
 
@@ -2190,24 +2414,29 @@ test("a pending quote send hides mentions and keeps the comment read-only", asyn
 
   const modifier = await page.evaluate(() => (/(Mac|iPod|iPhone|iPad)/.test(navigator.platform) ? "Meta" : "Control"))
 
+  // 评论里的 @ 提及匹配到文件
   await comment.fill("Explain @src/a")
   await expect(popup.locator('[data-slot="line-comment-v2-mention-item"]')).toHaveCount(1)
+  // 阻塞 prompt 路由以制造在途发送
   const admission = await holdRoute(page, new RegExp(`/api/session/${sessionID}/prompt(\\?|$)`), { method: "POST" })
 
   await popup.locator('[data-slot="line-comment-v2-submit"]').click({ modifiers: [modifier] })
   await admission.arrived
+  // 在途期间：按钮禁用、评论只读、加载器可见、提及隐藏
   await expect(popup.getByRole("button")).toBeDisabled()
   await expect(comment).toHaveAttribute("readonly", "")
   await expect(popup.locator('[data-component="loader-v2"]')).toBeVisible()
   await expect(popup.locator('[data-slot="line-comment-v2-mention-item"]')).toHaveCount(0)
   await comment.press("Tab")
   await expect(comment).toHaveValue("Explain @src/a")
+  // 只发送一次；放行后 delivery 因 busy 而排队
   expect(admission.requests).toHaveLength(1)
   admission.release()
   await expect(popup).toHaveCount(0)
   await expect.poll(() => sent).toEqual(["queue"])
 })
 
+// 双击发送只发一次，弹窗保持到发送结算
 test("a double-clicked quote send sends once and keeps the popup open until it settles", async ({ page }) => {
   const sent: string[] = []
 
@@ -2235,9 +2464,11 @@ test("a double-clicked quote send sends once and keeps the popup open until it s
   await popup.locator("textarea").fill("Only once")
   const admission = await holdRoute(page, new RegExp(`/api/session/${sessionID}/prompt(\\?|$)`), { method: "POST" })
 
+  // 双击发送：请求只到达一次
   await popup.locator('[data-slot="line-comment-v2-submit"]').dblclick({ modifiers: [modifier] })
   await admission.arrived
   // A click on the quote's chip while the send is in flight leaves the popup and its pending send alone.
+  // 在途时点击引用 chip：弹窗与其待发送都不受影响
   await chip.click()
   await expect(popup.locator('[data-component="loader-v2"]')).toBeVisible()
   admission.release()
@@ -2246,6 +2477,7 @@ test("a double-clicked quote send sends once and keeps the popup open until it s
   expect(admission.requests).toHaveLength(1)
 })
 
+// 选中目标元素全部内容（供引用选择用）
 function selectQuoteText(target: Locator) {
   return target.evaluate((element) => {
     const range = document.createRange()
@@ -2256,6 +2488,7 @@ function selectQuoteText(target: Locator) {
   })
 }
 
+// 失败的直接引用发送：弹窗与评论保留供重试
 test("a failed direct quote send keeps the popup and comment for retry", async ({ page }) => {
   let reject = true
 
@@ -2282,11 +2515,13 @@ test("a failed direct quote send keeps the popup and comment for retry", async (
 
   const modifier = await page.evaluate(() => (/(Mac|iPod|iPhone|iPad)/.test(navigator.platform) ? "Meta" : "Control"))
 
+  // 发送失败：显示告警，评论保留且可编辑
   await comment.fill("Keep my latest comment")
   await comment.press(`${modifier}+Enter`)
   await expect(popup.getByRole("alert")).toHaveText("Couldn’t send. Your comment is still here. Try again.")
   await expect(comment).toHaveValue("Keep my latest comment")
   await expect(comment).toBeEditable()
+  // 关闭失败开关后重试：成功关闭弹窗并清空 chips
   reject = false
   await popup.getByRole("button").click({ modifiers: [modifier] })
   await expect(popup).toHaveCount(0)
@@ -2295,6 +2530,7 @@ test("a failed direct quote send keeps the popup and comment for retry", async (
   )
 })
 
+// 引用评论打开期间，高亮其精确的重复段落
 test("highlights the exact duplicate passage whenever its quote comment is open", async ({ page }) => {
   let reject = true
   await setupTimeline(page, {
@@ -2316,6 +2552,7 @@ test("highlights the exact duplicate passage whenever its quote comment is open"
   const second = page.locator(`[data-timeline-part-id="${secondID}"] [data-slot="text-part-body"]`)
   await expect(second).toHaveText("The same quoted words. The same quoted words.")
 
+  // 读取 highlight 注册表：高亮来源部件、文本与在正文中的偏移区间
   const highlights = () =>
     page.evaluate(() =>
       ["timeline-quote-source"].map((name) =>
@@ -2340,6 +2577,7 @@ test("highlights the exact duplicate passage whenever its quote comment is open"
 
   const selectionCollapsed = () => page.evaluate(() => window.getSelection()?.isCollapsed ?? true)
 
+  // 从字符偏移 start 起选中 22 个字符（跨文本节点定位）
   const select = (target: Locator, start: number) =>
     target.evaluate((element, start) => {
       const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
@@ -2375,11 +2613,13 @@ test("highlights the exact duplicate passage whenever its quote comment is open"
     exact: true,
   })
 
+  // 两个相同段落的精确区间
   const firstRange = { part: firstID, text: "The same quoted words.", start: 0, end: 22 }
   const secondRange = { part: secondID, text: "The same quoted words.", start: 23, end: 45 }
 
   const scroll = page.locator('[data-slot="session-timeline-scroll"] > [data-scrollable]')
 
+  // 第一段第一个实例：引用并写入评论，高亮随之出现；短引用不提供跳转按钮
   await scroll.focus()
   await select(first, 0)
   await toolbar.getByRole("button", { name: "Quote", exact: true }).click()
@@ -2388,6 +2628,7 @@ test("highlights the exact duplicate passage whenever its quote comment is open"
   await expect.poll(highlights).toEqual([[firstRange]])
   await expect(jump).toHaveCount(0)
 
+  // 深浅两种配色下，::selection 与 ::highlight 的背景一致且保留文字颜色
   for (const palette of [
     { colorScheme: "dark" as const, background: "color(srgb 0.635294 0.737255 1 / 0.25)" },
     { colorScheme: "light" as const, background: "color(srgb 0.133333 0.219608 0.560784 / 0.1)" },
@@ -2412,11 +2653,13 @@ test("highlights the exact duplicate passage whenever its quote comment is open"
       ])
   }
 
+  // 提交评论：高亮清除、焦点回编辑器
   await comment.press("Enter")
   await expect(comment).toHaveCount(0)
   await expect.poll(highlights).toEqual([[]])
   await expect(editor).toBeFocused()
 
+  // Alt 点击添加第二段引用：选区塌陷、无高亮（未打开评论）
   await select(second, 23)
   await toolbar.getByRole("button", { name: "Quote", exact: true }).click({ modifiers: ["Alt"] })
   await expect(chips).toHaveCount(2)
@@ -2425,12 +2668,14 @@ test("highlights the exact duplicate passage whenever its quote comment is open"
   await expect.poll(highlights).toEqual([[]])
 
   const before = await scroll.evaluate((element) => element.scrollTop)
+  // 悬停 chip 不滚动、不高亮
   await chips.nth(0).hover()
   await expect(editor).toBeFocused()
   expect(await scroll.evaluate((element) => element.scrollTop)).toBe(before)
   await expect.poll(highlights).toEqual([[]])
 
   // Reopening either identical quote highlights its own part and exact occurrence, never a text search match.
+  // 重新打开任一相同引用：高亮它自己的部件与确切出现位置，绝不按文本搜索匹配
   await chips.nth(0).click()
   await expect(comment).toBeFocused()
   await expect(comment).toHaveValue("Keep this passage visible while I write.")
@@ -2447,6 +2692,7 @@ test("highlights the exact duplicate passage whenever its quote comment is open"
   await expect.poll(highlights).toEqual([[]])
 
   // Reopening a short quote never navigates to its offscreen source.
+  // 重新打开短引用绝不导航到其离屏的来源
   await scroll.hover({ position: { x: 20, y: 100 } })
   await page.mouse.wheel(0, -10000)
   await expect(second).not.toBeInViewport()
@@ -2459,6 +2705,7 @@ test("highlights the exact duplicate passage whenever its quote comment is open"
   await comment.press("Escape")
   await expect(chips.nth(1)).not.toContainText("An unsaved short-quote comment")
 
+  // 移除第一个附件 chip
   await page
     .locator('[data-component="composer-attachments"]')
     .getByRole("button", { name: "Remove attachment" })
@@ -2466,6 +2713,7 @@ test("highlights the exact duplicate passage whenever its quote comment is open"
     .click()
   await expect(chips).toHaveCount(1)
 
+  // 发送被 500 拒绝：chips 保留
   const rejected = page.waitForResponse(
     (response) =>
       response.request().method() === "POST" && response.url().includes("/prompt") && response.status() === 500,
@@ -2482,6 +2730,7 @@ test("highlights the exact duplicate passage whenever its quote comment is open"
   await expect(page.locator('[data-component="timeline-quote-background"]')).toHaveCount(0)
 })
 
+// 引用换行且带格式的文本后，原生选区行高保持不变
 test("keeps the native selection height after quoting wrapped and formatted text", async ({ page }) => {
   await setupTimeline(page, {
     messages: [
@@ -2499,6 +2748,7 @@ test("keeps the native selection height after quoting wrapped and formatted text
     `[data-timeline-part-id="${renderedPartID("prt_quote_height")}"] [data-slot="text-part-body"]`,
   )
 
+  // 选中段落中部（跨行、含格式）
   await expect(source).toContainText("A selected passage with bold text and inline code")
   await source.evaluate((element) => {
     const paragraph = element.querySelector("p")!
@@ -2514,6 +2764,7 @@ test("keeps the native selection height after quoting wrapped and formatted text
     .click()
   await expect(page.locator('[data-component="composer-quote-comment"] textarea')).toBeFocused()
 
+  // 窄视口：逐行背景块的行高与原文本一致
   await page.setViewportSize({ width: 700, height: 900 })
   const height = await source.locator("p").evaluate((element) => parseFloat(getComputedStyle(element).lineHeight))
   await expect
@@ -2529,9 +2780,11 @@ test("keeps the native selection height after quoting wrapped and formatted text
     .toBe(true)
 
   // The source-open preview is compact; editing the attached quote reveals up to four lines of the same passage.
+  // 来源打开时的预览是紧凑的（2 行）；编辑已附着的引用时展开至最多 4 行同一段落
   const popover = page.locator('[data-component="composer-quote-comment"]')
   const preview = popover.locator('[data-slot="line-comment-v2-preview"]')
 
+  // 预览的行数（按行高换算）
   const previewLines = () =>
     preview.evaluate(
       (element) => element.getBoundingClientRect().height / parseFloat(getComputedStyle(element).lineHeight),
@@ -2548,6 +2801,7 @@ test("keeps the native selection height after quoting wrapped and formatted text
   await expect.poll(previewLines).toBeCloseTo(4, 1)
 })
 
+// 长引用的来源在刷新后仍可恢复：编辑器打开时不发生滚动
 test("retains a long quote's source across reload without scrolling when its editor opens", async ({ page }) => {
   const passage = `Keep this exact source highlighted. ${Array.from({ length: 60 }, (_, index) => `source-word-${index}`).join(" ")}`
 
@@ -2583,6 +2837,7 @@ test("retains a long quote's source across reload without scrolling when its edi
   await expect(comment).toBeFocused()
   await expect(chip).toContainText("Keep this exact source highlighted.")
 
+  // 读取仍连接的高亮区间文本
   const highlighted = () =>
     page.evaluate(() =>
       [...(CSS.highlights.get("timeline-quote-source") ?? [])].flatMap((range) =>
@@ -2592,6 +2847,7 @@ test("retains a long quote's source across reload without scrolling when its edi
 
   await expect.poll(highlighted).toEqual([passage])
 
+  // 保存评论：高亮清除
   const scroll = page.locator('[data-slot="session-timeline-scroll"] > [data-scrollable]')
   await comment.fill("Retained quote comment")
   await comment.press("Enter")
@@ -2599,6 +2855,7 @@ test("retains a long quote's source across reload without scrolling when its edi
   await expect(chip).toContainText("Retained quote comment")
   await expect.poll(highlighted).toEqual([])
 
+  // 切走标签页再切回：chip 恢复、无高亮、无评论框
   const href = new URL(page.url()).pathname
   await page.getByRole("button", { name: "Home", exact: true }).click()
   await expect(chip).toHaveCount(0)
@@ -2609,24 +2866,29 @@ test("retains a long quote's source across reload without scrolling when its edi
   await expect(comment).toHaveCount(0)
 
   // A fresh document must recover the local source anchor, not just the quote's displayed text.
+  // 全新文档必须恢复本地的来源锚点，而不仅是引用显示的文本
   const editor = page.locator('[data-component="composer-editor"]')
   await editor.fill("Retained composer draft")
   // Reload only after the editor's input has reached the durable draft, not merely its DOM.
+  // 等编辑器输入写入持久化草稿后再刷新，而不是只看 DOM
   await expect.poll(() => readSessionDraftText(page, sessionID)).toBe("Retained composer draft")
   await page.reload()
   await timeline.transport.waitForConnection()
   await expect(editor).toHaveText("Retained composer draft")
   await expect(chip).toContainText("Retained quote comment")
+  // 滚到顶部、来源离屏
   await scroll.hover({ position: { x: 20, y: 100 } })
   await page.mouse.wheel(0, -10000)
   await expect.poll(() => scroll.evaluate((element) => element.scrollTop)).toBe(0)
   await expect(source).not.toBeInViewport()
   const reloadedTop = await scroll.evaluate((element) => element.scrollTop)
+  // 打开 chip 的评论框：不滚动、来源保持离屏
   await chip.click()
   await expect(comment).toBeFocused()
   await expect(comment).toHaveValue("Retained quote comment")
   await expect(source).not.toBeInViewport()
   expect(await scroll.evaluate((element) => element.scrollTop)).toBe(reloadedTop)
+  // 滚到底部：来源进入视口，高亮恢复
   await scroll.hover({ position: { x: 20, y: 100 } })
   await page.mouse.wheel(0, 10000)
   await expect
@@ -2638,6 +2900,7 @@ test("retains a long quote's source across reload without scrolling when its edi
   await expect.poll(highlighted).toEqual([])
 })
 
+// 水平裁剪的代码引用高亮：不滚动其来源
 test("highlights a horizontally clipped code quote without scrolling its source", async ({ page }) => {
   const tail = `quoted tail start ${Array.from({ length: 40 }, (_, index) => `distinct-word-${index}`).join(" ")} quoted tail end`
 
@@ -2658,9 +2921,11 @@ test("highlights a horizontally clipped code quote without scrolling its source"
   const code = pre.locator("code")
   await expect(code).toContainText(tail)
   await expect(pre).toBeInViewport()
+  // pre 水平可滚动，滚到最右
   await expect.poll(() => pre.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeGreaterThan(0)
   await pre.evaluate((element) => element.scrollTo({ left: element.scrollWidth }))
 
+  // 判断尾部文本是否完整落在 pre 的滚动口内
   const tailVisible = () =>
     code.evaluate((element) => {
       const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
@@ -2668,6 +2933,7 @@ test("highlights a horizontally clipped code quote without scrolling its source"
 
       while (node) {
         // The full quote is wider than the scrollport; check its final words after the user scrolls back.
+        // 完整引用比滚动口更宽；用户滚回后检查其末尾文字
         const start = node.textContent?.indexOf("quoted tail end") ?? -1
 
         if (start >= 0) {
@@ -2696,6 +2962,7 @@ test("highlights a horizontally clipped code quote without scrolling its source"
     })
 
   await expect.poll(tailVisible).toBe(true)
+  // 选中尾部文本并引用
   await code.evaluate((element, tail) => {
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
     let node = walker.nextNode()
@@ -2730,6 +2997,7 @@ test("highlights a horizontally clipped code quote without scrolling its source"
   await popover.getByRole("button", { name: "Done", exact: true }).click()
   await expect(comment).toHaveCount(0)
 
+  // chip 只显示引用文本（截断 200 字符），不含前缀
   const chip = page.locator('[data-component="composer-attachments"] [data-component="attachment-card"]')
   await expect(chip).toContainText(tail.slice(0, 200))
   await expect(chip).not.toContainText("unquoted prefix")
@@ -2744,6 +3012,7 @@ test("highlights a horizontally clipped code quote without scrolling its source"
   await comment.press("Enter")
   await expect(comment).toHaveCount(0)
 
+  // pre 滚回最左：垂直滚动位置不变，尾部不再可见
   const timeline = page.locator('[data-slot="session-timeline-scroll"] > [data-scrollable]')
   const top = await timeline.evaluate((element) => element.scrollTop)
   await pre.evaluate((element) => element.scrollTo({ left: 0 }))
@@ -2752,6 +3021,7 @@ test("highlights a horizontally clipped code quote without scrolling its source"
   expect(await timeline.evaluate((element) => element.scrollTop)).toBe(top)
 
   // Opening even a long quote keeps the nested horizontal scroll exactly where the user left it.
+  // 打开长引用也保持嵌套的水平滚动位置，与用户离开时完全一致
   await chip.click()
   await expect(comment).toBeFocused()
   await expect.poll(highlighted).toEqual([tail])
@@ -2763,6 +3033,7 @@ test("highlights a horizontally clipped code quote without scrolling its source"
   await expect.poll(() => pre.evaluate((element) => element.scrollLeft)).toBe(0)
   expect(await timeline.evaluate((element) => element.scrollTop)).toBe(top)
 
+  // 滚回最右：尾部可见、高亮恢复；Escape 关闭后 chip 重新打开仍显示已保存评论
   await pre.evaluate((element) => element.scrollTo({ left: element.scrollWidth }))
   await expect.poll(tailVisible).toBe(true)
   await expect.poll(highlighted).toEqual([tail])
@@ -2774,6 +3045,7 @@ test("highlights a horizontally clipped code quote without scrolling its source"
   await expect.poll(highlighted).toEqual([tail])
 })
 
+// 跨 diff 查看器选择的表格行与 diff 行可被引用
 test("quotes table rows and diff lines selected across a diff viewer", async ({ page }) => {
   const prompts: string[] = []
   await setupTimeline(page, {
@@ -2813,13 +3085,16 @@ test("quotes table rows and diff lines selected across a diff viewer", async ({ 
     onPrompt: (input) => void prompts.push(String(input.body.text)),
   })
 
+  // diff 的删除行与新增行
   const removed = page.locator('[data-line-type="change-deletion"][data-line]')
   const added = page.locator('[data-line-type="change-addition"][data-line]')
   await expect(added).toHaveText("export const value = 'after'")
+  // ::selection 配色固定
   await expect
     .poll(() => added.evaluate((element) => getComputedStyle(element, "::selection").backgroundColor))
     .toBe("color(srgb 0.133333 0.219608 0.560784 / 0.1)")
 
+  // 从 from 到 to 的鼠标拖选
   const drag = async (from: Locator, to: Locator) => {
     const start = await from.boundingBox()
     const end = await to.boundingBox()
@@ -2835,11 +3110,13 @@ test("quotes table rows and diff lines selected across a diff viewer", async ({ 
   const chips = page.locator('[data-component="composer-attachments"] [data-component="attachment-card"]')
 
   // Headers are unselectable chrome; body cells quote with tabs, followed by the diff lines and their markers.
+  // 表头是不可选的装饰；单元格引用以制表符连接，diff 行带 +/- 标记
   await drag(page.locator("td").getByText("a.ts", { exact: true }), added)
   await toolbar.getByRole("button", { name: "Quote", exact: true }).click()
   await expect(chips).toHaveCount(1)
   await expect(page.locator('[data-component="composer-quote-comment"] textarea')).toBeFocused()
 
+  // 读取 shadow root 内的高亮区间
   const diffHighlights = (name: string) =>
     page.evaluate(
       (name) =>
@@ -2856,6 +3133,7 @@ test("quotes table rows and diff lines selected across a diff viewer", async ({ 
   await expect.poll(() => diffHighlights("timeline-quote-source")).toEqual([])
 
   // The quote stops where a selection inside the diff viewer ends.
+  // 引用止于 diff 查看器内选择结束的位置
   await drag(page.locator("td").getByText("a.ts", { exact: true }), removed)
   await toolbar.getByRole("button", { name: "Quote", exact: true }).click({ modifiers: ["Alt"] })
   await expect(chips).toHaveCount(2)
@@ -2878,6 +3156,7 @@ test("quotes table rows and diff lines selected across a diff viewer", async ({ 
     ])
 })
 
+// 引用操作按钮按选择朝向的一端放置
 test("places the quote action by the end a selection was made towards", async ({ page }) => {
   const paragraph = Array.from(
     { length: 14 },
@@ -2907,6 +3186,7 @@ test("places the quote action by the end a selection was made towards", async ({
     return value
   }
 
+  // 鼠标拖选并返回工具栏盒子
   const drag = async (from: { x: number; y: number }, to: { x: number; y: number }) => {
     await page.mouse.move(from.x, from.y)
     await page.mouse.down()
@@ -2918,6 +3198,7 @@ test("places the quote action by the end a selection was made towards", async ({
   }
 
   // The middle of the selected text, whose right edge is ragged where its lines wrap.
+  // 选中文本的水平中点（换行处右缘参差）
   const middle = () =>
     page.evaluate(() => {
       const rects = [...(window.getSelection()?.getRangeAt(0).getClientRects() ?? [])].filter((rect) => rect.width > 0)
@@ -2926,6 +3207,7 @@ test("places the quote action by the end a selection was made towards", async ({
     })
 
   // Pressing inside a selection drags its text, so each case starts from no selection.
+  // 在选区内按下会拖拽文本，因此每种情形都从无选区开始
   const clear = async () => {
     await page.keyboard.press("Escape")
     await expect(toolbar).toHaveCount(0)
@@ -2938,27 +3220,32 @@ test("places the quote action by the end a selection was made towards", async ({
   const end = { x: lines.x + lines.width - 1, y: lines.y + lines.height - 8 }
 
   // A short selection keeps the action above it, even when dragged down.
+  // 短选择即使向下拖，按钮也在其上方
   const short = await drag(start, { x: lines.x + 200, y: lines.y + 30 })
   expect(short.y + short.height).toBeLessThanOrEqual(lines.y)
   expect(Math.abs(short.x + short.width / 2 - (await middle()))).toBeLessThan(2)
   await clear()
 
   // A tall downward selection puts the action below its last line, centred on the lines.
+  // 高的向下选择把按钮放在最后一行之下、按行居中
   const down = await drag(start, end)
   expect(down.y).toBeGreaterThanOrEqual(lines.y + lines.height)
   expect(Math.abs(down.x + down.width / 2 - (await middle()))).toBeLessThan(2)
   await clear()
 
   // A tall upward one puts it above its first line.
+  // 高的向上选择放在首行之上
   const up = await drag(end, start)
   expect(up.y + up.height).toBeLessThanOrEqual(lines.y)
   expect(Math.abs(up.x + up.width / 2 - (await middle()))).toBeLessThan(2)
   await clear()
 
   // A single line keeps it above the selection, centred on it, whichever way it was made.
+  // 单行选择无论方向，按钮都在其上方并水平居中
   const word = page.getByText("A short line with a word.", { exact: true })
 
   // The paragraph spans the column; the text inside it is narrower.
+  // 段落横跨整列；其内文本更窄
   const line = await word.evaluate((element) => {
     element.scrollIntoView({ block: "center" })
     const range = document.createRange()
@@ -2978,6 +3265,7 @@ test("places the quote action by the end a selection was made towards", async ({
   await clear()
 
   // A narrower timeline, as when a side panel opens, moves the action with the reflowed text.
+  // 时间线变窄（如打开侧栏）时按钮随重排文本移动
   const scroll = page.locator('[data-slot="session-timeline-scroll"]')
 
   const centre = async () => {
@@ -2995,6 +3283,7 @@ test("places the quote action by the end a selection was made towards", async ({
   await clear()
 
   // A selection running past both edges of the timeline pins the action to its bottom.
+  // 选择越过时间线两端的边缘时，按钮固定在其底部
   await first.click()
   await page.keyboard.press("ControlOrMeta+a")
   await expect(toolbar).toBeVisible()
@@ -3005,6 +3294,7 @@ test("places the quote action by the end a selection was made towards", async ({
     .toBe(Math.round(view.y + view.height - 8))
 })
 
+// 三击选中段落（选择越过到下一条消息）时引用按钮保持在段落旁
 test("keeps the quote action by a triple-clicked paragraph whose selection runs on to the next message", async ({
   page,
 }) => {
@@ -3032,6 +3322,7 @@ test("keeps the quote action by a triple-clicked paragraph whose selection runs 
   const paragraph = page.getByText("or else the turn whose reply is being read", { exact: false })
   await expect(paragraph).toBeVisible()
   // The selection ends at the start of the next message, past the tools between them.
+  // 选择结束于下一条消息的起点，越过中间的工具
   await paragraph.click({ clickCount: 3, position: { x: 4, y: 8 } })
   const toolbar = page.getByRole("toolbar", { name: "Quote selection" })
   await expect(toolbar).toBeVisible()
@@ -3040,10 +3331,12 @@ test("keeps the quote action by a triple-clicked paragraph whose selection runs 
 
   if (!text || !action) throw new Error("Element is not laid out")
   // One line, so the action sits just above it rather than below the tools the selection runs past.
+  // 单行文本：按钮贴在其上方，而不是选择越过的工具之下
   expect(action.y + action.height).toBeLessThanOrEqual(text.y)
   expect(action.y + action.height).toBeGreaterThanOrEqual(text.y - 10)
 
   // A press on unselectable space, which leaves the selection to the page, clears it before the button is released.
+  // 在不可选区域按下（选区交由页面处理）会在松开前清除选区
   const view = await page.locator('[data-slot="session-timeline-scroll"] .scroll-view__viewport').boundingBox()
 
   if (!view) throw new Error("Element is not laid out")
@@ -3054,6 +3347,7 @@ test("keeps the quote action by a triple-clicked paragraph whose selection runs 
   await page.mouse.up()
 })
 
+// 窄窗口鼠标锚定在选区上；触屏停靠在时间线底部
 for (const input of [
   { name: "a narrow window with a mouse anchors it to the selection", touch: false },
   { name: "a touch screen docks it to the timeline's bottom", touch: true },
@@ -3077,12 +3371,14 @@ for (const input of [
 
     if (!line || !view || !action) throw new Error("Element is not laid out")
 
+    // 触屏：按钮停靠在视口底 8px；鼠标：按钮在文本行之上
     if (input.touch) expect(Math.round(action.y + action.height)).toBe(Math.round(view.y + view.height - 8))
     else expect(action.y + action.height).toBeLessThanOrEqual(line.y)
 
     await toolbar.getByRole("button", { name: "Quote", exact: true }).click()
     const popover = page.locator('[data-component="composer-quote-comment"]')
     await expect(popover.locator("textarea")).toBeFocused()
+    // 弹窗必须整体落在视口内（四周至少 8px 边距）
     await expect
       .poll(() =>
         popover.evaluate((element) => {
@@ -3112,6 +3408,7 @@ for (const input of [
     await context.close()
   })
 
+// 引用操作旁可选评论框；Alt 点击跳过评论
 test("opens an optional comment beside the quote action and skips it with Alt-click", async ({ page }) => {
   await setupTimeline(page, {
     messages: [
@@ -3131,6 +3428,7 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
   const chips = page.locator('[data-component="composer-attachments"] [data-component="attachment-card"]')
   const comment = page.locator('[data-component="composer-quote-comment"] textarea')
 
+  // 按精确文本选中一个正文元素
   const select = async (text: string) => {
     await page
       .locator('[data-slot="text-part-body"]')
@@ -3140,6 +3438,7 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
   }
 
   // Alt-click adds the quote, leaves the comment closed, and returns the caret to where the draft left it.
+  // Alt 点击只添加引用：评论保持关闭，光标回到草稿原来的位置
   const editor = page.locator('[data-component="composer-editor"]')
   await editor.click()
   await page.keyboard.type("Draft")
@@ -3155,6 +3454,7 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
   await expect(chips).toHaveCount(0)
 
   // A slow tooltip names the action and its shortcut.
+  // 延迟提示注明动作与快捷键
   await select("The first sentence to quote.")
   await toolbar.getByRole("button", { name: "Quote", exact: true }).hover()
   const tooltip = page.locator('[data-component="tooltip-v2"]', { hasText: "Quote without comment" })
@@ -3162,6 +3462,7 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
   await expect(tooltip.locator('[data-slot="keybind-v2-label"]')).toHaveText([/^(⌥|Alt)$/])
 
   // Plain click replaces the quote action with a focused comment beside the same source.
+  // 普通点击：引用操作替换为同一来源旁的聚焦评论框
   const selected = await page.evaluate(() => {
     const rect = window.getSelection()!.getRangeAt(0).getBoundingClientRect()
 
@@ -3172,6 +3473,7 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
   await expect(chips).toHaveCount(1)
   await expect(comment).toBeFocused()
   const popover = page.locator('[data-component="composer-quote-comment"]')
+  // 弹窗底部距选区顶部 8px
   await expect
     .poll(async () => {
       const box = await popover.boundingBox()
@@ -3181,6 +3483,7 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
     .toBeLessThan(2)
 
   // Reflow must follow the current source glyphs, not the selection's old screen coordinates.
+  // 重排必须跟随当前来源字形，而不是选区旧的屏幕坐标
   await comment.fill("Unsaved reflow comment")
   await page.setViewportSize({ width: 700, height: 900 })
   await expect
@@ -3210,6 +3513,7 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
   await expect(comment).toHaveValue("Unsaved reflow comment")
 
   // An above-selection opening keeps its bottom/left while the input grows upwards.
+  // 在选区上方打开的弹窗：输入增高时保持底/左不动、向上生长
   await expect
     .poll(() =>
       comment.evaluate((element) => {
@@ -3246,12 +3550,14 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
     })
     .toBe(true)
 
+  // 输入评论并提交
   await comment.fill("")
   await page.keyboard.type("Why first?")
   await page.keyboard.press("Enter")
   await expect(comment).toHaveCount(0)
   await expect(chips.nth(0)).toContainText("Why first?")
 
+  // 第二条引用：无评论直接提交
   await select("The second sentence to quote.")
   await toolbar.getByRole("button", { name: "Quote", exact: true }).click()
   await expect(comment).toBeFocused()
@@ -3263,6 +3569,7 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
   await expect(editor).toBeFocused()
 
   // Reopening a quote uses its tile, not the original selection's position.
+  // 重新打开引用以它的 chip 为锚点，而不是原始选择的位置
   await chips.nth(1).click()
   await expect(comment).toBeFocused()
   await expect
@@ -3277,6 +3584,7 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
   await expect(editor).toBeFocused()
 
   // Escape and an unchanged click-away also keep newly attached quotes, without submitting a prompt.
+  // Escape 与"无改动的点击外部"同样保留新附着的引用，且不提交提示
   await select("The first sentence to quote.")
   await toolbar.getByRole("button", { name: "Quote", exact: true }).click()
   await expect(comment).toBeFocused()
@@ -3291,6 +3599,7 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
   await expect(chips).toHaveCount(4)
 })
 
+// 键盘可到达引用操作；超长选区被阻止
 test("reaches the quote action from the keyboard and blocks a selection over the limit", async ({ page }) => {
   await setupTimeline(page, {
     messages: [
@@ -3307,6 +3616,7 @@ test("reaches the quote action from the keyboard and blocks a selection over the
   const toolbar = page.getByRole("toolbar", { name: "Quote selection" })
 
   // A drag released where no pointerup arrives, such as outside the window, still lets the selection settle.
+  // 在没有 pointerup 的地方释放拖拽（例如窗外），选区依然能落定
   await short.click()
   await page.mouse.down()
   await page.evaluate(() => window.dispatchEvent(new Event("blur")))
@@ -3314,6 +3624,7 @@ test("reaches the quote action from the keyboard and blocks a selection over the
   await expect(toolbar).toBeVisible()
   await page.mouse.up()
 
+  // Tab 聚焦引用按钮；Escape 关闭后滚动视口获得焦点
   await page.keyboard.press("Tab")
   await expect(toolbar.getByRole("button", { name: "Quote", exact: true })).toBeFocused()
   await page.keyboard.press("Escape")
@@ -3324,6 +3635,7 @@ test("reaches the quote action from the keyboard and blocks a selection over the
   const composer = page.locator('[data-component="composer-editor"]')
 
   // Select all from the app menu covers the whole window; with focus in the timeline it keeps to the conversation.
+  // 应用菜单的全选覆盖整个窗口；焦点在时间线里时则只选中会话
   await page.evaluate(() => window.getSelection()?.selectAllChildren(document.body))
   await expect(toolbar).toBeVisible()
   await expect
@@ -3337,6 +3649,7 @@ test("reaches the quote action from the keyboard and blocks a selection over the
     .toBe(true)
 
   // Over the limit, the action is disabled and Tab moves on as usual.
+  // 超出上限：动作禁用，Tab 照常前进
   await expect(toolbar.getByText("Selection too long", { exact: true })).toBeVisible()
   await expect(toolbar.getByRole("button", { name: "Quote", exact: true })).toBeDisabled()
   await scroller.focus()
@@ -3345,6 +3658,7 @@ test("reaches the quote action from the keyboard and blocks a selection over the
   await expect(toolbar.getByRole("button", { name: "Quote", exact: true })).not.toBeFocused()
 
   // Tab from a control inside the timeline keeps its usual order while a quote is offered.
+  // 引用提供期间，从时间线内控件出发的 Tab 保持常规顺序
   await page.keyboard.press("Escape")
   await short.evaluate((element) => window.getSelection()?.selectAllChildren(element))
   await expect(toolbar).toBeVisible()
@@ -3357,6 +3671,7 @@ test("reaches the quote action from the keyboard and blocks a selection over the
   await expect(composer).toHaveCount(1)
 
   // A press that turns into a native drag of the selection ends with dragend, and no pointerup follows.
+  // 按下后变成选区原生拖拽时以 dragend 结束，不会跟随 pointerup
   await page.evaluate(() => window.getSelection()?.removeAllRanges())
   await expect(toolbar).toHaveCount(0)
   await short.hover()
@@ -3367,6 +3682,7 @@ test("reaches the quote action from the keyboard and blocks a selection over the
   await page.mouse.up()
 })
 
+// 注册 animationstart 监听并暂停 "exit" 动画（返回动画句柄）
 function pauseExitAnimations(locator: Locator) {
   return locator.evaluateHandle((element) => {
     const animations: Animation[] = []
@@ -3385,16 +3701,19 @@ function pauseExitAnimations(locator: Locator) {
   })
 }
 
+// 生成 count 条 "<label> note N." 文本（双换行连接）
 function notes(label: string, count: number) {
   return Array.from({ length: count }, (_, index) => `${label} note ${index + 1}.`).join("\n\n")
 }
 
+// 生成 count 个 grep 工具部件（编号续接 from）
 function searches(from: number, count: number) {
   return Array.from({ length: count }, (_, index) =>
     toolPart(`prt_search_${from + index}`, "grep", "completed", { pattern: `needle_${from + index}` }),
   )
 }
 
+// 构造一个带运行中 subagent 调用的助手消息
 function runningSubagent(): SessionMessageAssistant {
   return {
     ...completed,
@@ -3411,10 +3730,12 @@ function runningSubagent(): SessionMessageAssistant {
   }
 }
 
+// 后台提示按钮的定位器
 function backgroundHint(page: Page) {
   return page.getByRole("button", { name: /move running work to the background/i })
 }
 
+// 按下 Ctrl+B 并等待后台请求
 async function expectBackgroundRequest(page: Page) {
   const request = page.waitForRequest(
     (request) =>
@@ -3425,6 +3746,7 @@ async function expectBackgroundRequest(page: Page) {
   await request
 }
 
+// 构造补丁文件元数据（按状态选择补丁片段与增删行数）
 function patchFile(file: string, status: "added" | "modified" | "deleted") {
   return {
     file,
@@ -3439,6 +3761,7 @@ function patchFile(file: string, status: "added" | "modified" | "deleted") {
   }
 }
 
+// 构造第 index 个摘要差异（各占一行增删）
 function summaryDiff(index: number) {
   return {
     file: `src/diff-${index}.ts`,
