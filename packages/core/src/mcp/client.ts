@@ -6,7 +6,11 @@ import { pathToFileURL } from "node:url"
 // 引入 MCP SDK：客户端、协议错误、SDK 错误与错误码、HTTP 错误、Streamable HTTP 传输、
 // 未授权错误、不支持的协议版本错误，以及若干类型
 import {
+  type AuthProvider,
   Client,
+  InsufficientScopeError,
+  OAuthError,
+  OAuthErrorCode,
   ProtocolError,
   SdkError,
   SdkErrorCode,
@@ -22,7 +26,6 @@ import {
   type ElicitResult,
   type GetPromptResult,
   type Implementation,
-  type OAuthClientProvider,
   type Prompt,
   type ReadResourceResult,
   type Resource,
@@ -30,9 +33,7 @@ import {
   type Transport,
   type VersionNegotiationOptions,
 } from "@modelcontextprotocol/client"
-// 引入 Effect：原因、时钟、时长、Effect、Exit、平台错误、重试调度、Schema
-import { Cause, Clock, Duration, Effect, Exit, PlatformError, Schedule, Schema } from "effect"
-// 引入 MCP 配置 schema
+import { Cause, Clock, Duration, Effect, Exit, PlatformError, Queue, Schedule, Schema, Stream } from "effect"
 import { ConfigMCP } from "@opencode/schema/config/mcp"
 // 仅引入类型：会话 ID
 import type { Session } from "@opencode/schema/session"
@@ -40,6 +41,9 @@ import type { Session } from "@opencode/schema/session"
 import { isRecord } from "@opencode/util/record"
 // 引入 stdio 传输
 import { McpStdio } from "./stdio.js"
+import { EventStreamRejectedError, EventStreamTerminatedError } from "./event-errors.js"
+
+export { EventStreamRejectedError, EventStreamTerminatedError }
 
 // 默认启动（握手）超时：30 秒
 const DEFAULT_STARTUP_TIMEOUT = 30_000
@@ -84,7 +88,73 @@ const isTransient = (error: unknown) =>
     // fetch 把网络失败报告为携带系统错误码的 TypeError
     : error instanceof TypeError && "code" in error
 
-// 转发导出 SDK 的几个结果类型
+// MCP Events (SEP-3415), a draft extension. Every `notifications/events/*` names its stream by the JSON-RPC id of
+// the `events/stream` request that opened it.
+const EVENTS = "io.modelcontextprotocol/events"
+const SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId"
+// Servers send a heartbeat at least every 30 seconds; twice that in silence means the stream is dead.
+const EVENT_STREAM_IDLE = Duration.seconds(60)
+const EVENT_LIST_PAGES = 100
+
+/** Experimental: MCP Events is a draft extension; may change without compatibility guarantees. */
+const EventType = Schema.Struct({
+  name: Schema.String,
+  description: Schema.optional(Schema.String),
+  /** Any of "poll", "push" and "webhook". */
+  delivery: Schema.optional(Schema.Array(Schema.String)),
+  inputSchema: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  payloadSchema: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+})
+export type EventType = typeof EventType.Type
+const EventError = Schema.Struct({ code: Schema.Number, message: Schema.String, data: Schema.optional(Schema.Json) })
+export type EventError = typeof EventError.Type
+// An absent cursor means null: the event type has no replay.
+const Cursor = Schema.optional(Schema.NullOr(Schema.String))
+const Subscribed = { _meta: Schema.Struct({ [SUBSCRIPTION_ID]: Schema.Union([Schema.String, Schema.Number]) }) }
+const EventList = Schema.toStandardSchemaV1(
+  Schema.Struct({ events: Schema.Array(EventType), nextCursor: Schema.optional(Schema.String) }),
+)
+const StreamResult = Schema.toStandardSchemaV1(Schema.Unknown)
+const ActiveNotification = Schema.toStandardSchemaV1(
+  Schema.Struct({ cursor: Cursor, truncated: Schema.optional(Schema.Boolean), ...Subscribed }),
+)
+const EventNotification = Schema.toStandardSchemaV1(
+  Schema.Struct({
+    eventId: Schema.String,
+    name: Schema.String,
+    timestamp: Schema.String,
+    data: Schema.Json,
+    cursor: Cursor,
+    ...Subscribed,
+  }),
+)
+const HeartbeatNotification = Schema.toStandardSchemaV1(Schema.Struct({ cursor: Cursor, ...Subscribed }))
+const ErrorNotification = Schema.toStandardSchemaV1(Schema.Struct({ error: EventError, ...Subscribed }))
+
+/**
+ * One message on an event stream. Persist the latest non-null `cursor` to resume from it.
+ * Experimental: MCP Events is a draft extension; may change without compatibility guarantees.
+ */
+export type EventMessage =
+  /** The stream is live. Sent first, and again with `truncated` when the server skipped events it could not replay. */
+  | { readonly type: "active"; readonly cursor: string | null; readonly truncated: boolean }
+  | {
+      readonly type: "event"
+      readonly eventId: string
+      readonly name: string
+      readonly timestamp: string
+      readonly data: Schema.Json
+      readonly cursor: string | null
+    }
+  /** Nothing matched; the server has checked up to `cursor`. */
+  | { readonly type: "heartbeat"; readonly cursor: string | null }
+  /** A recoverable failure, such as one failed upstream fetch; the stream stays open. */
+  | { readonly type: "error"; readonly error: EventError }
+
+// JSON-RPC errors that mean an `events/stream` request can never succeed as sent: unknown method, bad arguments, and
+// the events extension's NotFound, Forbidden and Unsupported.
+const EVENT_STREAM_REJECTED = new Set([-32601, -32602, -32023, -32024, -32026])
+
 export type { GetPromptResult, Prompt, ReadResourceResult, Resource }
 // 资源模板类型别名
 export type ResourceTemplate = ResourceTemplateType
@@ -246,7 +316,8 @@ export interface Connection {
       readonly sessionID?: Session.ID
     } & PerRequest,
   ) => Effect.Effect<CallToolResult, Error>
-  // 注册连接关闭回调
+  /** MCP Events, when the connection declared them and the server offers them. Experimental; see `Events`. */
+  readonly events: Events | undefined
   readonly onClose: (callback: (reason: string) => void) => void
   // 注册会话过期回调
   readonly onSessionExpired: (callback: () => void) => void
@@ -256,6 +327,25 @@ export interface Connection {
   readonly onPromptsChanged: (callback: () => void) => void
   // 注册资源变化回调
   readonly onResourcesChanged: (callback: () => void) => void
+}
+
+/** Experimental: MCP Events is a draft extension; may change without compatibility guarantees. */
+export interface Events {
+  /** Every event type the server offers (`events/list`). */
+  readonly list: () => Effect.Effect<ReadonlyArray<EventType>, Error>
+  /**
+   * Push delivery (`events/stream`) from `cursor`, or from now. Ends when the server closes the stream. Fails with
+   * EventStreamRejectedError when the server refuses the subscription, EventStreamTerminatedError when it ends it,
+   * and with another error when the stream breaks or falls silent for a minute, after which it can be opened again
+   * from the last cursor. Interrupting it cancels it.
+   */
+  readonly stream: (input: {
+    readonly name: string
+    readonly arguments?: Record<string, unknown>
+    readonly cursor?: string | null
+    /** Replays nothing older than this, even from an older cursor. */
+    readonly maxAgeMs?: number
+  }) => Stream.Stream<EventMessage, Error>
 }
 
 /** An MCP server reached over a transport someone else already opened, such as a client socket. */
@@ -276,16 +366,16 @@ export interface ConnectOptions {
   /** Resolves a relative stdio `cwd` and is the default one, and is the root `roots/list` answers with. */
   // 目录：解析相对 stdio cwd 的基准与默认值，也是 roots/list 回答的根
   readonly directory: string
-  /** Remote only. A provider with no stored token and a no-op redirect ends in UnauthorizedError → needs_auth. */
-  // OAuth 提供者（仅远程）；无令牌且重定向为空操作时会以 UnauthorizedError → needs_auth 结束
-  readonly authProvider?: OAuthClientProvider
-  // 交互处理器
+  /** Remote only. A 401 the provider cannot recover from ends in UnauthorizedError → needs_auth. */
+  readonly authProvider?: AuthProvider
   readonly elicitation?: ElicitationHandler
   // 客户端标识
   readonly clientInfo?: Implementation
   /** False declares no roots and leaves `roots/list` unanswered, for a connection no one directory owns. */
   // roots=false：声明无根且不回应 roots/list（给无所属目录的连接用）
   readonly roots?: boolean
+  /** Experimental: declares MCP Events, a draft extension, and exposes `Connection.events` for a server that offers them. */
+  readonly events?: boolean
 }
 
 /**
@@ -328,6 +418,9 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
     // 原样返回信号
     return signal
   }
+
+  // Open event streams, by the JSON-RPC id of their `events/stream` request.
+  const streams = new Map<string, Queue.Queue<EventMessage, Error | Cause.Done>>()
 
   // The SDK fails pending requests with a bare "Connection closed"; the transport error before it says why.
   // 记录最近一次传输错误：SDK 只报裸的 "Connection closed"，靠它补充原因
@@ -379,6 +472,7 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
         // Some legacy servers refuse to run without one (https://github.com/anomalyco/opencode/issues/2308).
         // roots 能力：仅旧版协议需要（部分旧服务器没有 roots 就拒绝运行）
         ...(options.roots === false ? {} : { roots: {} }),
+        ...(options.events ? { extensions: { [EVENTS]: {} } } : {}),
       },
       // 版本协商策略
       versionNegotiation: negotiation(protocol),
@@ -402,6 +496,43 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
     // 需要声明 roots 时注册 roots/list 处理器：返回目录的 file:// 根
     if (options.roots !== false)
       client.setRequestHandler("roots/list", () => ({ roots: [{ uri: pathToFileURL(options.directory).href }] }))
+    if (options.events) {
+      const subscribed = (params: { readonly _meta: { readonly [SUBSCRIPTION_ID]: string | number } }) =>
+        streams.get(String(params._meta[SUBSCRIPTION_ID]))
+      client.setNotificationHandler("notifications/events/active", { params: ActiveNotification }, (params) => {
+        const queue = subscribed(params)
+        if (queue)
+          Queue.offerUnsafe(queue, {
+            type: "active",
+            cursor: params.cursor ?? null,
+            truncated: params.truncated === true,
+          })
+      })
+      client.setNotificationHandler("notifications/events/event", { params: EventNotification }, (params) => {
+        const queue = subscribed(params)
+        if (queue)
+          Queue.offerUnsafe(queue, {
+            type: "event",
+            eventId: params.eventId,
+            name: params.name,
+            timestamp: params.timestamp,
+            data: params.data,
+            cursor: params.cursor ?? null,
+          })
+      })
+      client.setNotificationHandler("notifications/events/heartbeat", { params: HeartbeatNotification }, (params) => {
+        const queue = subscribed(params)
+        if (queue) Queue.offerUnsafe(queue, { type: "heartbeat", cursor: params.cursor ?? null })
+      })
+      client.setNotificationHandler("notifications/events/error", { params: ErrorNotification }, (params) => {
+        const queue = subscribed(params)
+        if (queue) Queue.offerUnsafe(queue, { type: "error", error: params.error })
+      })
+      client.setNotificationHandler("notifications/events/terminated", { params: ErrorNotification }, (params) => {
+        const queue = subscribed(params)
+        if (queue) Queue.failCauseUnsafe(queue, Cause.fail(new EventStreamTerminatedError({ server, ...params.error })))
+      })
+    }
     if (elicitation) {
       // A 2026-07-28 server asks for input in the result of the request that needs it. Our SDK patch puts
       // that request's options on the context (`mcpReq.origin`, see patches/@modelcontextprotocol%2Fclient),
@@ -606,12 +737,77 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
       title: client.getServerVersion()?.title?.trim() || undefined,
       // 服务器说明文本（去空白，空则 undefined）
       instructions: client.getInstructions()?.trim() || undefined,
+      events:
+        options.events && client.getServerCapabilities()?.extensions?.[EVENTS]
+          ? {
+              list: Effect.fnUntraced(function* () {
+                const events: EventType[] = []
+                let cursor: string | undefined
+                for (let page = 0; page < EVENT_LIST_PAGES; page++) {
+                  const result = yield* list("list MCP events", (signal) =>
+                    client.request(
+                      { method: "events/list", params: cursor === undefined ? {} : { cursor } },
+                      EventList,
+                      {
+                        ...catalog,
+                        signal,
+                      },
+                    ),
+                  )
+                  events.push(...result.events)
+                  cursor = result.nextCursor
+                  if (cursor === undefined) return events
+                }
+                yield* Effect.logWarning("MCP event list has more pages than read", { server, pages: EVENT_LIST_PAGES })
+                return events
+              }),
+              stream: (input) =>
+                Stream.callback<EventMessage, Error>((queue) =>
+                  Effect.gen(function* () {
+                    yield* Effect.addFinalizer(() =>
+                      Effect.sync(() => {
+                        for (const [id, open] of streams) if (open === queue) streams.delete(id)
+                      }),
+                    )
+                    // Interrupting the request cancels the stream; the server closing it resolves the request.
+                    yield* Effect.tryPromise({
+                      try: (signal) =>
+                        client.request({ method: "events/stream", params: input }, StreamResult, {
+                          signal,
+                          // Heartbeats, not a request timeout, tell a quiet stream from a dead one; see below.
+                          timeout: Infinity,
+                          // Routes the stream's notifications, which can arrive before the request settles.
+                          onRequestId: (id) => streams.set(String(id), queue),
+                        }),
+                      catch: (error) =>
+                        error instanceof ProtocolError && EVENT_STREAM_REJECTED.has(error.code)
+                          ? new EventStreamRejectedError({ server, code: error.code, message: error.message })
+                          : failure(error),
+                    }).pipe(
+                      Effect.tapError((error) =>
+                        Effect.logWarning("failed to stream MCP events", { server, error: error.message }),
+                      ),
+                      Effect.matchEffect({
+                        onFailure: (error) => Queue.fail(queue, error),
+                        onSuccess: () => Queue.end(queue),
+                      }),
+                      Effect.forkScoped,
+                    )
+                  }),
+                ).pipe(
+                  Stream.timeoutOrElse({
+                    duration: EVENT_STREAM_IDLE,
+                    orElse: () =>
+                      Stream.fail(new Error(`MCP server ${server} sent nothing on the event stream for 60 seconds`)),
+                  }),
+                ),
+            }
+          : undefined,
       // Tool lists skip the SDK response cache: it re-stringifies every list, and on the first tools/call
       // re-parses it and compiles an output validator for every listed tool. Each call passes its own
-      // checked definition instead, so only that tool's outputSchema is compiled and modern Mcp-Param-*
-      // header mirroring still sees the schema. Tools are relisted on connect, list_changed and a stale
-      // header declaration; the SDK cache never relisted an expired list before a call either.
-      // tools：绕过 SDK 响应缓存的工具列举
+      // checked definition instead, so modern Mcp-Param-* header mirroring still sees the input schema.
+      // Tools are relisted on connect, list_changed and a stale header declaration; the SDK cache never
+      // relisted an expired list before a call either.
       tools: () =>
         // 仅在服务器宣告 tools 能力时才请求
         advertised("tools")
@@ -756,12 +952,13 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
                 onprogress: () => {},
                 // Always passed, even for a tool we haven't listed, so the SDK never falls back to listing
                 // and caching the raw tools itself. Its types are narrower than what it reads (JSON values,
-                // a string `$schema`); ours keep the server's values.
-                // 工具定义总是传入（未列入时给最小定义），避免 SDK 回退到自行列举并缓存
-                toolDefinition: (listed.get(input.name) ?? {
-                  name: input.name,
-                  inputSchema: { type: "object" },
-                }) as CallToolRequestOptions["toolDefinition"],
+                // a string `$schema`); ours keep the server's values. Leaving out `outputSchema` skips the
+                // SDK's output check: servers return results that miss or break their own schema (Zoom
+                // answers a 204 with nothing), and failing the call would report a completed action as failed.
+                toolDefinition: {
+                  ...(listed.get(input.name) ?? { name: input.name, inputSchema: { type: "object" } }),
+                  outputSchema: undefined,
+                } as CallToolRequestOptions["toolDefinition"],
               },
             ),
           catch: (error) => error,
@@ -811,9 +1008,8 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
 
   // 失败路径：提取错误对象
   const error = Cause.squash(exit.cause)
-  // 未授权错误 → 需要认证
-  if (error instanceof UnauthorizedError) return yield* new NeedsAuthError({ server, message: error.message })
-  // 不支持的协议版本 → 连接错误（提示可用的版本或 legacy）
+  if (error instanceof UnauthorizedError || error instanceof InsufficientScopeError)
+    return yield* new NeedsAuthError({ server, message: error.message })
   if (error instanceof UnsupportedProtocolVersionError)
     return yield* new ConnectError({
       server,
@@ -836,7 +1032,8 @@ function repeats(error: unknown): boolean {
     // Refused credentials, even without OAuth: any connection with them would be refused the same way.
     // 401/403：凭证被拒（有无 OAuth 都一样）
     (error instanceof SdkHttpError && (error.status === 401 || error.status === 403)) ||
-    // 瞬时错误（过载/掉线等）
+    // The authorization server could not refresh the token for now; see McpOAuth.
+    (error instanceof OAuthError && error.code === OAuthErrorCode.TemporarilyUnavailable) ||
     isTransient(error) ||
     // 平台错误（进程无法生成等）
     PlatformError.isPlatformError(error)

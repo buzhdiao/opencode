@@ -16,7 +16,7 @@ import { Provider } from "../provider.js"
 const RemoteModel = Schema.Struct({
   // 是否在模型选择器（model picker）中启用
   model_picker_enabled: Schema.Boolean,
-  // 模型的 API ID
+  is_chat_fallback: Schema.optional(Schema.Boolean),
   id: Schema.String,
   // 展示名称
   name: Schema.String,
@@ -29,7 +29,7 @@ const RemoteModel = Schema.Struct({
   // 计费信息（可选）
   billing: Schema.optional(
     Schema.Struct({
-      // 按 token 计价的信息（可选）
+      auto_discount: Schema.optional(Schema.Number),
       token_prices: Schema.optional(
         Schema.Struct({
           // 计费批次大小（换算单价用）
@@ -185,7 +185,29 @@ export function derive(baseURL: string, remote: Snapshot, existing: readonly Mod
   return result
 }
 
-// 类型守卫（type guard）：判定远端模型是否“可用”，可安全收窄为 UsableModel
+/** Copilot's Auto model. Copilot's router picks the model that serves each Session from the account's Auto pool. */
+export const auto = Model.ID.make("auto")
+
+export function autoModel(baseURL: string, remote: Snapshot) {
+  const pool = Array.from(remote.values()).filter((model) => model.billing?.auto_discount !== undefined)
+  if (pool.length === 0) return
+  const route = routeFor(auto, "chat", baseURL)
+  const limits = pool.map((model) => model.capabilities.limits)
+  return Model.Info.make({
+    ...Model.Info.default(Provider.ID.githubCopilot, auto),
+    name: "Auto",
+    package: route.package,
+    settings: { baseURL: route.baseURL },
+    capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+    // Any pool model may serve a Session, so show the smallest window.
+    limit: {
+      context: Math.min(...limits.map((limit) => limit.max_context_window_tokens ?? limit.max_prompt_tokens)),
+      input: Math.min(...limits.map((limit) => limit.max_prompt_tokens)),
+      output: Math.min(...limits.map((limit) => limit.max_output_tokens)),
+    },
+  })
+}
+
 function usable(model: RemoteModel): model is UsableModel {
   return (
     // 策略状态不是 disabled（未被禁用）
@@ -201,17 +223,7 @@ function usable(model: RemoteModel): model is UsableModel {
 
 // 由远端模型数据构建标准 Model.Info；previous 为本地已有模板（可选），用于保留别名与覆盖项
 function build(id: Model.ID, remote: UsableModel, baseURL: string, previous?: Model.Info) {
-  // 是否声明支持 Anthropic 风格的 /v1/messages 端点
-  const messages = remote.supported_endpoints?.includes("/v1/messages") ?? false
-  // 按优先级挑选端点类型：messages > responses > chat；均不支持则为 undefined
-  const endpoint = messages
-    ? "messages"
-    : remote.supported_endpoints?.includes("/responses")
-      ? "responses"
-      : remote.supported_endpoints?.includes("/chat/completions")
-        ? "chat"
-        : undefined
-  // 是否支持图片输入：vision 开关为真，或媒体类型中存在 image/* 开头的类型
+  const route = routeFor(remote.id, endpoint(remote.supported_endpoints), baseURL)
   const image =
     (remote.capabilities.supports.vision ?? false) ||
     (remote.capabilities.limits.vision?.supported_media_types ?? []).some((item) => item.startsWith("image/"))
@@ -251,14 +263,8 @@ function build(id: Model.ID, remote: UsableModel, baseURL: string, previous?: Mo
     family: previous?.family ?? Model.Family.make(remote.capabilities.family),
     // 名称：优先沿用本地模板，否则取远端名称
     name: previous?.name ?? remote.name,
-    // 适配包：messages 端点复用 anthropic 适配器，其余使用 copilot 专用 AI SDK 包
-    package: messages ? "@opencode/ai/providers/anthropic" : Provider.aisdk("@ai-sdk/github-copilot"),
-    // 设置：以本地设置为底，覆盖 baseURL 与选中的端点类型
-    settings: Provider.mergeOverlay(previous?.settings, {
-      baseURL: messages ? `${baseURL}/v1` : baseURL,
-      ...(endpoint ? { endpoint } : {}),
-    }),
-    // 请求头沿用本地模板
+    package: route.package,
+    settings: Provider.mergeOverlay(previous?.settings, { baseURL: route.baseURL }),
     headers: previous?.headers,
     // 额外请求体沿用本地模板
     body: previous?.body,
@@ -268,9 +274,7 @@ function build(id: Model.ID, remote: UsableModel, baseURL: string, previous?: Mo
       input,
       output: ["text"],
     },
-    // 依据端点与思考能力生成推理变体
-    variants: variants(remote, messages),
-    // 发布时间：解析失败（NaN）时记为 0
+    variants: variants(remote, route.endpoint === "messages"),
     time: { released: Number.isFinite(released) ? released : 0 },
     // 价格：按美元/百万 token 换算后的单价列表
     cost: [
@@ -303,7 +307,40 @@ function build(id: Model.ID, remote: UsableModel, baseURL: string, previous?: Mo
   })
 }
 
-// 依据远端能力为模型生成推理（reasoning）变体列表
+type Endpoint = "messages" | "responses" | "chat"
+
+const PACKAGES = {
+  messages: "@opencode/ai/providers/anthropic",
+  responses: "@opencode/ai/providers/openai-compatible-responses",
+  chat: "@opencode/ai/providers/openai-compatible",
+} as const satisfies Record<Endpoint, string>
+
+/** The native package and base URL for the Copilot API that serves a model. */
+export function routeFor(modelID: string, advertised: Endpoint | undefined, root: string) {
+  const selected = advertised ?? fallbackEndpoint(modelID)
+  return {
+    endpoint: selected,
+    package: PACKAGES[selected],
+    // Copilot serves Anthropic Messages under /v1 and its OpenAI APIs at the root.
+    baseURL: selected === "messages" ? `${root}/v1` : root,
+  }
+}
+
+function endpoint(supported: ReadonlyArray<string> | undefined): Endpoint | undefined {
+  if (supported?.includes("/v1/messages")) return "messages"
+  if (supported?.includes("/responses")) return "responses"
+  if (supported?.includes("/chat/completions")) return "chat"
+}
+
+// Without advertised endpoints, Copilot serves GPT-5 and later (except GPT-5 mini), Grok and MAI Code
+// only on /responses, and Gemini and the rest on /chat/completions.
+function fallbackEndpoint(modelID: string): Endpoint {
+  const gpt = /^gpt-(\d+)/.exec(modelID)
+  if (gpt !== null && Number(gpt[1]) >= 5 && !modelID.startsWith("gpt-5-mini")) return "responses"
+  if (modelID.startsWith("grok-") || modelID.startsWith("mai-code-")) return "responses"
+  return "chat"
+}
+
 function variants(remote: UsableModel, messages: boolean): Model.Info["variants"] {
   // 读取支持的推理力度（effort）等级，可能未声明
   const efforts = remote.capabilities.supports.reasoning_effort ?? []

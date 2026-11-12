@@ -51,7 +51,14 @@ type Input = {
 // 把任意值归一为对象：非普通对象时包一层 { value }
 const asRecord = (value: unknown): Record<string, unknown> => (isRecord(value) ? value : { value })
 
-// 工具入参摘录的最大字符数
+/** Provider events that carry a step's first generated token, matching how the stream counts output. */
+const beginsOutput = (event: LLMEvent) =>
+  event.type === "text-start" ||
+  event.type === "reasoning-start" ||
+  event.type === "tool-input-start" ||
+  event.type === "tool-input-error" ||
+  event.type === "tool-call"
+
 const INPUT_EXCERPT_LIMIT = 2048
 
 // 工具入参摘录：截断文本与原始总长度
@@ -204,7 +211,15 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       assistantMessageID: yield* startAssistant(),
     })
   })
-  // 读取当前提供方（provider）的原生元数据
+  let firstTokenPublished = false
+  const firstToken = Effect.fnUntraced(function* () {
+    if (firstTokenPublished) return
+    firstTokenPublished = true
+    yield* bus.publish(SessionEvent.Step.FirstToken, {
+      sessionID: input.sessionID,
+      assistantMessageID: yield* startAssistant(),
+    })
+  })
   const native = (metadata: ProviderMetadata | undefined) => metadata?.[input.providerMetadataKey]
   // 分片（fragment）管理器：跟踪多个流式块的序号、累积值与批量增量发布
   const fragments = (
@@ -576,7 +591,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
 
   // 发布（publish）一个 LLM 事件：按事件类型转换成会话事件（不可中断）
   const publish = Effect.fnUntraced(function* (event: LLMEvent) {
-    // 按事件类型分发
+    if (beginsOutput(event)) yield* firstToken()
     switch (event.type) {
       // 步骤开始
       case "step-start":

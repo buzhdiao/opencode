@@ -4,11 +4,8 @@ import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect
 import type { SessionRequestKind, SessionTitle } from "@opencode/plugin/effect/session"
 // 导入“是否为普通对象”的判断工具
 import { isRecord } from "@opencode/util/record"
-// 从 effect 库导入 Effect、Option 与 Schema
-import { Effect, Option, Schema } from "effect"
-// 导入 HTTP 客户端与 Fetch 客户端层
-import { FetchHttpClient, HttpClient } from "effect/http"
-// 导入集成连接工具（连接指纹键）
+import { Clock, Effect, Option, Schema } from "effect"
+import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
 import { IntegrationConnection } from "../../integration/connection.js"
 // 导入凭据模块
 import { Credential } from "../../credential.js"
@@ -28,11 +25,9 @@ import { define } from "@opencode/plugin/effect/plugin"
 import { Provider } from "../../provider.js"
 // 导入会话亲和性工具（交互 ID）
 import { SessionAffinity } from "../../session/affinity.js"
-// 导入共享缓存服务
+import type { Session } from "@opencode/schema/session"
 import { SharedCache } from "../../shared-cache.js"
-// 导入激活凭据解析工具
-import { activeCredential } from "./credential-settings.js"
-// 导入供应商刷新工具
+import { activeCredential, credentialSettings } from "./credential-settings.js"
 import { ProviderRefresh } from "./refresh.js"
 // 导入插件内部类型
 import type { PluginInternal } from "../internal.js"
@@ -77,7 +72,11 @@ const User = Schema.Struct({
 })
 // 用户信息解码器
 const decodeUser = Schema.decodeUnknownOption(User)
-// JSON 字符串 -> 未知值的 Schema
+const AutoRoute = Schema.Struct({
+  session_token: Schema.String,
+  expires_at: Schema.Number,
+  selected_model: Schema.Struct({ id: Schema.String }),
+})
 const JsonBody = Schema.fromJsonString(Schema.Unknown)
 // 请求体解码器
 const decodeBody = Schema.decodeUnknownOption(JsonBody)
@@ -174,23 +173,14 @@ const oauth = (app: App.Info) =>
               if (token.access_token) {
                 // 提取令牌
                 const access = token.access_token
-                // 请求 Copilot 内部用户信息端点
-                return request(
-                  `${domain === "github.com" ? "https://api.github.com" : `https://api.${domain}`}/copilot_internal/user`,
-                  {
-                    headers: {
-                      // 接受 JSON
-                      Accept: "application/json",
-                      // Bearer 授权
-                      Authorization: `Bearer ${access}`,
-                      // User-Agent
-                      "User-Agent": App.useragent(app),
-                      // 用户 API 版本
-                      "X-GitHub-Api-Version": userApiVersion,
-                    },
+                return request(userURL(enterprise ? domain : undefined), {
+                  headers: {
+                    Accept: "application/json",
+                    Authorization: `Bearer ${access}`,
+                    "User-Agent": App.useragent(app),
+                    "X-GitHub-Api-Version": userApiVersion,
                   },
-                ).pipe(
-                  // 解码用户信息（可能为 undefined）
+                }).pipe(
                   Effect.map((user) => Option.getOrUndefined(decodeUser(user))),
                   // 只有明确的权限否定才阻止登录；查询失败或格式错误不能把 GitHub 的小故障变成拒绝登录。
                   // Only an explicit entitlement answer blocks login; a failed
@@ -270,7 +260,14 @@ export const GithubCopilotPlugin = define({
     const http = yield* HttpClient.HttpClient
     // 获取底层 fetch 实例（供直连请求使用）
     const outbound = yield* FetchHttpClient.Fetch
-    // 启动凭据驱动的刷新流程：加载 baseURL/令牌/模型列表
+    // Each Session keeps the model Copilot's Auto router picked until its token nears expiry, the Session is compacted,
+    // or the account changes. The token unlocks the pick and its Auto discount; Copilot rejects it for any other model.
+    const routes = new Map<Session.ID, { model: string; account: string; token?: string; until: number }>()
+    // The endpoint saved at login serves requests until the first refresh reads the account's current one, so an
+    // Enterprise login doesn't send its token to the public host while that refresh is still running.
+    const login = yield* credentialSettings(ctx, "github-copilot", (value) =>
+      value.type === "oauth" ? { baseURL: copilotBaseURL(value.metadata) } : {},
+    )
     const discovered = yield* ProviderRefresh.start({
       // 所属集成
       integrationID: "github-copilot",
@@ -295,9 +292,43 @@ export const GithubCopilotPlugin = define({
         const { connection, credential } = yield* activeCredential(ctx, "github-copilot")
         // 无连接或凭据非 OAuth：返回空值
         if (!connection || credential?.type !== "oauth") return { connection, value: {} }
-        // 计算 baseURL：优先用凭据元数据里的端点
-        const url = copilotBaseURL(credential.metadata) ?? baseURL()
-        // 读取供应商配置的请求头
+        // The account's API endpoint changes with its plan, so read it again on every refresh; the one stored at
+        // login is the fallback.
+        const endpoint = yield* cache
+          .get({
+            key: `github-copilot-endpoint:${IntegrationConnection.key(connection)}`,
+            ...options,
+            load: ctx.integration.connection.resolve(connection).pipe(
+              Effect.flatMap((current) =>
+                current?.type === "oauth"
+                  ? HttpClient.filterStatusOk(http)
+                      .execute(
+                        HttpClientRequest.get(
+                          userURL(
+                            typeof current.metadata?.enterpriseUrl === "string"
+                              ? current.metadata.enterpriseUrl
+                              : undefined,
+                          ),
+                        ).pipe(
+                          HttpClientRequest.setHeaders({
+                            Accept: "application/json",
+                            Authorization: `Bearer ${current.refresh}`,
+                            "User-Agent": App.useragent(ctx.app),
+                            "X-GitHub-Api-Version": userApiVersion,
+                          }),
+                        ),
+                      )
+                      .pipe(
+                        Effect.flatMap(HttpClientResponse.schemaBodyJson(User)),
+                        Effect.map((user) => user.endpoints?.api?.replace(/\/+$/, "")),
+                        Effect.timeout("5 seconds"),
+                      )
+                  : Effect.fail(new Error("GitHub Copilot connection has no OAuth credential")),
+              ),
+            ),
+          })
+          .pipe(Effect.orElseSucceed(() => undefined))
+        const url = endpoint || copilotBaseURL(credential.metadata)
         const headers = (yield* providers.get(Provider.ID.githubCopilot))?.headers ?? {}
         // 通过共享缓存加载模型列表（按连接+URL+请求头指纹缓存）
         const models = yield* cache
@@ -347,16 +378,16 @@ export const GithubCopilotPlugin = define({
       if (!item) return
       // 取当前发现的加载结果
       const loaded = discovered.current
-      // 有实时模型列表：整体替换模型注册
+      const url = loaded.baseURL ?? (typeof login.settings.baseURL === "string" ? login.settings.baseURL : baseURL())
       if (loaded.models) {
+        const router = CopilotModels.autoModel(url, loaded.models)
         evt.add({
           // 供应商信息
           info: item.provider,
-          // 从快照派生模型列表（合并已注册模型的信息）
-          models: Array.from(
-            CopilotModels.derive(loaded.baseURL ?? baseURL(), loaded.models, Array.from(item.models.values())).values(),
-          ),
-          // 关联的连接
+          models: [
+            ...CopilotModels.derive(url, loaded.models, Array.from(item.models.values())).values(),
+            ...(router ? [router] : []),
+          ],
           sourceConnection: loaded.connection,
         })
         return
@@ -364,27 +395,22 @@ export const GithubCopilotPlugin = define({
       // 没有实时模型列表时，models.dev 的包声明了每个模型走哪条 Copilot API：
       // Anthropic Messages 保持原生；OpenAI 意味着走 Responses；其余走捆绑 Copilot SDK 的模型 ID 回退。
       // Without the live model list, the models.dev package says which Copilot API serves
-      // each model: Anthropic Messages stays native, OpenAI means Responses, and anything
-      // else goes through the bundled Copilot SDK's model ID fallback.
+      // each model: Anthropic means Messages, OpenAI means Responses, and anything else
+      // falls back to the model ID.
       for (const id of item.models.keys()) {
         // 逐个模型调整
         evt.models.update(item.provider.id, id, (model) => {
-          // Anthropic 包：保持原生，只更新 baseURL
-          if (model.package === "@opencode/ai/providers/anthropic") {
-            // 有发现的 baseURL 则拼上 /v1
-            if (loaded.baseURL)
-              model.settings = Provider.mergeOverlay(model.settings, { baseURL: `${loaded.baseURL}/v1` })
-            return
-          }
-          // 判断是否 OpenAI 包（走 Responses 端点）
-          const responses = model.package === "@opencode/ai/providers/openai"
-          // 统一切换到捆绑的 Copilot SDK 包
-          model.package = Provider.aisdk("@ai-sdk/github-copilot")
-          // 合并设置：baseURL 与端点类型
-          model.settings = Provider.mergeOverlay(model.settings, {
-            ...(loaded.baseURL ? { baseURL: loaded.baseURL } : {}),
-            ...(responses ? { endpoint: "responses" } : {}),
-          })
+          const route = CopilotModels.routeFor(
+            model.modelID ?? model.id,
+            model.package === "@opencode/ai/providers/anthropic"
+              ? "messages"
+              : model.package === "@opencode/ai/providers/openai"
+                ? "responses"
+                : undefined,
+            url,
+          )
+          model.package = route.package
+          model.settings = Provider.mergeOverlay(model.settings, { baseURL: route.baseURL })
         })
       }
     })
@@ -401,30 +427,6 @@ export const GithubCopilotPlugin = define({
         })
       }
     })
-    // 注册 AI SDK 钩子：创建 Copilot SDK 实例并包装 fetch
-    yield* ctx.aisdk.hook(
-      "sdk",
-      Effect.fn(function* (evt) {
-        // 只处理 Copilot 的 SDK 包
-        if (evt.package !== "@ai-sdk/github-copilot") return
-        // 用包装后的 fetch 替换选项里的 fetch（注入令牌与必需请求头）
-        evt.options.fetch = copilotFetch(
-          // API key 即 Copilot 令牌
-          typeof evt.options.apiKey === "string" ? evt.options.apiKey : undefined,
-          // 保留上游 fetch
-          evt.options.fetch,
-          // 应用信息
-          ctx.app,
-        )
-        // 动态加载 Copilot provider 模块
-        const mod = yield* Effect.promise(() => import("../../github-copilot/copilot-provider.js"))
-        // 用选项创建 OpenAI 兼容的 SDK 实例
-        evt.sdk = mod.createOpenaiCompatible(evt.options)
-      }),
-      // 仅对 githubCopilot 供应商生效
-      { providerID: Provider.ID.githubCopilot },
-    )
-    // 注册 model.request 钩子：注入 Copilot 要求的交互头
     yield* ctx.session.hook(
       "model.request",
       (evt) =>
@@ -441,6 +443,82 @@ export const GithubCopilotPlugin = define({
           evt.headers["X-Interaction-Id"] = session ? SessionAffinity.get(session) : evt.sessionID
           // 非普通对话的请求标记为 agent 发起
           if (interaction !== "conversation-agent") evt.headers["x-initiator"] = "agent"
+          const route = routes.get(evt.sessionID)
+          if (route?.token && route.model === evt.model.id) evt.headers["Copilot-Session-Token"] = route.token
+        }),
+      { providerID: Provider.ID.githubCopilot },
+    )
+    const route = Effect.fn("GithubCopilotPlugin.route")(function* (sessionID: Session.ID) {
+      const loaded = discovered.current
+      if (!loaded.baseURL || !loaded.token || !loaded.models) return
+      const user = yield* ctx.session.context({ sessionID }).pipe(
+        Effect.map((messages) => messages.findLast((message) => message.type === "user")),
+        Effect.orElseSucceed(() => undefined),
+      )
+      const headers = (yield* providers.get(Provider.ID.githubCopilot))?.headers ?? {}
+      const picked = yield* HttpClient.filterStatusOk(http)
+        .execute(
+          HttpClientRequest.post(`${loaded.baseURL}/auto`).pipe(
+            HttpClientRequest.setHeaders({
+              ...headers,
+              Authorization: `Bearer ${loaded.token}`,
+              "User-Agent": App.useragent(ctx.app),
+              "X-GitHub-Api-Version": apiVersion,
+            }),
+            HttpClientRequest.bodyJsonUnsafe({
+              prompt: user?.text ?? "",
+              ...(user?.files?.some((file) => file.mime.startsWith("image/")) ? { has_image: true } : {}),
+            }),
+          ),
+        )
+        .pipe(
+          Effect.flatMap(HttpClientResponse.schemaBodyJson(AutoRoute)),
+          Effect.timeout("5 seconds"),
+          Effect.tapError((cause) => Effect.logWarning("Copilot Auto routing failed", { cause })),
+          Effect.option,
+        )
+      const now = yield* Clock.currentTimeMillis
+      if (Option.isSome(picked) && loaded.models.has(picked.value.selected_model.id))
+        return {
+          model: picked.value.selected_model.id,
+          account: loaded.token,
+          token: picked.value.session_token,
+          // Route again before the token can expire mid-request.
+          until: picked.value.expires_at * 1000 - 5 * 60_000,
+        }
+      const models = Array.from(loaded.models.values())
+      const fallback =
+        models.find((model) => model.is_chat_fallback) ?? models.find((model) => model.billing?.auto_discount)
+      // Retry routing soon when the router fails or picks a model this client cannot serve.
+      return fallback && { model: fallback.id, account: loaded.token, until: now + 5 * 60_000 }
+    })
+    yield* ctx.session.hook(
+      "experimental.model.resolve",
+      (evt) =>
+        Effect.gen(function* () {
+          // Titles use Copilot's utility model, so they never route.
+          if (evt.model.id !== CopilotModels.auto || evt.kind === "title") return
+          const now = yield* Clock.currentTimeMillis
+          const cached = routes.get(evt.sessionID)
+          const current =
+            cached && cached.until > now && cached.account === discovered.current.token
+              ? cached
+              : yield* route(evt.sessionID)
+          if (!current) return
+          for (const [id, route] of routes) if (route.until <= now) routes.delete(id)
+          routes.set(evt.sessionID, current)
+          evt.model = Model.Ref.make({ providerID: Provider.ID.githubCopilot, id: Model.ID.make(current.model) })
+        }),
+      { providerID: Provider.ID.githubCopilot },
+    )
+    // Compaction rewrites the prompt, so the request after it routes again, like Copilot's own clients. The compaction
+    // request itself still carries the current pick's token.
+    yield* ctx.session.hook(
+      "compaction",
+      (evt) =>
+        Effect.sync(() => {
+          const route = routes.get(evt.sessionID)
+          if (route) route.until = 0
         }),
       // 仅对 githubCopilot 供应商生效
       { providerID: Provider.ID.githubCopilot },
@@ -487,55 +565,16 @@ export const GithubCopilotPlugin = define({
       "http.request",
       (evt) =>
         Effect.gen(function* () {
-          // 从 x-api-key 头提取令牌
-          const token = evt.request.headers.get("x-api-key")
-          // 无令牌则跳过
+          // The Messages route sends the token as `x-api-key`, the OpenAI routes as a bearer token.
+          const token =
+            evt.request.headers.get("x-api-key") ?? evt.request.headers.get("authorization")?.replace(/^Bearer\s+/i, "")
           if (!token) return
           // 读取请求体文本（clone 避免消费原请求）
           const text = yield* Effect.promise(() => evt.request.clone().text())
           // 解析请求体
           const body = Option.getOrUndefined(decodeBody(text))
-          // 应用 Copilot 请求头（anthropic 分支为 true）
-          applyHeaders(evt.request.headers, token, ctx.app, requestMetadata(evt.request.url, body), true)
+          applyHeaders(evt.request.headers, token, ctx.app, requestMetadata(evt.request.url, body))
         }),
-      // 仅对 githubCopilot 供应商生效
-      { providerID: Provider.ID.githubCopilot },
-    )
-    // 注册 language 钩子：为每个模型选择正确的端点（responses 或 chat）
-    yield* ctx.aisdk.hook(
-      "language",
-      Effect.fn(function* (evt) {
-        // SDK 既没有 responses 也没有 chat 构造器：退回通用 languageModel
-        if (evt.sdk.responses === undefined && evt.sdk.chat === undefined) {
-          evt.language = evt.sdk.languageModel(evt.model.modelID ?? evt.model.id)
-          return
-        }
-        // 选项声明 responses 且 SDK 支持：用 responses 端点
-        if (evt.options.endpoint === "responses" && evt.sdk.responses) {
-          evt.language = evt.sdk.responses(evt.model.modelID ?? evt.model.id)
-          return
-        }
-        // 选项声明 chat 且 SDK 支持：用 chat 端点
-        if (evt.options.endpoint === "chat" && evt.sdk.chat) {
-          evt.language = evt.sdk.chat(evt.model.modelID ?? evt.model.id)
-          return
-        }
-        // 模型 ID
-        const id = evt.model.modelID ?? evt.model.id
-        // Copilot 只在 /responses 上提供 Grok 与 MAI Code，Gemini 只在 /chat/completions 上提供；
-        // 只要实时模型列表提供了端点元数据，上面的声明就优先生效。
-        // Copilot serves Grok and MAI Code only on /responses, and Gemini only on
-        // /chat/completions; advertised endpoint metadata above wins whenever the
-        // live model list provides it.
-        const gpt = /^gpt-(\d+)/.exec(id)
-        // GPT-5 及以上（排除 gpt-5-mini）、grok-、mai-code- 走 responses
-        const responses =
-          (gpt !== null && Number(gpt[1]) >= 5 && !id.startsWith("gpt-5-mini")) ||
-          id.startsWith("grok-") ||
-          id.startsWith("mai-code-")
-        // 按判定结果选择端点
-        evt.language = responses ? evt.sdk.responses(id) : evt.sdk.chat(id)
-      }),
       // 仅对 githubCopilot 供应商生效
       { providerID: Provider.ID.githubCopilot },
     )
@@ -569,7 +608,10 @@ function oauthURLs(domain: string) {
   }
 }
 
-// 计算 Copilot API 的 baseURL：企业域名或公有端点
+function userURL(enterprise?: string) {
+  return `${enterprise ? `https://api.${normalizeDomain(enterprise)}` : "https://api.github.com"}/copilot_internal/user`
+}
+
 function baseURL(enterprise?: string) {
   return enterprise ? `https://copilot-api.${normalizeDomain(enterprise)}` : "https://api.githubcopilot.com"
 }
@@ -730,39 +772,7 @@ export function utilityTitle(
   )
 }
 
-// 包装 fetch：为所有 Copilot API 请求注入令牌与必需请求头
-export function copilotFetch(token: string | undefined, upstream: Fetch | undefined, app: App.Info): Fetch {
-  // 使用上游 fetch 或全局 fetch
-  const send = upstream ?? fetch
-  // 返回包装后的 fetch
-  return async (input, init) => {
-    // 复制请求头以便修改
-    const requestHeaders = new Headers(init?.headers)
-    // 提取请求 URL（支持 URL/字符串/Request 对象）
-    const url = input instanceof URL ? input.href : typeof input === "string" ? input : input.url
-    // 解析请求体（仅字符串形式）
-    const body = typeof init?.body === "string" ? Option.getOrUndefined(decodeBody(init.body)) : undefined
-    // 应用 Copilot 头（非 anthropic 分支）
-    applyHeaders(requestHeaders, token, app, requestMetadata(url, body), false)
-    // 使用修改后的头发起请求
-    return send(input, { ...init, headers: requestHeaders })
-  }
-}
-
-// 应用 Copilot 必需的请求头
-function applyHeaders(
-  // 目标请求头集合
-  headers: Headers,
-  // Copilot 令牌
-  token: string | undefined,
-  // 应用信息
-  app: App.Info,
-  // 从请求体推导的元数据
-  metadata: RequestMetadata,
-  // 是否为 Anthropic 原生端点
-  anthropic: boolean,
-) {
-  // 有令牌时：统一为 Bearer 授权
+function applyHeaders(headers: Headers, token: string | undefined, app: App.Info, metadata: RequestMetadata) {
   if (token) {
     // 删除其他形式的授权头
     headers.delete("authorization")
@@ -784,8 +794,6 @@ function applyHeaders(
   else if (!headers.has("x-initiator")) headers.set("x-initiator", "user")
   // 涉及图像时声明视觉请求
   if (metadata.vision) headers.set("Copilot-Vision-Request", "true")
-  // Anthropic 原生端点需要交错思考的 beta 头
-  if (anthropic) headers.set("anthropic-beta", "interleaved-thinking-2025-05-14")
 }
 
 // 与 Copilot 客户端的 X-Interaction-Type 词汇一致：代理循环是默认值，
@@ -817,12 +825,13 @@ function requestMetadata(url: string, body: unknown) {
     return {
       // 最后项不是 user 消息 => agent 发起
       agent: !isRecord(last) || last.role !== "user",
-      // 任一输入项包含 input_image => 视觉请求
+      // Tool results carry their images in `output`, user messages in `content`.
       vision: body.input.some(
         (item) =>
           isRecord(item) &&
-          Array.isArray(item.content) &&
-          item.content.some((part) => isRecord(part) && part.type === "input_image"),
+          [item.content, item.output].some(
+            (parts) => Array.isArray(parts) && parts.some((part) => isRecord(part) && part.type === "input_image"),
+          ),
       ),
     }
   }
@@ -832,10 +841,10 @@ function requestMetadata(url: string, body: unknown) {
   const last = body.messages.at(-1)
   // Chat Completions 端点
   if (url.includes("completions")) {
+    const previous = body.messages.at(-2)
     return {
-      // 最后项不是 user => agent 发起
-      agent: !isRecord(last) || last.role !== "user",
-      // 任一消息包含 image_url => 视觉请求
+      // Chat Completions moves tool-result images into a user message after the tool messages.
+      agent: !isRecord(last) || last.role !== "user" || (isRecord(previous) && previous.role === "tool"),
       vision: body.messages.some(
         (message) =>
           isRecord(message) &&

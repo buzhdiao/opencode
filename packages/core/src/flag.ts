@@ -1,7 +1,8 @@
 // 功能开关（feature flag）：解析环境变量与配置中的实验性开关，给出每个开关的启用状态与来源。
 export * as Flag from "./flag.js"
 
-import { Context, Effect, Option, Record } from "effect"
+import { Context, Effect, Layer, Record } from "effect"
+import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { ConfigFlag } from "@opencode/schema/config/flag"
 import type { Document, Entry } from "@opencode/schema/config"
 import { App } from "./app.js"
@@ -17,6 +18,14 @@ export interface State {
   // 来源按优先级从高到低：环境 → 配置 → 默认
   readonly source: "env" | "config" | "default"
 }
+
+export interface Interface {
+  readonly resolve: (entries: readonly Entry[]) => Record<Key, State>
+  readonly all: Effect.Effect<Record<Key, State>>
+  readonly enabled: (key: Key) => Effect.Effect<boolean>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/Flag") {}
 
 /**
  * `OPENCODE_FLAGS`, a comma-separated list such as `schedules,-media_blob`; a leading `-` turns a flag off, and
@@ -81,26 +90,45 @@ export function resolve(input: {
   })
 }
 
-/** {@link resolve} for this process's channel and `OPENCODE_FLAGS`, for synchronous readers of config entries. */
-// 预绑定本进程渠道与 OPENCODE_FLAGS 的解析器，供需要同步读取配置条目的调用方复用
-export const resolver = Effect.gen(function* () {
-  // 进程的应用元数据（含渠道）
-  const app = yield* App.Metadata
-  // 读取环境覆盖
-  const overrides = yield* Overrides
-  return (entries: readonly Entry[]) => resolve({ entries, channel: app.channel, overrides })
+export const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const app = yield* App.Service
+    const config = yield* Config.Service
+    const overrides = yield* Overrides
+    const resolveEntries = (entries: readonly Entry[]) => resolve({ entries, channel: app.channel, overrides })
+    const all = Effect.gen(function* () {
+      return resolveEntries(yield* config.entries())
+    })
+    return Service.of({
+      resolve: resolveEntries,
+      all,
+      enabled: (key) => Effect.map(all, (flags) => flags[key].enabled),
+    })
+  }),
+)
+
+export const testLayer = (
+  entries: Entry[] = [],
+  options?: { readonly app?: Partial<App.Info>; readonly overrides?: string },
+) =>
+  Layer.fresh(layer).pipe(
+    Layer.provideMerge(
+      Layer.mergeAll(
+        App.layer(options?.app),
+        Config.testLayer(entries),
+        Layer.succeed(Overrides, options?.overrides),
+      ),
+    ),
+  )
+
+export const node = makeLocationNode({
+  service: Service,
+  layer,
+  deps: [App.node, Config.node],
 })
 
-/** Every flag with its value and where it came from, read from the Config in scope on each call. */
-// 每次调用都从当前作用域的 Config 读取条目并解析全部开关
-export const all = Effect.gen(function* () {
-  // Config 服务可能不存在（可选获取）
-  const config = yield* Effect.serviceOption(Config.Service)
-  // 无服务时按空条目处理
-  const entries = Option.isSome(config) ? yield* config.value.entries() : []
-  const read = yield* resolver
-  return read(entries)
-})
+/** Every flag with its value and where it came from, read from the location's Config on each call. */
+export const all = Service.use((flags) => flags.all)
 
-// 查询单个开关是否启用
-export const enabled = (key: Key) => all.pipe(Effect.map((flags) => flags[key].enabled))
+export const enabled = (key: Key) => Service.use((flags) => flags.enabled(key))

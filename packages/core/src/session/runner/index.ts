@@ -65,6 +65,8 @@ export interface Interface {
     /** The previous drain ran a step before handing off, so reaching idle still runs the idle hook. */
     // stepped：上一次 drain 已经跑过至少一步，因此即使本次直接空闲也要触发 idle 钩子。
     readonly stepped?: boolean
+    /** Why the execution is being interrupted, once it is: `"user"` when someone stopped it. */
+    readonly interruption?: () => "user" | "shutdown" | undefined
   }) => Effect.Effect<DrainResult, RunError>
 }
 

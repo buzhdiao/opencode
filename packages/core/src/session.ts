@@ -27,7 +27,8 @@ import { PromptInput } from "@opencode/schema/prompt-input"
 import { Bus } from "./bus.js"
 // 导入实例（Instance）服务
 import { Instance } from "./instance/service.js"
-// 导入数据库服务
+import { Plugin } from "./plugin/service.js"
+import { PluginHooks } from "./plugin/hooks.js"
 import { Database } from "./database/database.js"
 // 导入会话投影器（projector）
 import { SessionProjector } from "./session/projector.js"
@@ -309,13 +310,11 @@ export interface Interface {
   readonly prompt: (
     input: Parameters<Session.Handle["prompt"]>[0] & { sessionID: SessionSchema.ID },
   ) => ReturnType<Session.Handle["prompt"]>
-  /** Generates text from current Session context without admitting input or mutating history. */
-  // 仅用当前上下文生成文本，不写入输入也不改动历史
+  /** Generates text from current Session context without admitting input or mutating history. Its usage counts toward the Session's totals. */
   readonly generate: (input: {
     sessionID: SessionSchema.ID
     prompt: string
-  }) => Effect.Effect<string, NotFoundError | SessionGenerate.Error>
-  // 执行会话命令（command）
+  }) => Effect.Effect<SessionGenerate.Result, NotFoundError | SessionGenerate.Error>
   readonly command: (input: {
     sessionID: SessionSchema.ID
     command: string
@@ -381,9 +380,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Se
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    // 依赖：应用元数据（版本号等）
-    const app = yield* App.Metadata
-    // 依赖：数据库服务
+    const app = yield* App.Service
     const database = yield* Database.Service
     // 取底层 drizzle 实例
     const db = database.db
@@ -411,9 +408,7 @@ const layer = Layer.effect(
     const locations = yield* LocationServiceMap.Service
     // 构建底层会话句柄工厂
     const sessions = yield* Session.make()
-    // 判断某会话位置是否启用媒体 blob 存储
-    const mediaBlob = (session: SessionSchema.Info) => SessionBlob.enabledFor(instances, app, session)
-    // 判断总线日志条目是否为会话持久事件
+    const mediaBlob = (session: SessionSchema.Info) => SessionBlob.enabledFor(instances, session)
     const isDurableSessionEvent = (item: Bus.LogItem): item is SessionEvent.DurableEvent =>
       Object.hasOwn(SessionEvent.Durable.cases, item.type)
 
@@ -539,8 +534,16 @@ const layer = Layer.effect(
             ...inherited,
           })
           .pipe(Effect.provideService(SessionBlob.ForkMedia, media))
-        // 返回新会话
-        return yield* result.get(sessionID).pipe(Effect.orDie)
+        const forked = yield* result.get(sessionID).pipe(Effect.orDie)
+        yield* Effect.gen(function* () {
+          yield* Plugin.awaitActivation
+          const hooks = yield* PluginHooks.Service
+          yield* hooks.trigger("session", "fork", { sessionID })
+        }).pipe(
+          instances.provide(forked),
+          Effect.catchCause((cause) => Effect.logWarning("fork hook failed", { sessionID, cause })),
+        )
+        return forked
       }),
       // 按 ID 读取会话（委托给句柄）
       get: (sessionID) => sessions.forSession(sessionID).get(),
@@ -569,14 +572,15 @@ const layer = Layer.effect(
         yield* transport.close(sessionID)
         // 查找全部子会话
         const children = yield* store.list({ parentID: sessionID })
-        // 串行递归删除子会话
-        yield* Effect.forEach(children, (child) => result.remove(child.id), { concurrency: 1, discard: true })
-        // 清空环境变量
+        // Delete the parent before its children: an interrupted child settles through the report
+        // path, and a report admitted just before the parent's deletion wakes an execution whose
+        // lifecycle write then fails on the deleted row.
         yield* environments.clear(sessionID)
         // 发布会话删除事件
         yield* bus.publish(SessionEvent.Deleted, { sessionID })
         // 移除该会话的总线聚合
         yield* bus.remove(sessionID)
+        yield* Effect.forEach(children, (child) => result.remove(child.id), { concurrency: 1, discard: true })
       }),
       // 分页列出会话：解析游标、查询数据并生成前后翻页游标
       list: Effect.fn("Session.list")(function* (input = {}) {
@@ -683,6 +687,7 @@ const layer = Layer.effect(
           Effect.provideService(Instance.Service, instances),
           Effect.provideService(Database.Service, database),
           Effect.provideService(LLMClient.Service, llm),
+          Effect.provideService(Bus.Service, bus),
         )
       }),
       // 执行会话命令：注入实例服务

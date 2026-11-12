@@ -7,6 +7,7 @@ import { createHash } from "crypto"
 import { Instruction } from "@opencode/schema/instruction"
 // 引入 Effect 的数据类型、副作用、Option 与 Schema 工具
 import { Data, Effect, Option, Schema } from "effect"
+import { canonicalJson } from "../util/canonical-json.js"
 
 // 转发导出 Key 及其类型
 export const Key = Instruction.Key
@@ -271,7 +272,7 @@ export function renderUpdate(
 
 // 计算 JSON 值的 SHA-256 哈希（基于规范化序列化）
 export function hash(value: Schema.Json) {
-  return Hash.make(createHash("sha256").update(canonical(value)).digest("hex"))
+  return Hash.make(createHash("sha256").update(canonicalJson(value)).digest("hex"))
 }
 
 // 把哈希增量应用到已有哈希表，得到新的哈希表
@@ -363,21 +364,6 @@ function isRemoved(value: unknown): value is Removed {
   return value === removed
 }
 
-// 规范化序列化：递归排序对象键，保证相同数据得到相同字符串（供哈希用）
-function canonical(value: Schema.Json): string {
-  // 数组：逐元素规范化后拼接
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`
-  // 对象：键按字典序排序后再逐项规范化
-  if (value !== null && typeof value === "object")
-    return `{${Object.entries(value)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      .map(([key, entry]) => `${JSON.stringify(key)}:${canonical(entry)}`)
-      .join(",")}}`
-  // 标量直接 JSON 序列化
-  return JSON.stringify(value)
-}
-
-// 校验渲染文本非空：空文本说明来源实现有误，立即抛错
 function requireText(key: Key, kind: string, text: string) {
   if (text.length === 0) throw new Error(`Instruction source ${key} rendered an empty ${kind}`)
   return text

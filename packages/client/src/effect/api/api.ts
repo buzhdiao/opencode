@@ -36,9 +36,9 @@ import type { SessionInbox } from "@opencode/schema/session-inbox"
 import type { PromptInput } from "@opencode/schema/prompt-input"
 import type { AgentAttachment } from "@opencode/schema/prompt"
 import type { FileDiff } from "@opencode/schema/file-diff"
+import type { Money } from "@opencode/schema/money"
 import type { Form } from "@opencode/schema/form"
 import type { DateTime } from "effect"
-import type { Money } from "@opencode/schema/money"
 import type { Skill } from "@opencode/schema/skill"
 import type { InstructionEntry } from "@opencode/schema/instruction-entry"
 import type { Schema } from "effect"
@@ -549,9 +549,16 @@ export type SessionInboxUpdateOperation<E = never> = (
 
 // 生成输入：会话 ID + 提示词
 export type SessionGenerateInput = { readonly sessionID: Session.ID; readonly prompt: string }
-// 输出：生成文本
-export type SessionGenerateOutput = { readonly text: string }
-// 操作类型：生成（多行签名）
+export type SessionGenerateOutput = {
+  readonly text: string
+  readonly tokens: {
+    readonly input: number
+    readonly output: number
+    readonly reasoning: number
+    readonly cache: { readonly read: number; readonly write: number }
+  }
+  readonly cost: Money.USD
+}
 export type SessionGenerateOperation<E = never> = (
   // 输入参数
   input: SessionGenerateInput,
@@ -1717,7 +1724,17 @@ export type ExperimentalSessionLogOutput =
           readonly created: number
           // 可选：附加元数据
           readonly metadata?: { readonly [x: string]: unknown } | undefined
-          // 判别字段：事件类型（标识当前变体）
+          readonly type: "session.step.first-token"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: { readonly sessionID: Session.ID; readonly assistantMessageID: SessionMessage.ID }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
           readonly type: "session.step.streamed"
           // 持久化定位：聚合 ID + 序列号 + 版本（供事件回放/补齐）
           readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
@@ -2450,9 +2467,7 @@ export type ExperimentalSessionLogOutput =
           readonly data: {
             // 会话 ID
             readonly sessionID: Session.ID
-            // 用量来源（标题生成/上下文压缩）
-            readonly source: "title" | "compaction"
-            // 花费（美元）
+            readonly source: "title" | "compaction" | "generate"
             readonly cost: Money.USD
             // token 用量统计
             readonly tokens: {
@@ -3589,6 +3604,7 @@ export type EventSubscribeInput = {
         | "session.shell.started"
         | "session.shell.ended"
         | "session.step.started"
+        | "session.step.first-token"
         | "session.step.streamed"
         | "session.step.ended"
         | "session.step.failed"
@@ -3650,6 +3666,7 @@ export type EventSubscribeInput = {
         | "vcs.branch.updated"
         | "mcp.status.changed"
         | "mcp.resources.changed"
+        | "experimental.mcp.event"
         | `${"rpc."}${string}`
       >
     | undefined

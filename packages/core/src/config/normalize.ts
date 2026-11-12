@@ -900,9 +900,7 @@ function diagnoseSelectionMap(value: unknown, path: string[], diagnostics: Diagn
 
 // 检查单个对象里的 model/variant 旧写法是否可识别，不可识别记 unsupported 诊断。
 function diagnoseSelection(value: Record<string, unknown>, path: string[], diagnostics: Diagnostic[]) {
-  // model 形如 provider/model（不含 #）才有效。
-  const modelValid = typeof value.model === "string" && /^[^/#]+\/[^#]+$/.test(value.model)
-  // model 存在但格式不被支持：记诊断。
+  const modelValid = typeof value.model === "string" && ConfigMigrateV1.modelSelection(value.model) !== undefined
   if (own(value, "model") && typeof value.model === "string" && !modelValid)
     diagnostics.push({
       kind: "unsupported",

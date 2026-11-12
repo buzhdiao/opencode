@@ -116,11 +116,9 @@ export type Inventory = {
 const description = [
   // 第 1 条：说明 execute 的用途
   "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results.",
-  // 第 2 条：可用能力与限制（有 fetch；无导入、无文件系统、无定时器）
+  "Write plain JavaScript and send it exactly as written: no code fence, and no JSON or other wrapper around it.",
   "`fetch` is available for HTTP requests. Imports, direct filesystem access, and timers are unavailable: there is no `setTimeout` or sleep. All other external access goes through `tools`.",
-  // 第 3 条：代码里只能调用目录列出或 search 返回的工具
-  "Within `{ code }`, the only callable tools are those explicitly listed in the Code Mode catalog instructions or returned by the `search` function. Inside `{ code }`, ignore tools shown outside the Code Mode catalog. They are not available in the Code Mode runtime.",
-  // 第 4 条：必须按目录里的精确路径与签名调用，不得自行改写工具名
+  "Inside `execute`, the only callable tools are those explicitly listed in the Code Mode catalog instructions or returned by the `search` function. Ignore tools shown outside the Code Mode catalog. They are not available in the Code Mode runtime.",
   'Call tools through `tools` using only exact paths and signatures from the catalog. Do not infer or normalize tool names; preserve bracket notation such as `tools.<namespace>["tool-name"](input)`.',
   // 第 5 条：建议显式 return；省略时取最后一个顶层表达式的值
   "Prefer an explicit `return`; if omitted, the final top-level expression becomes the result.",
@@ -145,7 +143,7 @@ export const create = (
     description,
     // 输入模式：CodeMode.Input（含 code 字段）
     input: CodeMode.Input,
-    // 输出模式：ExecuteOutput
+    freeform: { type: "text" },
     output: ExecuteOutput,
     // 执行入口：解构出 code 后运行
     execute: ({ code }, context) =>
@@ -211,6 +209,8 @@ export const create = (
                     // Progress replaces the execute call's own, so an inner tool's updates would hide the call rows.
                     // 内部工具的 progress 置空：避免覆盖 execute 自身的调用行进度
                     progress: () => Effect.void,
+                    // A stop is the execute call's to handle: a nested call never fails it with its own error.
+                    cancel: undefined,
                   }).pipe(
                     // 失败时包装为 ToolFailure（消息经过 toSessionError 归一化）
                     Effect.mapError((error) => new ToolFailure({ message: toSessionError(error).message, error })),
@@ -351,8 +351,10 @@ export const catalog = (inventory: Inventory) => {
       // 工具名取路径最后一段
       name: tool.path.split(".").at(-1) ?? tool.path,
       description: tool.description,
-      signature: tool.signature,
-      // 标记是否 pinned
+      // Rendered only for the tools the catalog shows.
+      get signature() {
+        return tool.signature
+      },
       pinned: pinned.has(tool.path),
     }
   // 渲染整棵树并返回清单形状
@@ -431,8 +433,11 @@ export const check = (
   // 内部工具调用回调
   executeTool: (name: string, tool: Info, input: unknown) => Effect.Effect<Result, Error>,
 ) =>
-  // 为本次校验单独构建运行时（不缓存），执行代码并注入 Run 服务
-  CodeMode.make({ tools: inventoryTools(inventory), hooks: runHooks, limits })
+  CodeMode.make({
+    tools: inventoryTools(inventory),
+    hooks: runHooks,
+    limits,
+  })
     .execute(code, bindings)
     .pipe(
       Effect.provideService(Run, {
@@ -457,7 +462,7 @@ function inventoryTools(inventory: Inventory) {
     getNode(root, qualifiedName(registration)).tool = Tool.make({
       description: child.description,
       input: child.inputSchema,
-      // 输出缺省时按"可空字符串"处理
+      freeform: registration.freeform !== undefined,
       output: child.outputSchema ?? Schema.NullOr(Schema.String),
       // 执行时回调 Run 服务里的 executeTool
       execute: (input) => Run.use((run) => run.executeTool(name, registration, input)),
@@ -613,12 +618,11 @@ function formatResult(result: CodeMode.Result) {
   return [output, warnings, logs].filter((part) => part !== undefined && part !== "").join("\n\n")
 }
 
-// 定义 formatValue：把返回值格式化为文本（字符串原样，其他 JSON 缩进两格）
+// Compact JSON: indentation adds tokens on every later step without helping the model. Clients pretty-print it.
 function formatValue(value: CodeMode.DataValue) {
   // 字符串直接返回
   if (typeof value === "string") return value
-  // 其他值 JSON 序列化（undefined 时退化为 String()）
-  return JSON.stringify(value, null, 2) ?? String(value)
+  return JSON.stringify(value) ?? String(value)
 }
 
 // 定义 outputFiles：从内容块中提取文件（要求为 base64 data URI 格式）

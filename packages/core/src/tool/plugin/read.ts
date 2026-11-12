@@ -3,9 +3,7 @@ export * as ReadTool from "./read.js"
 
 // 导入插件上下文类型（Context）
 import type { Context } from "@opencode/plugin/effect/plugin"
-// 导入 path 模块的常用函数：取文件名、取目录、拼接路径
-import { basename, dirname, join } from "path"
-// 导入 Effect 化的工具失败类型（ToolFailure）
+import { basename, dirname, extname, isAbsolute, join, relative } from "path"
 import { ToolFailure } from "@opencode/ai/effect"
 // 导入 Effect 原语：Effect、Schema
 import { Effect, Schema } from "effect"
@@ -49,7 +47,7 @@ const LocationInput = Schema.Struct({
 })
 // 工具输入 Schema（当前与 LocationInput 相同）
 export const Input = LocationInput
-// 输出 Schema：文件内容 / 文本分页 / 目录分页 三选一
+type Missing = { input: string; requested: FileAccess.Target; context: FileAccess.Invocation }
 const Output = Schema.Union([ReadToolFileSystem.FileContent, ReadToolFileSystem.TextPage, ReadToolFileSystem.ListPage])
 
 // 插件定义：注册 read 工具
@@ -72,6 +70,7 @@ export const Plugin = {
     const fs = yield* FSUtil.Service
     // 注入位置服务
     const location = yield* Location.Service
+    const environment = yield* Environment.Service
 
     // 向工具注册中心注册 read 工具
     yield* ctx.tool
@@ -167,20 +166,16 @@ export const Plugin = {
                       const alternate = yield* alternatePath(requested.absolute).pipe(
                         Effect.orElseSucceed(() => undefined),
                       )
-                      // 没有替代文件：走统一的“缺失”错误提示
-                      if (!alternate) return yield* missing(input.path, requested.absolute)
-                      // 对替代文件授权读取（作为请求目标的同级）
+                      if (!alternate) return yield* missing({ input: input.path, requested, context })
                       const target = yield* access.authorizeRead(alternate, context, { siblingOf: requested })
                       // 读取替代文件（仍不存在则走缺失提示）
                       const content = yield* read(target).pipe(
                         Effect.catchIf(
                           (error) => error instanceof Environment.NotFound,
-                          () => missing(input.path, requested.absolute),
+                          () => missing({ input: input.path, requested, context }),
                         ),
                       )
-                      // 替代命中目录列表也视为不匹配，走缺失提示
-                      if (content.type === "list-page") return yield* missing(input.path, requested.absolute)
-                      // 返回内容，路径显示为请求目录 + 替代文件名
+                      if (content.type === "list-page") return yield* missing({ input: input.path, requested, context })
                       return {
                         content,
                         target,
@@ -246,8 +241,8 @@ export const Plugin = {
                 const message =
                   error instanceof ReadToolFileSystem.BinaryFileError ||
                   error instanceof ReadToolFileSystem.MediaIngestLimitError ||
-                  error instanceof ReadToolFileSystem.OffsetOutOfRangeError ||
-                  error instanceof ReadToolFileSystem.PathKindError
+                  error instanceof ReadToolFileSystem.PathKindError ||
+                  error instanceof ReadToolFileSystem.DirectoryOffsetError
                     ? error.message
                     : `Unable to read ${input.path}`
                 return new ToolFailure({ message, error })
@@ -261,13 +256,6 @@ export const Plugin = {
 
     // 在同目录中查找与目标文件名“规范化后相同”的替代文件
     const alternatePath = Effect.fn("ReadTool.alternatePath")(function* (absolute: string) {
-      // 规范化函数：NFC 归一、把不间断空格换成普通空格、把弯引号换成直引号
-      const canonical = (name: string) =>
-        name
-          .normalize("NFC")
-          .replace(/[\u00a0\u202f]/g, " ")
-          .replace(/[\u2018\u2019]/g, "'")
-      // 目标文件名的规范化形式
       const base = canonical(basename(absolute))
       // 列出同目录条目并按规范化名匹配
       const matches = (yield* reader.list(AbsolutePath.make(dirname(absolute)))).filter(
@@ -291,25 +279,34 @@ export const Plugin = {
         Effect.orElseSucceed(() => ({ type: "unknown" as const })),
       )
 
-    // 从名字列表里找与 name 相似的候选（双向包含匹配，最多 3 个）
-    const similar = (names: readonly string[], name: string) => {
-      // 目标的小写形式
-      const base = name.toLowerCase()
-      // 过滤：候选包含目标或目标包含候选（均小写比较）
-      return names
-        .filter((entry) => {
-          const candidate = entry.toLowerCase()
-          return candidate.includes(base) || base.includes(candidate)
-        })
-        // 最多给 3 个建议
-        .slice(0, 3)
-    }
+    // A path written from the wrong root, such as /Users/me/src/a.ts for a location at /Users/me/repo,
+    // usually means <location>/src/a.ts, so check that one path and nothing else.
+    const reroot = Effect.fn("ReadTool.reroot")(function* (miss: Missing) {
+      const root = location.directory
+      if (FSUtil.contains(root, miss.requested.absolute) || !FSUtil.contains(dirname(root), miss.requested.absolute))
+        return []
+      const target = yield* access.resolve({ path: join(root, relative(dirname(root), miss.requested.absolute)) })
+      if (!(yield* Environment.exists(environment.files, target.absolute))) return []
+      const readable = yield* permission.allows({
+        action: "read",
+        resources: [target.resource],
+        save: ["*"],
+        ...Permission.invocation(miss.context),
+      })
+      if (!readable) return []
+      return [isAbsolute(miss.input) || miss.input.startsWith("~/") ? target.absolute : target.resource]
+    })
+
+    const didYouMean = (suggestions: string[]) =>
+      suggestions.length === 0 ? [] : [`Did you mean one of these?\n${suggestions.slice(0, 3).join("\n")}`]
 
     // A missing folder usually means a removed worktree, a moved directory, or a relative path
     // resolved from the wrong place, so name the first missing folder and its nearest existing parent.
-    // 目录整体缺失时的错误提示：指出第一个缺失的目录与其最近存在的父目录
-    const missingFolder = Effect.fn("ReadTool.missingFolder")(function* (input: string, folder: string) {
-      // 当前检查的子目录
+    const missingFolder = Effect.fn("ReadTool.missingFolder")(function* (
+      input: string,
+      folder: string,
+      moved: string[],
+    ) {
       let child = folder
       // 其父目录
       let parent = dirname(folder)
@@ -321,13 +318,11 @@ export const Plugin = {
         if (found.type === "unknown") break
         // 父目录存在：给出针对性提示
         if (found.type === "found") {
-          // 在父目录里找与缺失目录名相似的建议
-          const suggestions = similar(found.names, basename(child)).map((entry) => join(parent, entry))
-          // 组装多段消息
+          const suggestions = [...moved, ...similar(found.names, basename(child)).map((entry) => join(parent, entry))]
           const message = [
             `File not found: ${input}`,
             `The folder ${child} does not exist. The nearest folder that does is ${parent}.`,
-            ...(suggestions.length === 0 ? [] : [`Did you mean one of these?\n${suggestions.join("\n")}`]),
+            ...didYouMean(suggestions),
           ].join("\n\n")
           // 返回失败
           return yield* new ToolFailure({ message })
@@ -336,33 +331,77 @@ export const Plugin = {
         child = parent
         parent = dirname(parent)
       }
-      // 回溯到根仍没找到：给通用提示
-      return yield* new ToolFailure({ message: `File not found: ${input}` })
+      return yield* new ToolFailure({ message: [`File not found: ${input}`, ...didYouMean(moved)].join("\n\n") })
     })
 
-    // 统一的“文件缺失”错误构造：区分目录缺失与文件名打错两种情形
-    const missing = Effect.fn("ReadTool.missing")(function* (input: string, absolute: string) {
-      // 所在目录
-      const folder = dirname(absolute)
-      // 列出目录
+    const missing = Effect.fn("ReadTool.missing")(function* (miss: Missing) {
+      const moved = yield* reroot(miss).pipe(Effect.orElseSucceed(() => []))
+      const folder = dirname(miss.requested.absolute)
       const found = yield* listing(folder)
-      // 目录本身不存在：走目录缺失提示
-      if (found.type === "missing") return yield* missingFolder(input, folder)
-      // 目录存在：找与请求文件名相似的建议
-      const suggestions =
-        found.type === "found" ? similar(found.names, basename(input)).map((entry) => join(dirname(input), entry)) : []
-      // 有建议时给 “Did you mean” 消息，否则给通用消息
-      const message =
-        suggestions.length === 0
-          ? `File not found: ${input}`
-          : `File not found: ${input}\n\nDid you mean one of these?\n${suggestions.join("\n")}`
-      // 返回失败
-      return yield* new ToolFailure({ message })
+      if (found.type === "missing") return yield* missingFolder(miss.input, folder, moved)
+      const suggestions = [
+        ...moved,
+        ...(found.type === "found"
+          ? similar(found.names, basename(miss.input)).map((entry) => join(dirname(miss.input), entry))
+          : []),
+      ]
+      return yield* new ToolFailure({
+        message: [`File not found: ${miss.input}`, ...didYouMean(suggestions)].join("\n\n"),
+      })
     })
   }),
 }
 
-// 解析 skill:// URI：提取技能 ID 与内部目标路径，并做安全校验
+// Ranks a folder's entries against a missing name: same name ignoring case, then same stem with
+// another extension, then one containing the other, then a typo in the stem.
+const similar = (names: readonly string[], requested: string) => {
+  const name = requested.toLowerCase()
+  const wanted = stem(name)
+  const typos = wanted.length < 3 ? 0 : wanted.length < 5 ? 1 : 2
+  const tier = (candidate: string) => {
+    if (candidate === name) return 1
+    // Names that only differ in look-alike characters are what alternatePath recovers or deliberately skips.
+    if (canonical(candidate) === canonical(name)) return
+    const found = stem(candidate)
+    if (found === wanted) return 2
+    if (
+      Math.min(found.length, wanted.length) >= 3 &&
+      (candidate.includes(name) || name.includes(candidate) || found.includes(wanted) || wanted.includes(found))
+    )
+      return 3
+    // Folders can be huge, so skip the distance when the lengths alone rule out a typo.
+    if (typos > 0 && Math.abs(found.length - wanted.length) <= typos && editDistance(found, wanted) <= typos) return 4
+  }
+  return names
+    .filter((entry) => entry !== requested)
+    .flatMap((entry) => {
+      const rank = tier(entry.toLowerCase())
+      return rank === undefined ? [] : [{ entry, rank, distance: editDistance(entry.toLowerCase(), name) }]
+    })
+    .sort((a, b) => a.rank - b.rank || a.distance - b.distance || a.entry.localeCompare(b.entry))
+    .slice(0, 3)
+    .map((match) => match.entry)
+}
+
+const canonical = (name: string) =>
+  name
+    .normalize("NFC")
+    .replace(/[\u00a0\u202f]/g, " ")
+    .replace(/[\u2018\u2019]/g, "'")
+
+const stem = (name: string) => name.slice(0, name.length - extname(name).length) || name
+
+const editDistance = (a: string, b: string) => {
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index)
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i]
+    for (let j = 1; j <= b.length; j++)
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1))
+    previous = current
+  }
+  return previous[b.length]
+}
+
 function parseSkillUri(value: string) {
   // 去掉 "skill://" 前缀并去掉尾部斜杠
   const trimmed = value.slice("skill://".length).replace(/\/+$/, "")
@@ -422,9 +461,12 @@ export const toModelContent = (path: string, offset: number | undefined, output:
   const text = output.type === "file" ? output.content.replace(/\n$/, "") : output.content
   // 拆行（空内容为空数组）
   const lines = output.content === "" ? [] : text.split("\n")
-  // 首行摘要
+  // A page that starts before the requested offset is the file's tail, returned for an offset past the end.
+  const total = start + lines.length - 1
+  const pastEnd = output.type === "text-page" && offset !== undefined && start < offset
   const content = [
-    lines.length === 0 ? `Read file ${path}, 0 lines` : `Read file ${path}, lines ${start}-${start + lines.length - 1}`,
+    (lines.length === 0 ? `Read file ${path}, 0 lines` : `Read file ${path}, lines ${start}-${total}`) +
+      (pastEnd ? ` (offset ${offset} is past the end; the file has ${total} ${total === 1 ? "line" : "lines"})` : ""),
   ]
   // 逐行输出 "行号: 内容"
   lines.forEach((line, index) => content.push(`${start + index}: ${line}`))

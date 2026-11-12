@@ -25,9 +25,7 @@ import { Effect } from "effect"
 import { type HttpServerRequest, HttpServerResponse } from "effect/http"
 // HttpApiSchema：API 响应 Schema 工具（如 204 无内容）
 import { HttpApiSchema } from "effect/http-api"
-// Location 工具：等待插件、错误转换、请求归属与响应包装
-import { awaitPlugins, locationErrors, requestRef, response } from "../location"
-// 会话缺失错误构造
+import { locationErrors, requestRef, response } from "../location"
 import { missingSession } from "./session-error"
 
 /** `artifacts.*` in the `server.experimental` group. Every route needs experimental.artifacts in the resolved Location. */
@@ -119,8 +117,7 @@ export const makeArtifact = Effect.gen(function* () {
     Effect.gen(function* () {
       // 先解析 Location 引用
       const ref = yield* resolveLocation(request, options)
-      // 等插件就绪后执行 effect，按 Location 注入服务并转换位置类错误
-      return yield* awaitPlugins.pipe(Effect.andThen(effect), Effect.provide(locations.get(ref)), locationErrors)
+      return yield* effect.pipe(Effect.provide(locations.get(ref)), locationErrors)
     })
 
   // 把工件领域的错误统一映射为 HTTP 协议错误

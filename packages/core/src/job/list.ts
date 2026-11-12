@@ -25,7 +25,8 @@ export type Live = {
   readonly info: Info
   // 是否已转入后台运行（后台作业即使尚未落库也应出现在列表中）
   readonly isBackgrounded: boolean
-  // 可选的恢复信息（shell / subagent / image 三种之一）
+  readonly consumed?: boolean
+  readonly settling?: boolean
   readonly recovery?: Recovery
 }
 
@@ -186,7 +187,7 @@ export function read<Entry extends Live>(
     }
     // 再遍历内存中的活跃作业，补上尚未落库（或比数据库行更新）的后台作业
     for (const live of active.values()) {
-      // 非后台作业或没有恢复信息的跳过（前者已由数据库行表达，后者无法展示）
+      if (live.consumed || live.settling) continue
       if (!live.isBackgrounded || !live.recovery) continue
       // 该作业的通知 ID 已被数据库行覆盖时跳过，避免重复展示
       if (live.info.notificationID && seen.has(live.info.notificationID)) continue

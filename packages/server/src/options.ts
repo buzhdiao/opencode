@@ -53,15 +53,6 @@ export const ServerOptions = Schema.Struct({
    */
   // 自定义 fetch：仅接受函数值（Schema.declare 定义不透明类型并做运行时判断）
   fetch: Schema.optional(Schema.declare((input): input is LayerNodePlatform.Fetch => typeof input === "function")),
-  // 已连接的 OpenCode Console 配置保持新鲜的方式（详见下方英文说明）
-  /**
-   * How a connected OpenCode Console's config stays fresh. `poll` (default `true`) re-checks it every minute in the
-   * background. With `poll: false` it refreshes only when a prompt starts, so a host that suspends between prompts,
-   * such as a Durable Object, can stay idle.
-   */
-  // Console 配置刷新选项块
-  console: Schema.optional(Schema.Struct({ poll: Schema.optional(Schema.Boolean) })),
-  // 配置加载选项块
   config: Schema.optional(
     Schema.Struct({
       // 配置目录路径

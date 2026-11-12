@@ -23,9 +23,6 @@ import { Permission } from "../../permission.js"
 import { Session } from "../../session.js"
 // 会话相关 Schema（如 ID 类型）
 import { SessionSchema } from "../../session/schema.js"
-// 子代理完成结果常量（如无输出时的占位文本）
-import { SubagentCompletion } from "../../session/subagent-completion.js"
-// 子代理任务（SubagentJob）服务：注册后台任务与通知
 import { SubagentJob } from "../../session/subagent-job.js"
 
 // 工具名称：subagent（子代理）
@@ -39,9 +36,7 @@ const backgroundResult = (sessionID: SessionSchema.ID) => ({
   status: "running" as const,
   // 输出提示文案：不要轮询/重复子代理的工作，并说明如何跟进
   output: [
-    // 告知子代理已在后台启动，结束时会有自动通知
-    `The subagent is working in the background (sessionID: ${sessionID}). You will be notified automatically when it finishes.`,
-    // 禁止休眠、轮询进度、询问状态或重复其工作
+    `The subagent is working in the background (sessionID: ${sessionID}). You will receive a <subagent> message when it goes idle, and again after each later round of work.`,
     "DO NOT sleep, poll for progress, ask the subagent for status, or duplicate this subagent's work; avoid working with the same files or topics it is using.",
     // 建议处理互不重叠的任务，或简单告知用户已启动后结束回复
     "Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.",
@@ -67,36 +62,23 @@ export const Input = Schema.Struct({
   sessionID: Schema.optionalKey(SessionSchema.ID).annotate({
     description: "Send a follow-up to an existing subagent, running or finished. Omit to start a new one.",
   }),
-  // background：可选，是否后台运行并立即返回
-  background: Schema.optionalKey(Schema.Boolean).annotate({
-    description:
-      "Run the subagent in the background and return immediately. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress.",
-  }),
 })
 
 // 工具出参 Schema：会话 ID、运行状态与输出文本
 export const Output = Schema.Struct({
   // 子代理会话 ID
   sessionID: SessionSchema.ID,
-  // 状态：completed（已完成）或 running（后台运行中）
-  status: Schema.Literals(["completed", "running"]),
-  // 输出文本
+  status: Schema.Literal("running"),
   output: Schema.String,
 })
 // 工具描述：说明子代理的用途、前后台行为与 sessionID 续聊用法
 export const description = [
   // 在子会话中派生一个代理来执行指定任务
   "Spawns an agent in a child session to work on the specified task.",
-  // 返回的 sessionID 可用于继续与该子代理对话
-  "The output includes a sessionID you can pass back later to continue that specific conversation with the subagent.",
-  // 新子会话上下文是全新的，需要自带完整上下文
+  "Subagents always run in the background: the call returns immediately with a sessionID, and you receive a `<subagent>` message each time the child goes idle, including after later work.",
+  "Keep working on non-overlapping tasks, or briefly tell the user what you launched and end your response. Do not sleep, poll for progress, or ask the child for status.",
   "New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.",
-  // 前台模式（默认）会等待子代理完成并返回最终答复
-  "Foreground (default) runs the subagent to completion and returns its final response.",
-  // 后台模式（background=true）异步启动并立即返回，完成后收到通知
-  "Background mode (background=true) launches it asynchronously and returns immediately; you are notified when it finishes.",
-  // 仅对可并行执行的独立任务使用后台模式
-  "Use background only for independent work that can run while you continue elsewhere.",
+  "Pass the returned sessionID to continue that specific child conversation. A follow-up to a running child joins its current run.",
 ].join("\n")
 
 // 插件定义：注册 subagent 工具及其钩子
@@ -296,14 +278,13 @@ export const Plugin = {
                     ),
                   ))
 
-              // 是否以后台模式运行
-              const background = input.background === true
-              // 先向调用方报告子代理已开始运行
+              // A child that is not draining yet must be admitted without waking: the job's resume
+              // owns the start, so the period cannot run before its boundary is registered.
+              const running =
+                existing !== undefined &&
+                ((yield* sessions.active).has(existing.id) || (yield* jobs.get(existing.id))?.status === "running")
               yield* context.progress({ sessionID: child.id, status: "running" })
 
-              // Standard prompt admission outside the job: Job.start joining a running child skips
-              // its run effect, and the default wake starts an idle child or steers a running one.
-              // 在任务系统之外直接向子会话发送提示（prompt）：新建时附加子代理身份说明，续聊只发任务内容
               yield* sessions
                 .prompt({
                   // 目标为子会话
@@ -313,8 +294,7 @@ export const Plugin = {
                     existing === undefined
                       ? ["You are a subagent spawned by another session.", input.prompt].join("\n")
                       : input.prompt,
-                  // 后台新建时不自动 resume（恢复），避免抢占运行
-                  ...(background && existing === undefined ? { resume: false } : {}),
+                  ...(running ? {} : { resume: false }),
                 })
                 .pipe(
                   Effect.mapError(
@@ -337,62 +317,13 @@ export const Plugin = {
               }
               // 注册子代理任务
               yield* subagents.start(recovery)
-
-              // 后台模式：登记后台任务并立即返回运行中结果
-              if (background) {
-                // 标记为后台执行
-                yield* subagents.background(recovery)
-                // 返回后台运行结果
-                return backgroundResult(child.id)
-              }
-
-              // 前台模式：阻塞等待子会话任务完成；被中断时联动取消子会话
-              const result = yield* jobs.block({ id: child.id, sessionID: context.sessionID }).pipe(
-                // 中断处理：中断子会话并取消任务
-                Effect.onInterrupt(() =>
-                  Effect.all([sessions.interrupt(child.id), jobs.cancel(child.id)], {
-                    // 只执行不产出结果
-                    discard: true,
-                  }),
-                ),
-              )
-              // 任务被转后台时，通知子代理任务服务并返回后台结果
-              if (result?.type === "backgrounded") {
-                // 发送状态通知
-                yield* subagents.notify(recovery, result.info.started_at)
-                // 返回后台运行结果
-                return backgroundResult(child.id)
-              }
-              // Failure surfaces keep the sessionID visible so the model can continue the child.
-              // 失败信息中保留 sessionID，便于模型继续与子会话交互
-              // 子任务执行出错时抛出带错误详情的工具失败
-              if (result?.info.status === "error")
-                return yield* new ToolFailure({
-                  message: `Subagent failed (sessionID: ${child.id}): ${result.info.error ?? "unknown error"}`,
-                })
-              // 子任务被取消时同样返回工具失败
-              if (result?.info.status === "cancelled")
-                return yield* new ToolFailure({ message: `Subagent cancelled (sessionID: ${child.id})` })
-              // 正常完成：返回子会话 ID、完成状态与输出文本
-              return {
-                // 子会话 ID
-                sessionID: child.id,
-                // 状态：已完成
-                status: "completed" as const,
-                // 输出文本；无文本时使用占位常量
-                output: result?.info.output ?? SubagentCompletion.NO_TEXT,
-              }
+              return backgroundResult(child.id)
             }).pipe(
               // 将执行结果包装为工具响应（content/metadata）
               Effect.map((output) => ({
                 // 原始输出
                 output,
-                // 完成时用 XML 标签包裹输出，运行中则原样透传提示
-                content:
-                  output.status === "completed"
-                    ? `<subagent sessionID="${output.sessionID}" state="completed">\n${output.output}\n</subagent>`
-                    : output.output,
-                // 元数据：携带会话 ID 与状态
+                content: output.output,
                 metadata: { sessionID: output.sessionID, status: output.status },
               })),
             ),

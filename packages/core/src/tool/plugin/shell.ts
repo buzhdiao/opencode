@@ -12,31 +12,34 @@ import { ToolFailure } from "@opencode/ai/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
 import type { ShellCreateBefore } from "@opencode/plugin/effect/shell"
+import type { Shell as ShellSchema } from "@opencode/schema/shell"
 import type { Tool } from "@opencode/schema/tool"
-// effect：Deferred（一次性异步结果）、Schema、Scope（作用域）。
-import { Deferred, Effect, Schema, Scope } from "effect"
-// 环境服务（文件系统类型校验）。
+import { Deferred, Effect, Fiber, Option, Schema } from "effect"
 import { Environment } from "../../environment/index.js"
 // 作业系统。
 import { Job } from "../../job.js"
 // 文件访问控制（目录解析与外部目录授权）。
 import { FileAccess } from "../../file-access.js"
-// 权限系统。
+import { Flag } from "../../flag.js"
 import { Permission } from "../../permission.js"
 // 非负整数 Schema。
 import { NonNegativeInt } from "../../schema.js"
 // 会话服务（发合成消息）。
 import { Session } from "../../session.js"
+import { SessionMessage } from "../../session/message.js"
 import { SessionSchema } from "../../session/schema.js"
 // shell 服务与解析/选择/结果工具。
 import { Shell } from "../../shell.js"
 import { ShellParse } from "../../shell/parse.js"
 import { ShellSelect } from "../../shell/select.js"
 import { ShellResult } from "../../shell/result.js"
+import { toolFailure } from "../runtime.js"
 
 // 工具名与默认超时（2 分钟）。
 export const name = "shell"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
+// How long a call the user interrupted waits for its stopped command to exit before settling with the output so far.
+const INTERRUPT_WAIT = "500 millis"
 
 // BACKGROUND_INSTRUCTION：后台命令返回时附带的指令——别轮询，干别的活，
 // 完成后会自动通知你。
@@ -51,8 +54,7 @@ const OS =
       : process.platform === "linux"
         ? "Linux"
         : process.platform
-// description：动态生成工具描述（可附带实际使用的 shell）。
-const description = (shell?: string) =>
+const description = (shell?: string, autoBackground = false) =>
   [
     "Execute a shell command and return its output.",
     ...(shell ? [`Commands run on ${OS} using ${shell}.`] : []),
@@ -60,7 +62,9 @@ const description = (shell?: string) =>
     "Prefer dedicated tools over shell commands when possible.",
     "When output is large, the full result is saved to a file and a truncated preview is returned.",
     "Rely on automatic truncation unless filtering the output is more useful.",
-    "Commands accept an optional timeout, background commands have no timeout by default.",
+    autoBackground
+      ? "Commands still running after their timeout move to the background."
+      : "Commands accept an optional timeout, background commands have no timeout by default.",
     "Background commands return immediately, and you will be notified when they complete.",
   ].join(" ")
 
@@ -85,8 +89,10 @@ const StructuredOutput = Schema.Struct({
   exit: Schema.optionalKey(Schema.Number),
   signal: Schema.optionalKey(Schema.String),
   shellID: Schema.optionalKey(Schema.String),
+  pid: Schema.optionalKey(NonNegativeInt),
   truncated: Schema.Boolean,
   timeout: Schema.optionalKey(Schema.Boolean),
+  killed: Schema.optionalKey(Schema.String),
 })
 
 // 完整输出：结构化字段 + 正文 output + status（completed/running）。
@@ -98,41 +104,175 @@ const Output = Schema.Struct({
 
 type Output = typeof Output.Type
 
-// resultMessages：正文 + 附带说明（后台指令或结果提示）。
-const resultMessages = (output: Output) => {
-  const notice = output.status === "running" ? BACKGROUND_INSTRUCTION : ShellResult.notice(output)
+const resultMessages = (output: Output, timeout?: number) => {
+  const notice = output.status === "running" ? BACKGROUND_INSTRUCTION : ShellResult.notice(output, timeout)
   return [...(output.output ? [output.output] : []), ...(notice ? [notice] : [])]
 }
 
-// toolResult：包装成标准工具结果（output + content + metadata）。
-const toolResult = (output: Output) => {
+const toolResult = (output: Output, timeout?: number) => {
   return {
     output,
-    content: resultMessages(output).map((text) => ({ type: "text" as const, text })),
+    content: resultMessages(output, timeout).map((text) => ({ type: "text" as const, text })),
     metadata: {
       status: output.status,
       ...ShellResult.metadata(output),
       ...(output.shellID !== undefined ? { shellID: output.shellID } : {}),
+      ...(output.pid !== undefined ? { pid: output.pid } : {}),
     },
   }
 }
 
-// backgroundResult：后台启动时立即返回的“已转后台”提示（含输出文件路径）。
-const backgroundResult = (shellID: string, file: string) => ({
-  output: `Command moved to the background (shell ID: ${shellID}).\nOutput is streaming to: ${file}`,
-  shellID,
+const backgroundResult = (info: ShellResult.Result["info"], timeout?: number) => ({
+  output: [
+    `Command moved to the background (shell ID: ${info.id}).`,
+    ...(info.pid === undefined ? [] : [`PID: ${info.pid}`]),
+    `Output is streaming to: ${info.file}`,
+    ...(timeout === undefined
+      ? []
+      : [
+          "",
+          `The command did not finish within its timeout of ${timeout / 1_000} seconds and was moved to the background. Do not start another copy while it is running.`,
+        ]),
+  ].join("\n"),
+  shellID: info.id,
+  ...(info.pid === undefined ? {} : { pid: info.pid }),
   truncated: false,
   status: "running" as const,
 })
 
-// 以插件形式实现（opencode.tool.shell），随 Location 装配。
+// Tells the session how a background command ended, once its job settles.
+const notify = Effect.fnUntraced(function* (
+  sessions: Pick<Session.Interface, "synthetic">,
+  jobs: Job.Interface,
+  input: {
+    readonly sessionID: SessionSchema.ID
+    readonly id: string
+    readonly shellID: string
+    readonly command: string
+    readonly settled: Deferred.Deferred<Output>
+  },
+) {
+  const info = (yield* jobs.wait({ id: input.id })).info
+  if (!info || info.status === "running") return
+  const output = info.status === "completed" ? yield* Deferred.await(input.settled) : undefined
+  const text = output ? (info.output ?? "") : info.status === "error" ? (info.error ?? "Command failed") : "Cancelled"
+  // A session deleted while its command ran has no one left to tell.
+  yield* sessions
+    .synthetic({
+      ...(info.notificationID ? { id: info.notificationID } : {}),
+      sessionID: input.sessionID,
+      description: input.command,
+      ...ShellResult.notification({
+        jobID: input.id,
+        shellID: input.shellID,
+        command: input.command,
+        state: info.status,
+        text,
+        output,
+      }),
+    })
+    .pipe(Effect.catchTag("Session.NotFoundError", () => Effect.void))
+  if (info.notificationID) yield* jobs.completeBackground(info.notificationID)
+})
+
+// The job that waits on a command for its call (or its session, once backgrounded).
+const startJob = Effect.fnUntraced(function* (
+  jobs: Job.Interface,
+  shell: Shell.Interface,
+  input: {
+    readonly sessionID: SessionSchema.ID
+    readonly info: ShellSchema.Info
+    readonly background?: boolean
+    readonly notificationID?: SessionMessage.ID
+    readonly timeout?: () => number
+  },
+) {
+  const info = input.info
+  const settled = yield* Deferred.make<Output>()
+  const job = yield* jobs.start({
+    // CodeMode children share a tool-call ID, but each shell must own its job.
+    id: info.id,
+    type: name,
+    title: info.command,
+    metadata: { sessionID: input.sessionID, shellID: info.id },
+    recovery: {
+      kind: "shell",
+      sessionID: input.sessionID,
+      shellID: info.id,
+      command: info.command,
+    },
+    ...(input.notificationID ? { notificationID: input.notificationID } : {}),
+    background: input.background,
+    run: Effect.gen(function* () {
+      const result = yield* shell.result(info)
+      if (!result.capture) return yield* new Shell.NotFoundError({ id: info.id })
+      return { ...ShellResult.output(result), status: "completed" as const }
+    }).pipe(
+      Effect.tap((output) => Deferred.succeed(settled, output)),
+      Effect.map((output) => resultMessages(output, input.timeout?.()).join("\n\n")),
+      // Interrupting the job (its registry closing) stops the command too, unless the server is handing its daemon
+      // over: then the command keeps running for the next server.
+      Effect.onInterrupt(() =>
+        shell.handoffPrepared() ? Effect.void : shell.stop(info.id, "killed").pipe(Effect.ignore, Effect.asVoid),
+      ),
+    ),
+    // Cancelling the job stops the command, keeping it and its output file.
+    cancel: shell.stop(info.id, "killed").pipe(Effect.ignore, Effect.asVoid),
+  })
+  return { job, settled }
+})
+
+/** The tool result of a call whose command moved to the background. */
+export const backgroundToolResult = (info: ShellSchema.Info) => {
+  const result = toolResult(backgroundResult(info))
+  // Narrowed to what a backgrounded command reports, so it can be published as is.
+  const metadata = {
+    shellID: info.id,
+    status: "running" as const,
+    truncated: result.metadata.truncated,
+    ...(info.pid === undefined ? {} : { pid: info.pid }),
+  }
+  return { content: result.content, metadata }
+}
+
+/**
+ * Watches a command taken over from a previous server as a background job of its session, and notifies the
+ * session when it finishes, as for a command the model ran in the background. A finished command's notice is
+ * admitted before this returns.
+ */
+export const reattach = Effect.fnUntraced(function* (input: {
+  readonly shell: Shell.Interface
+  readonly jobs: Job.Interface
+  readonly sessions: Pick<Session.Interface, "synthetic">
+  readonly sessionID: SessionSchema.ID
+  readonly info: ShellSchema.Info
+  // The job's existing durable row, if the previous server had backgrounded it.
+  readonly notificationID?: SessionMessage.ID
+}) {
+  const { job, settled } = yield* startJob(input.jobs, input.shell, { ...input, background: true })
+  const notifying = notify(input.sessions, input.jobs, {
+    sessionID: input.sessionID,
+    id: job.id,
+    shellID: input.info.id,
+    command: input.info.command,
+    settled,
+  })
+  const current = yield* input.shell.get(input.info.id).pipe(Effect.option)
+  if (Option.isSome(current) && current.value.status !== "running")
+    return yield* notifying.pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("failed to report a recovered shell command", { id: input.info.id, error }),
+      ),
+    )
+  yield* input.shell.watch(notifying)
+})
+
 export const Plugin = {
   id: "opencode.tool.shell",
   effect: Effect.fn("ShellTool.Plugin")(function* (ctx: Context) {
     // 依赖：会话、作业、作用域、环境、文件访问、shell、兼容 shell 选择、权限。
     const sessions = yield* Session.Service
     const jobs = yield* Job.Service
-    const scope = yield* Scope.Scope
     const environment = yield* Environment.Service
     const access = yield* FileAccess.Service
     const shell = yield* Shell.Service
@@ -140,6 +280,7 @@ export const Plugin = {
     // 兼容性优先的 shell（比如 Windows 上的 Git Bash）。
     const compatibleShell = shellSelect.resolve({ priority: "compat" })
     const permission = yield* Permission.Service
+    const autoBackground = yield* Flag.enabled("shell_timeout_background")
 
     // prepare：执行前检查（在 shell.create 的回调里跑）。
     const prepare = Effect.fn("ShellTool.prepare")(function* (invocation: ShellCreateBefore, context: Tool.Context) {
@@ -177,44 +318,36 @@ export const Plugin = {
       return timeout
     })
 
-    // notifyWhenDone：后台命令结束后的通知 fiber。
-    const notifyWhenDone = Effect.fn("ShellTool.notifyWhenDone")(
-      function* (
-        sessionID: SessionSchema.ID,
-        id: string,
-        shellID: string,
-        command: string,
-        settled: Deferred.Deferred<Output>,
-      ) {
-        // 等作业结束。
-        const info = (yield* jobs.wait({ id })).info
-        if (!info || info.status === "running") return
-        // 成功：取结果正文；失败/取消：给对应文案。
-        const output = info.status === "completed" ? yield* Deferred.await(settled) : undefined
-        const text = output
-          ? resultMessages(output).join("\n\n")
-          : info.status === "error"
-            ? (info.error ?? "Command failed")
-            : "Cancelled"
-        // 发合成消息（描述=命令，正文=输出），唤醒会话继续干活。
-        yield* sessions.synthetic({
-          ...(info.notificationID ? { id: info.notificationID } : {}),
-          sessionID,
-          description: command,
-          ...ShellResult.notification({
-            jobID: id,
-            shellID,
-            command,
-            state: info.status,
-            text,
-            output,
-          }),
-        })
-        if (info.notificationID) yield* jobs.completeBackground(info.notificationID)
-      },
-      // fork 进插件作用域，立即启动。
-      Effect.forkIn(scope, { startImmediately: true }),
-    )
+    // Not in this Location's scope: a daemon command outlives a Location that closes while the server runs, and
+    // its session must still hear how it ended.
+    const notifyWhenDone = (
+      sessionID: SessionSchema.ID,
+      id: string,
+      shellID: string,
+      command: string,
+      settled: Deferred.Deferred<Output>,
+    ) => shell.watch(notify(sessions, jobs, { sessionID, id, shellID, command, settled }))
+
+    // Stops the command of a call the user asked to stop, and fails the call with the output so far. The command
+    // stays observable, output file included.
+    const cancelled = Effect.fnUntraced(function* (info: ShellSchema.Info, jobID: string) {
+      yield* shell.stop(info.id, "killed").pipe(Effect.ignore)
+      // The stop escalates to SIGKILL on its own; the session does not wait for that to settle the call.
+      const result = yield* shell.result(info, { wait: INTERRUPT_WAIT })
+      // The stopped job settles from the same exit; this only releases it.
+      yield* jobs.cancel(jobID)
+      const stopped = ShellResult.interrupted(result)
+      return yield* new ToolFailure({
+        message: stopped.message,
+        // The notice ends the message; renderers show what precedes it as the output, like a finished call's.
+        metadata: {
+          interrupted: true,
+          truncated: result.capture?.truncated ?? false,
+          shellID: info.id,
+          notice: stopped.notice,
+        },
+      })
+    })
 
     // 注册工具本体。
     yield* ctx.tool
@@ -223,105 +356,135 @@ export const Plugin = {
           name,
           // codemode=false：不进 Code Mode 目录，始终作为直接工具暴露。
           options: { codemode: false },
-          description: description(),
+          description: description(undefined, autoBackground),
           input: Input,
           output: Output,
-          execute: (input, context) =>
-            Effect.gen(function* () {
-              // 超时：后台默认无超时（0），前台默认 2 分钟。
-              const timeout = input.background === true ? (input.timeout ?? 0) : (input.timeout ?? DEFAULT_TIMEOUT_MS)
-              let finalTimeout = timeout
-              // 创建 shell；回调里注入环境变量并做 prepare 检查。
-              const info = yield* shell.create(
-                {
-                  command: input.command,
-                  cwd: input.workdir,
-                  timeout,
-                  shell: yield* compatibleShell,
-                  metadata: { sessionID: context.sessionID },
-                },
-                (invocation) =>
-                  Effect.gen(function* () {
-                    // 给子进程打上“agent 在跑”的标记。
-                    invocation.env.AGENT = "1"
-                    invocation.env.OPENCODE = "1"
-                    invocation.env.AI_AGENT ||= "opencode"
-                    invocation.env.OPENCODE_SESSION_ID = context.sessionID
-                    finalTimeout = yield* prepare(invocation, context)
-                  }),
-              )
-              // 立刻上报 shell ID（UI 可显示/中断）。
-              yield* context.progress({ shellID: info.id })
+          execute: (input, context) => {
+            const timeout = input.background === true ? (input.timeout ?? 0) : (input.timeout ?? DEFAULT_TIMEOUT_MS)
+            let finalTimeout = timeout
+            // Uninterruptible from spawning to blocking, so an interrupt cannot orphan a started command.
+            return Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                // Listens for the user's stop for the whole call, starting before the command does, so a stop always
+                // reaches this tool through `cancel` instead of interrupting it, even while the command starts.
+                const stopped = yield* Deferred.make<void>()
+                const listener = context.cancel
+                  ? yield* context.cancel.pipe(
+                      Effect.andThen(Deferred.succeed(stopped, undefined)),
+                      Effect.interruptible,
+                      Effect.forkChild({ startImmediately: true }),
+                    )
+                  : undefined
+                return yield* Effect.gen(function* () {
+                  const info = yield* shell.create(
+                    {
+                      command: input.command,
+                      cwd: input.workdir,
+                      timeout,
+                      shell: yield* compatibleShell,
+                      metadata: { sessionID: context.sessionID },
+                      waited: input.background !== true,
+                      toolCall: {
+                        sessionID: context.sessionID,
+                        assistantMessageID: context.messageID,
+                        callID: context.id,
+                      },
+                    },
+                    (invocation) =>
+                      Effect.gen(function* () {
+                        invocation.env.AGENT = "1"
+                        invocation.env.OPENCODE = "1"
+                        invocation.env.AI_AGENT ||= "opencode"
+                        invocation.env.OPENCODE_SESSION_ID = context.sessionID
+                        // Asking for permission can take a while; a stop then ends the call before any command starts.
+                        finalTimeout = yield* restore(
+                          Effect.raceFirst(
+                            prepare(invocation, context),
+                            Deferred.await(stopped).pipe(
+                              Effect.andThen(
+                                Effect.fail(
+                                  new ToolFailure({ message: "Command interrupted by the user before it started." }),
+                                ),
+                              ),
+                            ),
+                          ),
+                        )
+                        if (autoBackground) invocation.timeout = 0
+                      }),
+                  )
+                  yield* context.progress({ shellID: info.id })
 
-              // settled：命令完整结果的一次性信箱。
-              const settled = yield* Deferred.make<Output>()
-              // run：作业的执行体——等 shell 结果 → 组装输出 → 成功时填充
-              // settled；被中断时清理 shell。
-              const run = Effect.gen(function* () {
-                const result = yield* shell.result(info)
-                if (!result.capture) return yield* new Shell.NotFoundError({ id: info.id })
-                const output = ShellResult.output(result)
-                return {
-                  ...output,
-                  // 超时的输出尾部追加提示。
-                  output: output.timeout
-                    ? `${output.output}\n\nCommand exceeded timeout of ${finalTimeout} ms. Retry with a larger timeout if the command is expected to take longer.`
-                    : output.output,
-                  status: "completed" as const,
-                }
-              }).pipe(
-                Effect.tap((output) => Deferred.succeed(settled, output)),
-                Effect.map((output) => resultMessages(output).join("\n\n")),
-                Effect.onInterrupt(() => shell.remove(info.id).pipe(Effect.ignore)),
-              )
-              // 以作业形式启动（可恢复：崩溃后按 recovery 信息找回 shell）。
-              const job = yield* jobs.start({
-                // CodeMode children share a tool-call ID, but each shell must own its job.
-                // CodeMode 子进程共享工具调用 ID，但每个 shell 要有独立的作业 ID。
-                id: info.id,
-                type: name,
-                title: info.command,
-                metadata: { sessionID: context.sessionID, shellID: info.id },
-                recovery: {
-                  kind: "shell",
-                  sessionID: context.sessionID,
-                  shellID: info.id,
-                  command: info.command,
-                },
-                run,
-              })
+                  const { job, settled } = yield* startJob(jobs, shell, {
+                    sessionID: context.sessionID,
+                    info,
+                    timeout: () => finalTimeout,
+                  })
+                  // Stopped while the command was starting: stop it now.
+                  if (yield* Deferred.isDone(stopped)) return yield* cancelled(info, job.id)
 
-              // 显式请求后台：转后台 + 注册通知 + 立即返回。
-              if (input.background === true) {
-                yield* jobs.background(job.id)
-                yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
-                return backgroundResult(info.id, info.file)
-              }
+                  if (input.background === true) {
+                    yield* jobs.background(job.id)
+                    yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
+                    return backgroundResult(info)
+                  }
 
-              // 前台：阻塞等待作业结果；等待被中断（用户取消）时取消作业。
-              const result = yield* jobs
-                .block({ id: job.id, sessionID: context.sessionID })
-                .pipe(Effect.onInterrupt(() => jobs.cancel(job.id).pipe(Effect.ignore)))
-              // 等待期间被“转后台”→ 去掉超时，注册通知，返回后台提示。
-              if (result?.type === "backgrounded") {
-                yield* shell.timeout(info.id, 0)
-                yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
-                return backgroundResult(info.id, info.file)
-              }
-              // 失败/取消 → 工具失败。
-              if (result?.info.status === "error")
-                return yield* Effect.fail(new Error(result.info.error ?? "Command failed"))
-              if (result?.info.status === "cancelled") return yield* Effect.fail(new Error("Command cancelled"))
+                  const waiting = jobs.block({ id: job.id, sessionID: context.sessionID })
+                  const blocked =
+                    autoBackground && finalTimeout > 0
+                      ? waiting.pipe(
+                          Effect.timeoutOption(finalTimeout),
+                          Effect.flatMap((result) =>
+                            Option.isSome(result)
+                              ? Effect.succeed(result.value)
+                              : jobs
+                                  .background(job.id)
+                                  .pipe(
+                                    Effect.map((info) =>
+                                      info ? { type: "backgrounded" as const, info, timedOut: true } : undefined,
+                                    ),
+                                  ),
+                          ),
+                        )
+                      : waiting
+                  // A user's stop arrives through `cancel`. Any interrupt stops the command too, unless the server is
+                  // handing its daemon over: then the command and its job keep running, and the next server takes the
+                  // call over and moves the command to the background.
+                  const outcome = yield* restore(
+                    Effect.raceFirst(
+                      blocked.pipe(Effect.map((result) => ({ type: "settled" as const, result }))),
+                      Deferred.await(stopped).pipe(Effect.as({ type: "cancelled" as const })),
+                    ),
+                  ).pipe(
+                    Effect.onInterrupt(() =>
+                      shell.handoffPrepared() ? Effect.void : jobs.cancel(job.id).pipe(Effect.ignore),
+                    ),
+                  )
+                  if (outcome.type === "cancelled") return yield* cancelled(info, job.id)
+                  const result = outcome.result
+                  if (result?.type === "backgrounded") {
+                    yield* shell.timeout(info.id, 0)
+                    const elapsed = "timedOut" in result ? finalTimeout : undefined
+                    finalTimeout = 0
+                    yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
+                    return backgroundResult(info, elapsed)
+                  }
+                  if (result?.info.status === "error")
+                    return yield* Effect.fail(new Error(result.info.error ?? "Command failed"))
+                  if (result?.info.status === "cancelled") return yield* Effect.fail(new Error("Command cancelled"))
 
-              // 正常完成：从信箱取结果。
-              return yield* Deferred.await(settled)
-            }).pipe(
-              // 统一包装结果/错误。
-              Effect.map(toolResult),
-              Effect.mapError(
-                (error) => new ToolFailure({ message: `Unable to execute command: ${input.command}`, error }),
-              ),
-            ),
+                  return yield* Deferred.await(settled)
+                }).pipe(Effect.ensuring(listener ? Fiber.interrupt(listener) : Effect.void))
+              }),
+            ).pipe(
+              // Shell spans, including the job that waits for a backgrounded command, name the call that started them.
+              Effect.annotateSpans({
+                "gen_ai.tool.call.id": context.id,
+                ...(input.background === true ? { "opencode.shell.background": true } : {}),
+              }),
+              Effect.map((output) => toolResult(output, finalTimeout)),
+              Effect.mapError(toolFailure(`Unable to execute command: ${input.command}`)),
+            )
+          },
         }),
       )
       .pipe(Effect.orDie)
@@ -331,7 +494,7 @@ export const Plugin = {
       Effect.gen(function* () {
         const tool = event.tools[name]
         if (!tool) return
-        tool.description = description(ShellSelect.name(yield* compatibleShell))
+        tool.description = description(ShellSelect.name(yield* compatibleShell), autoBackground)
       })
     // 在 context/compaction/generate 三类钩子上都挂上（描述在每种请求里都正确）。
     yield* ctx.session.hook("context", hook)

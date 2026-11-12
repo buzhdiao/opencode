@@ -6,7 +6,6 @@ import { PtyTicket } from "@opencode/core/pty/ticket"
 import {
   ForbiddenError,
   InvalidRequestError,
-  PtyFeatureUnsupportedError,
   PtyNotFoundError,
   ServiceUnavailableError,
 } from "@opencode/protocol/errors"
@@ -153,23 +152,7 @@ export const PersistentPtyHandler = HttpApiBuilder.group(Api, "server.experiment
               .pipe(mapTerminalError)
           // 负载未带 title（undefined 表示不改名）时，直接返回终端最新信息
           if (ctx.payload.title === undefined) return { data: yield* pty.get(ctx.params.ptyID).pipe(mapTerminalError) }
-          return {
-            // 执行重命名；各错误分别映射
-            data: yield* pty.rename(ctx.params.ptyID, ctx.payload.title).pipe(
-              Effect.catchTags({
-                // 终端不存在 -> PtyNotFoundError
-                "PersistentPty.NotFoundError": notFound,
-                // 重命名特性暂不支持（如旧版守护进程）-> PtyFeatureUnsupportedError
-                "PersistentPty.UnsupportedError": (error) =>
-                  new PtyFeatureUnsupportedError({
-                    feature: error.feature,
-                    message: "Terminal renaming will be available after OpenCode's terminal service restarts",
-                  }),
-                // 守护进程不可用 -> ServiceUnavailableError
-                "PersistentPty.UnavailableError": unavailable,
-              }),
-            ),
-          }
+          return { data: yield* pty.rename(ctx.params.ptyID, ctx.payload.title).pipe(mapTerminalError) }
         }),
       )
       .handle(

@@ -93,10 +93,8 @@ export const Plugin = {
       ctx.event,
       Effect.andThen(ctx.tool.reload(), ctx.command.reload()),
     )
-    // 获取功能开关解析器
-    const flags = yield* Flag.resolver
-    // 判断 schedules 功能是否启用
-    const enabled = () => flags(loaded.entries).schedules.enabled
+    const flags = yield* Flag.Service
+    const enabled = () => flags.resolve(loaded.entries).schedules.enabled
 
     // A request keeps the tools it started with after config reloads, so each call rechecks the flag.
     // 检查会话级开关：未启用则以 DisabledError 失败（配置重载不会换掉已注册工具，故每次调用再查）

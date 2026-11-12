@@ -108,6 +108,8 @@ export interface Snapshot {
     readonly messageID: SessionMessage.ID
     readonly call: ToolCall
     readonly progress?: (update: Tool.Metadata) => Effect.Effect<void>
+    /** Completes when the user asks the call to stop; see `Tool.Context.cancel`. */
+    readonly cancel?: Effect.Effect<void>
     /** Surviving request definitions, keyed by the names advertised after session context hooks. */
     // definitions：本次请求实际通告的工具名集合（钩子可能删改过）。
     readonly definitions?: ReadonlyMap<string, ToolDefinition>
@@ -189,6 +191,7 @@ const layer = Layer.effect(
         "gen_ai.tool.name": name,
         "gen_ai.tool.call.id": context.id,
         "session.id": context.sessionID,
+        "gen_ai.agent.name": context.agent,
       })
       // 执行工具体；Tool.Error 被捕获成 { failure } 以便走统一 after 钩子。
       const execution = yield* execute(tool, input, context).pipe(
@@ -379,6 +382,7 @@ const layer = Layer.effect(
                 messageID: input.messageID,
                 id: Tool.CallID.make(input.call.id),
                 progress: input.progress ?? (() => Effect.void),
+                cancel: input.cancel,
               }
               // 先走 before 钩子（可改写入参/改名）。
               const event = yield* beforeExecute(input.call.name, input.call.input, context)

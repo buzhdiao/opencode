@@ -11,9 +11,7 @@ import { ConfigCommand } from "@opencode/schema/config/command"
 import { AppProcess } from "@opencode/util/process"
 // 导入 Node 的 path 模块。
 import path from "path"
-// 导入 Effect、Option 与 Schema 工具。
-import { Effect, Option, Schema } from "effect"
-// 导入 Effect 的子进程工具。
+import { Effect, Result, SchemaIssue, SchemaParser } from "effect"
 import { ChildProcess } from "effect/process"
 // 导入代理服务。
 import { Agent } from "../../agent.js"
@@ -34,8 +32,8 @@ import { ConfigMarkdown } from "../markdown.js"
 // 导入配置条目观察器。
 import { ConfigEntryObserver } from "./entry-observer.js"
 
-// V2 命令模式的解码器。
-const decodeCommand = Schema.decodeUnknownOption(ConfigCommand.Info)
+const decodeCommand = SchemaParser.decodeUnknownResult(ConfigCommand.Info)
+const formatIssue = SchemaIssue.makeFormatterDefault()
 
 // 定义插件：加载命令定义并注册到命令注册表。
 export const Plugin = define({
@@ -144,9 +142,6 @@ export const Plugin = define({
                   }
                   // 启动任务跟踪。
                   yield* subagents.start(recovery)
-                  // 标记为后台任务。
-                  yield* subagents.background(recovery)
-                  // 子代理流程结束。
                   return
                 }
                 // 命令指定了代理时切换当前会话的代理。
@@ -186,9 +181,7 @@ function loadDirectory(fs: FSUtil.Interface, directory: string) {
     // 排序后逐个读取并解码，失败项忽略。
     return yield* Effect.forEach(files.toSorted(), (filepath) =>
       fs.readFileStringSafe(filepath).pipe(
-        // 读取成功才解码。
-        Effect.map((content) => (content === undefined ? undefined : decode(directory, filepath, content))),
-        // 错误吞掉并返回 undefined。
+        Effect.flatMap((content) => (content === undefined ? Effect.undefined : decode(directory, filepath, content))),
         Effect.orElseSucceed(() => undefined),
       ),
     ).pipe(
@@ -200,25 +193,30 @@ function loadDirectory(fs: FSUtil.Interface, directory: string) {
   })
 }
 
-// 解码单个命令 Markdown 文件。
-function decode(directory: string, filepath: string, content: string) {
-  // 解析 Markdown；失败忽略。
+const decode = Effect.fnUntraced(function* (directory: string, filepath: string, content: string) {
   const markdown = ConfigMarkdown.parseOption(content)
-  if (!markdown) return
-  // frontmatter 数据即命令字段，正文即模板。
-  const info = Option.getOrUndefined(decodeCommand({ ...markdown.data, template: markdown.content.trim() }))
-  // 解码失败忽略。
-  if (!info) return
-  // 返回命令名（相对路径去掉 command(s)/ 前缀与 .md 后缀）与命令信息。
+  if (!markdown) {
+    yield* Effect.logWarning("command file skipped", { filepath, reason: "markdown" })
+    return
+  }
+  const info = decodeCommand({ ...markdown.data, template: markdown.content.trim() })
+  if (Result.isFailure(info)) {
+    yield* Effect.logWarning("command file skipped", {
+      filepath,
+      reason: "frontmatter",
+      issue: formatIssue(info.failure),
+    })
+    return
+  }
   return {
     name: path
       .relative(directory, filepath)
       .replaceAll("\\", "/")
       .replace(/^(command|commands)\//, "")
       .replace(/\.md$/, ""),
-    info,
+    info: info.success,
   }
-}
+})
 
 // 渲染命令模板：替换 $ARGUMENTS/$N 参数占位符，并执行 !`命令` shell 插值。
 function evaluateTemplate(

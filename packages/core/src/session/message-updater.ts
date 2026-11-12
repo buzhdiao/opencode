@@ -289,6 +289,7 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
                 draft.rawFinish = undefined
                 draft.native = undefined
                 draft.time.created = DateTime.makeUnsafe(event.data.started)
+                draft.time.firstToken = undefined
                 draft.time.streamed = undefined
                 draft.time.completed = undefined
                 // 事件带快照时记录步骤起始快照
@@ -321,7 +322,11 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
             }),
           )
         }),
-      // 步骤开始流式输出：记录 streamed 时间
+      "session.step.first-token": (event) => {
+        return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
+          draft.time.firstToken = created
+        })
+      },
       "session.step.streamed": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           draft.time.streamed = created

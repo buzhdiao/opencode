@@ -6,9 +6,6 @@ import { Project } from "@opencode/core/project"
 import { Worktree } from "@opencode/core/worktree"
 // 引入总线（Bus）：发布领域事件
 import { Bus } from "@opencode/core/bus"
-// 引入插件服务：等待插件激活
-import { Plugin } from "@opencode/core/plugin"
-// 引入位置（Location）服务
 import { Location } from "@opencode/core/location"
 // 引入位置服务映射：初始化后失效缓存
 import { LocationServiceMap } from "@opencode/core/location-services"
@@ -44,9 +41,6 @@ export const VcsHandler = HttpApiBuilder.group(Api, "server.vcs", (handlers) =>
           const directory = location.project.directory
           // 提供商默认为 git（可由查询参数指定）
           const providerID = ctx.query.provider ?? "git"
-          // 等待插件激活完成（部分 VCS 提供商由插件提供）
-          yield* Plugin.awaitActivation
-          // 获取 VCS 服务
           const vcs = yield* Vcs.Service
           // 执行初始化；按错误类别分别映射为协议错误
           yield* vcs.initialize(providerID).pipe(

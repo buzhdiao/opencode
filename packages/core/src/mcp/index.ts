@@ -22,9 +22,11 @@ import {
   Effect,
   Exit,
   Fiber,
+  FiberMap,
   FiberSet,
   Latch,
   Layer,
+  Schedule,
   Schema,
   Scope,
   Semaphore,
@@ -43,7 +45,7 @@ import { Credential } from "../credential.js"
 import { Bus } from "../bus.js"
 // 引入环境（Environment）服务
 import { Environment } from "../environment/index.js"
-// 引入表单（Form）服务（交互表单）
+import { Flag } from "../flag.js"
 import { Form } from "../form.js"
 // 引入集成（Integration）服务
 import { Integration } from "../integration.js"
@@ -51,13 +53,14 @@ import { Integration } from "../integration.js"
 import { KeyedMutex } from "../effect/keyed-mutex.js"
 // 引入位置（Location）服务
 import { Location } from "../location.js"
-// 引入等待中止信号辅助
+import { Hash } from "@opencode/util/hash"
 import { waitForAbort } from "@opencode/util/process"
 // 引入状态（State）模块
 import { State } from "../state.js"
 // 仅引入类型：MCP 客户端
 import type { McpClient } from "./client.js"
-// 引入 MCP 连接模块
+import { EventStreamRejectedError, EventStreamTerminatedError } from "./event-errors.js"
+import { canonicalJson } from "../util/canonical-json.js"
 import { McpConnection } from "./connection.js"
 // 引入 MCP 连接池
 import { McpPool } from "./pool.js"
@@ -185,9 +188,7 @@ type AttachedEntry = {
   tools: ReadonlyArray<Tool>
 }
 
-// How long a model call may wait for a server that is still connecting and configures no `timeout.startup`,
-// counted from when it began. A server with a startup timeout gets that window instead.
-// 启动宽限：未配置 timeout.startup 的服务器，模型调用最多等它这么久（自尝试开始计）
+// How long a model call may wait for a server that is still connecting, counted from when it began.
 const STARTUP_GRACE_MS = 2_000
 
 // Bounds re-listing the tools of an attached connection that takes over the top of its stack.
@@ -204,7 +205,12 @@ const URL_ELICITATION_FIELD_KEY = "elicitation"
 // 目录变化对应的各类事件
 const changes = { tools: McpEvent.ToolsChanged, resources: McpEvent.ResourcesChanged, prompts: PromptsChanged }
 
-// 状态数据：配置覆盖的服务器与被移除的服务器名
+// A broken, silent or closed event stream reopens after a delay growing from a second to this cap.
+const EVENT_REOPEN = Schedule.min([Schedule.exponential("1 second"), Schedule.spaced("30 seconds")])
+
+const isEnded = (error: Error) =>
+  error instanceof EventStreamRejectedError || error instanceof EventStreamTerminatedError
+
 type Data = {
   // 当前配置中的服务器
   servers: Map<ServerName, Types.DeepMutable<Mcp.ServerConfig>>
@@ -252,8 +258,7 @@ export interface Interface extends State.Transformable<Editor> {
   readonly tools: () => Effect.Effect<Tool[]>
   /**
    * Waits for servers that are still connecting, each until it settles or until its startup grace
-   * window ends: `timeout.startup` when the server configures one, else `STARTUP_GRACE_MS`. Servers
-   * past their window never wait.
+   * window ends. Servers past their window never wait.
    */
   // awaitStartup：等待仍在连接中的服务器（各自的宽限窗口内）
   readonly awaitStartup: () => Effect.Effect<void>
@@ -292,12 +297,56 @@ export interface Interface extends State.Transformable<Editor> {
     // 资源 URI
     readonly uri: string
   }) => Effect.Effect<ResourceContent | undefined, Error>
+  /** Experimental: MCP Events of a connected server that offers them, while the `mcp_events` flag is on. */
+  readonly events: (server: ServerName | string) => Effect.Effect<McpClient.Events | undefined, NotFoundError>
+  /**
+   * Experimental: follows an event type of a server, publishing each event as `experimental.mcp.event` while the
+   * server is connected, and resuming from the last cursor after a reconnect or a broken stream. Its status changes
+   * publish `experimental.mcp.subscription.changed`. Subscribing again to the same server, name and arguments returns
+   * the existing subscription. Subscriptions last as long as this service, and an ended one stays until unsubscribed.
+   */
+  readonly subscribe: (
+    server: ServerName | string,
+    input: {
+      readonly name: string
+      readonly arguments?: Schema.JsonObject
+      /** Where to start; omitted or null starts from now. */
+      readonly cursor?: string | null
+    },
+  ) => Effect.Effect<Subscription, NotFoundError | EventsUnavailableError>
+  /** Experimental: stops following a subscription. */
+  readonly unsubscribe: (id: string) => Effect.Effect<void>
+  /** Experimental: every subscription, with its status. */
+  readonly subscriptions: () => Effect.Effect<ReadonlyArray<Subscription>>
 }
 
 // Effect 服务标识（Tag）
 export class Service extends Context.Service<Service, Interface>()("@opencode/MCP") {}
 
-// 层选项 schema：客户端标识
+/**
+ * Why `subscribe` cannot follow a server's events.
+ * Experimental: MCP Events is a draft extension; may change without compatibility guarantees.
+ */
+export class EventsUnavailableError extends Schema.TaggedError<EventsUnavailableError>()("MCP.EventsUnavailableError", {
+  server: ServerName,
+  message: Schema.String,
+}) {}
+
+/**
+ * An event type of a server, followed onto the bus as `experimental.mcp.event`.
+ * Experimental: MCP Events is a draft extension; may change without compatibility guarantees.
+ */
+export interface Subscription {
+  /** The same for every subscribe to this server, event name and arguments, within this Location. */
+  readonly id: string
+  readonly server: ServerName
+  readonly name: string
+  readonly arguments?: Schema.JsonObject
+  readonly status: Mcp.SubscriptionStatus
+  /** Where it resumes from: the last cursor the server sent. */
+  readonly cursor: string | null
+}
+
 export const Options = Schema.Struct({
   clientInfo: Schema.optional(
     Schema.Struct({
@@ -332,7 +381,7 @@ export const layer = (options?: Options) =>
       const fetch = yield* FetchHttpClient.Fetch
       // 取回连接池服务
       const pool = yield* McpPool.Service
-      // 取回根作用域
+      const mcpEvents = yield* Flag.enabled("mcp_events")
       const root = yield* Effect.scope
       // 运行时纤程集合
       const fork = yield* FiberSet.makeRuntime<never, void, never>()
@@ -368,6 +417,117 @@ export const layer = (options?: Options) =>
       // Legacy era only: pending URL-mode elicitation forms, settled by notifications/elicitation/complete.
       // 仅旧版协议：待完成的 URL 交互表单（键 -> 表单 ID）
       const urlElicitations = new Map<string, Form.ID>()
+
+      // Experimental MCP Events subscriptions, by server. Each streams while its server is connected; the streams
+      // run here, in this Location, not in a pooled connection's scope.
+      type Followed = { -readonly [K in keyof Subscription]: Subscription[K] } & { gap: boolean }
+      const followed = new Map<ServerName, Map<string, Followed>>()
+      const streams = yield* FiberMap.make<string>()
+      const runStream = yield* FiberMap.runtime(streams)<never>()
+      const view = (sub: Followed): Subscription => ({
+        id: sub.id,
+        server: sub.server,
+        name: sub.name,
+        arguments: sub.arguments,
+        status: sub.status,
+        cursor: sub.cursor,
+      })
+
+      const setStatus = (sub: Followed, status: Mcp.SubscriptionStatus) =>
+        Effect.suspend(() => {
+          if (sub.status.status === status.status) return Effect.void
+          sub.status = status
+          return bus.publish(McpEvent.ExperimentalSubscriptionChanged, { id: sub.id })
+        })
+
+      const receive = (sub: Followed, message: McpClient.EventMessage) => {
+        if (message.type === "error")
+          return Effect.logWarning("mcp event stream error", {
+            server: sub.server,
+            name: sub.name,
+            code: message.error.code,
+          })
+        if (message.type === "heartbeat")
+          return Effect.sync(() => {
+            sub.cursor = message.cursor
+          })
+        if (message.type === "active")
+          return Effect.sync(() => {
+            sub.cursor = message.cursor
+            sub.gap ||= message.cursor !== null && message.truncated
+          }).pipe(Effect.andThen(setStatus(sub, { status: "active" })))
+        // The cursor moves past the event only once it is published.
+        return bus
+          .publish(McpEvent.ExperimentalEvent, {
+            id: sub.id,
+            server: sub.server,
+            name: sub.name,
+            eventId: message.eventId,
+            timestamp: message.timestamp,
+            data: message.data,
+            cursor: message.cursor,
+            ...(sub.gap ? { truncated: true } : {}),
+          })
+          .pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                sub.cursor = message.cursor
+                sub.gap = false
+              }),
+            ),
+          )
+      }
+
+      // Streams until the server terminates or rejects the subscription. A clean close reopens like a broken stream.
+      const follow = (sub: Followed, events: McpClient.Events) =>
+        Stream.suspend(() => events.stream({ name: sub.name, arguments: sub.arguments, cursor: sub.cursor })).pipe(
+          Stream.tap((message) => receive(sub, message)),
+          // Stream.retry resets on output. Only a confirmed open resets the delay, not a failed attempt.
+          Stream.filter((message) => message.type === "active"),
+          Stream.concat(Stream.fail(new Error(`MCP server ${sub.server} closed the event stream`))),
+          Stream.tapError((error) => (isEnded(error) ? Effect.void : setStatus(sub, { status: "pending" }))),
+          Stream.retry(
+            EVENT_REOPEN.pipe(
+              Schedule.setInputType<Error>(),
+              Schedule.while(({ input }) => !isEnded(input)),
+            ),
+          ),
+          Stream.runDrain,
+          Effect.catch((error) =>
+            isEnded(error)
+              ? setStatus(sub, {
+                  status: "ended",
+                  reason: error instanceof EventStreamRejectedError ? "rejected" : "terminated",
+                  error: { code: error.code, message: error.message },
+                })
+              : Effect.void,
+          ),
+        )
+
+      // Starts or stops a server's subscriptions to match its status; runs on every status change.
+      const follows = Effect.fnUntraced(function* (server: ServerName) {
+        const entry = entries.get(server)
+        const client = entry?.status.status === "connected" ? entry.connection.client : undefined
+        for (const sub of followed.get(server)?.values() ?? []) {
+          if (sub.status.status === "ended") continue
+          if (client?.events) {
+            runStream(sub.id, follow(sub, client.events), { onlyIfMissing: true })
+            continue
+          }
+          yield* FiberMap.remove(streams, sub.id)
+          yield* setStatus(
+            sub,
+            !entry || entry.status.status === "disabled" || client
+              ? { status: "ended", reason: "unavailable" }
+              : { status: "pending" },
+          )
+        }
+      })
+      if (mcpEvents)
+        yield* bus.subscribe(McpEvent.StatusChanged).pipe(
+          Stream.runForEach((event) => follows(ServerName.make(event.data.server))),
+          Effect.forkScoped({ startImmediately: true }),
+        )
 
       // Register every remote server as an OAuth integration so credentials live in the global store
       // rather than in committed config. Servers that connect anonymously simply never use the method.
@@ -454,6 +614,7 @@ export const layer = (options?: Options) =>
 
       // connectProvider：为条目与凭证构建 OAuth 提供者
       const connectProvider = Effect.fnUntraced(function* (
+        name: ServerName,
         entry: ServerEntry,
         credential: Credential.Info | undefined,
       ) {
@@ -461,8 +622,7 @@ export const layer = (options?: Options) =>
         if (entry.config.type !== "remote" || !entry.integrationID) return undefined
         // 懒加载 OAuth 模块
         const { McpOAuth } = yield* Effect.promise(() => import("./oauth.js"))
-        // 构建提供者（注入凭证服务与 fetch）
-        return yield* McpOAuth.connectProvider({ config: entry.config, credential }).pipe(
+        return yield* McpOAuth.connectProvider({ server: name, config: entry.config, credential }).pipe(
           Effect.provideService(Credential.Service, credentials),
           Effect.provideService(FetchHttpClient.Fetch, fetch),
         )
@@ -603,8 +763,7 @@ export const layer = (options?: Options) =>
                 return {
                   // 键：把凭证 ID 纳入
                   key: McpPool.key({ ...input, credential: credential?.id }),
-                  // 提供者：按选定的凭证构建
-                  authProvider: connectProvider(entry, credential),
+                  authProvider: connectProvider(name, entry, credential),
                 }
               }
               // Resolved exactly as the spawn resolves it, `~` included, so the key matches where the server runs.
@@ -639,9 +798,9 @@ export const layer = (options?: Options) =>
             directory: location.directory,
             // 客户端标识
             clientInfo: options?.clientInfo,
-            // OAuth 提供者：每次尝试按当前凭证重建
+            mcpEvents,
             authProvider: Effect.suspend(() =>
-              selectCredential(entry).pipe(Effect.flatMap((credential) => connectProvider(entry, credential))),
+              selectCredential(entry).pipe(Effect.flatMap((credential) => connectProvider(name, entry, credential))),
             ),
             // 交互处理器
             elicitation,
@@ -803,13 +962,9 @@ export const layer = (options?: Options) =>
       const replaceServer = Effect.fnUntraced(function* (name: ServerName, serverConfig: Mcp.ServerConfig) {
         // 取旧条目
         const previous = entries.get(name)
-        // 创建新条目
-        const entry = makeEntry(name, serverConfig, yield* Clock.currentTimeMillis)
-        // Readers that arrive while the previous connection closes wait for this one instead of using that one.
-        // 先替换表内条目：关闭旧连接期间到来的读取者会等待新连接
-        entries.set(name, entry)
-        // 清理旧条目
         if (previous) yield* disposeServer(previous)
+        const entry = makeEntry(name, serverConfig, yield* Clock.currentTimeMillis)
+        entries.set(name, entry)
         yield* Effect.gen(function* () {
           // 注册集成
           yield* register(name, entry)
@@ -1205,13 +1360,7 @@ export const layer = (options?: Options) =>
             Array.from(entries.values()).flatMap((entry) => {
               // 非 pending 或无进行中尝试：不等
               if (entry.status.status !== "pending" || !entry.attempt) return []
-              // A configured startup timeout is the window the connection itself is allowed, so wait as long
-              // as the caller asked for rather than dropping a server that is still mid-handshake.
-              // 宽限：配置了启动超时用之，否则用默认 2 秒
-              const grace = entry.config.timeout?.startup ?? STARTUP_GRACE_MS
-              // 计算剩余毫秒
-              const remaining = entry.attempt.started + grace - now
-              // 仍有剩余：等待结算闭锁（限时）
+              const remaining = entry.attempt.started + STARTUP_GRACE_MS - now
               return remaining > 0 ? [entry.attempt.settled.await.pipe(Effect.raceFirst(Effect.sleep(remaining)))] : []
             }),
             { concurrency: "unbounded", discard: true },
@@ -1348,6 +1497,43 @@ export const layer = (options?: Options) =>
             ),
           })
         }),
+        events: Effect.fn("MCP.events")(function* (server) {
+          return (yield* connected(ServerName.make(server))).client?.events
+        }),
+        subscribe: Effect.fn("MCP.subscribe")(function* (server, input) {
+          const name = ServerName.make(server)
+          if (!mcpEvents)
+            return yield* new EventsUnavailableError({ server: name, message: "MCP events need the mcp_events flag." })
+          yield* requireServer(name)
+          const id = "mcpsub_" + Hash.sha256(canonicalJson([name, input.name, input.arguments ?? {}])).slice(0, 24)
+          const subs = followed.get(name) ?? new Map<string, Followed>()
+          followed.set(name, subs)
+          const existing = subs.get(id)
+          if (existing && existing.status.status !== "ended") return view(existing)
+          const sub: Followed = {
+            id,
+            server: name,
+            name: input.name,
+            arguments: input.arguments,
+            status: { status: "pending" },
+            cursor: input.cursor ?? existing?.cursor ?? null,
+            gap: false,
+          }
+          subs.set(id, sub)
+          yield* bus.publish(McpEvent.ExperimentalSubscriptionChanged, { id })
+          yield* follows(name)
+          return view(sub)
+        }),
+        unsubscribe: Effect.fn("MCP.unsubscribe")(function* (id) {
+          const subs = Array.from(followed.values()).find((subs) => subs.has(id))
+          if (!subs) return
+          subs.delete(id)
+          yield* FiberMap.remove(streams, id)
+          yield* bus.publish(McpEvent.ExperimentalSubscriptionChanged, { id })
+        }),
+        subscriptions: Effect.fn("MCP.subscriptions")(function* () {
+          return Array.from(followed.values()).flatMap((subs) => Array.from(subs.values(), view))
+        }),
       })
     }),
   )
@@ -1381,6 +1567,7 @@ export function configured(options?: Options) {
     deps: [
       Location.node,
       Environment.node,
+      Flag.node,
       Bus.node,
       Form.node,
       Integration.node,

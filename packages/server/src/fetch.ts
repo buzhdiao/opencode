@@ -11,7 +11,7 @@ import { SessionRestart } from "@opencode/core/session/execution/restart"
 import type { LayerNode } from "@opencode/util/effect/layer-node"
 // CORS 来源判断
 import { isAllowedCorsOrigin } from "./cors"
-// 去除父级 tracing span 的工具
+import { RequestSite } from "./request-site"
 import { withoutParentSpan } from "./request-tracing"
 // 路由构建
 import { createRoutes } from "./routes"
@@ -67,7 +67,7 @@ export const make = Effect.fn("ServerFetch.make")(function* (options: ServerOpti
     // 转为通用 HTTP effect
     .asHttpEffect()
     .pipe(
-      // CORS：按来源判断放行，预检缓存 24 小时
+      RequestSite.middleware(options),
       HttpMiddleware.cors({ allowedOrigins: (origin) => isAllowedCorsOrigin(origin, options), maxAge: 86_400 }),
       // 附带构建上下文转成标准 Web fetch 处理器
       HttpEffect.toWebHandlerWith(context),

@@ -1,9 +1,7 @@
 // 将本模块以命名空间 McpConnection 整体再导出（barrel 模式）
 export * as McpConnection from "./connection.js"
 
-// 仅引入类型：MCP SDK 的 OAuth 客户端提供者
-import type { OAuthClientProvider } from "@modelcontextprotocol/client"
-// 仅引入类型：MCP 服务器的配置 schema
+import type { AuthProvider } from "@modelcontextprotocol/client"
 import type { Mcp } from "@opencode/schema/mcp"
 // 引入 Effect：原因、Effect、Exit、作用域
 import { Cause, Effect, Exit, Scope } from "effect"
@@ -76,10 +74,10 @@ export interface Input {
   readonly shared?: boolean
   // 客户端标识（名称 + 版本），用于 initialize 握手
   readonly clientInfo?: { readonly name: string; readonly version: string }
+  /** Declares MCP Events; see `McpClient.ConnectOptions.events`. */
+  readonly mcpEvents?: boolean
   /** Read on every attempt, so a credential change applies to the next one. */
-  // OAuth 提供者：每次尝试都会读取，凭证变化会作用于下一次
-  readonly authProvider: Effect.Effect<OAuthClientProvider | undefined>
-  // 交互（elicitation）处理器
+  readonly authProvider: Effect.Effect<AuthProvider | undefined>
   readonly elicitation: McpClient.ElicitationHandler
   /** A stdio server is spawned on this execution plane. */
   // stdio 服务器在该执行平面上生成
@@ -174,9 +172,6 @@ export function make(input: Input): Connection {
   // 重新拉取提示词列表并写入状态（失败按空列表处理）
   const refreshPrompts = (client: McpClient.Connection) =>
     client.prompts().pipe(
-      // 拉取失败时按空列表处理
-      Effect.orElseSucceed(() => []),
-      // 更新状态中的提示词列表
       Effect.map((prompts) => {
         state.prompts = prompts
       }),
@@ -275,6 +270,7 @@ export function make(input: Input): Connection {
         clientInfo: input.clientInfo,
         // 仅非共享连接声明 roots
         roots: !input.shared,
+        events: input.mcpEvents,
       }).pipe(
         // 连接成功后继续列工具（共享且旧协议的除外）
         Effect.flatMap(

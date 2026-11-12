@@ -7,11 +7,16 @@ import {
   auth,
   LATEST_PROTOCOL_VERSION,
   checkResourceAllowed,
+  discoverAuthorizationServerMetadata,
   discoverOAuthServerInfo,
   extractWWWAuthenticateParams,
+  OAuthError,
+  OAuthErrorCode,
   parseErrorResponse,
+  refreshAuthorization,
   resourceUrlFromServerUrl,
   UnauthorizedError,
+  type AuthProvider,
   type FetchLike,
   type OAuthClientProvider,
   type OAuthDiscoveryState,
@@ -20,9 +25,7 @@ import {
 } from "@modelcontextprotocol/client"
 // 引入 OAuth 元数据 schema（授权服务器元数据与 OpenID 发现元数据）
 import { OAuthMetadataSchema, OpenIdProviderDiscoveryMetadataSchema } from "@modelcontextprotocol/core"
-// 引入 Effect：原因、Deferred（一次性结果）、Effect
-import { Cause, Deferred, Effect } from "effect"
-// 引入 Effect 的 fetch HTTP 客户端标记
+import { Cause, Clock, Data, Deferred, Duration, Effect, Option, Schema } from "effect"
 import { FetchHttpClient } from "effect/http"
 // 仅引入类型：node 的 ServerResponse（回调 HTTP 响应）
 import type { ServerResponse } from "node:http"
@@ -34,7 +37,7 @@ import { ConfigMCP } from "@opencode/schema/config/mcp"
 import { Credential } from "../credential.js"
 // 引入 OAuth 回调页面渲染
 import { OauthCallbackPage } from "../oauth/page.js"
-// 仅引入类型：集成（Integration）类型
+import { OauthRedirect } from "../oauth/redirect.js"
 import type { Integration } from "../integration.js"
 // 引入错误摘要辅助
 import { ErrorSummary } from "../util/error-summary.js"
@@ -43,61 +46,31 @@ import { ErrorSummary } from "../util/error-summary.js"
 // CIMD（Client ID Metadata Document）：支持该机制的服务器直接以这个 URL 作为 client_id，无需动态注册
 export const CLIENT_METADATA_URL = "https://opencode.ai/oauth/opencode/client.json"
 
-// Refresh tokens rotate, so concurrent refreshes of the same token share one request or the second gets invalid_grant.
-// 刷新令牌会轮换：同一令牌的并发刷新必须共享一次请求，否则第二次会得到 invalid_grant
-const refreshes = new Map<string, ReturnType<FetchLike>>()
+// The authorization server refused the refresh token or the client: only a new login helps.
+class RefreshRejected extends Data.TaggedError("McpOAuth.RefreshRejected")<{ readonly message: string }> {}
 
-// refreshKey：识别一次“刷新令牌”请求的键（URL + client_id + refresh_token）
-const refreshKey = (url: string | URL, init: RequestInit | undefined) => {
-  // 请求体不是 URLSearchParams 或 grant_type 不是 refresh_token 时返回 undefined
-  if (!(init?.body instanceof URLSearchParams) || init.body.get("grant_type") !== "refresh_token") return undefined
-  // 用 NUL 分隔拼出键
-  return [String(url), init.body.get("client_id") ?? "", init.body.get("refresh_token") ?? ""].join("\u0000")
-}
+// Discovery named another authorization server than the one that issued the credential. Its tokens are not sent
+// there; the credential stays for its own server, and a new login is needed meanwhile.
+class IssuerChanged extends Data.TaggedError("McpOAuth.IssuerChanged")<{ readonly message: string }> {}
 
-// Bun's and Node's fetch types both apply here and the SDK's FetchLike wants Bun's Response, so the
-// overload is picked by annotation and clone() is pinned to the type it was called on. A tool call
-// can stay silent for minutes, so Bun's idle deadline is off; the MCP execution timeout still applies.
-// share：把进行中的请求 Promise 克隆一份响应返回，让并发等待者各拿到独立响应体
-const share = (pending: ReturnType<FetchLike>) => pending.then((response) => response.clone() as typeof response)
+// Like other MCP clients: refreshing this close to expiry leaves short-lived tokens alone until they are due.
+const REFRESH_AHEAD = Duration.seconds(30)
 
-// Requests use `FetchHttpClient.Fetch`, which an embedder can replace, rather than the global fetch.
-// sender：构造 SDK 用的 fetch（走可替换的 FetchHttpClient，并合并并发刷新请求）
-const sender = Effect.gen(function* () {
-  // 取回注入的 fetch 实现
-  const fetch = yield* FetchHttpClient.Fetch
-  // 基础发送：禁用 Bun 的空闲超时（工具调用可能静默数分钟）
-  const base: FetchLike = (url, init) => fetch(url, { ...init, timeout: false } as BunFetchRequestInit)
-  // 实际发送：刷新令牌请求按键去重共享
-  const send: FetchLike = (url, init) => {
-    // 计算刷新键（非刷新请求为 undefined）
-    const key = refreshKey(url, init)
-    // 非刷新请求直接发送
-    if (key === undefined) return base(url, init)
-    // 已有进行中的同键请求则共享其结果
-    const current = refreshes.get(key)
-    if (current) return share(current)
-    // 否则发起请求；完成后清理登记
-    const pending = base(url, init).finally(() => {
-      if (refreshes.get(key) === pending) refreshes.delete(key)
-    })
-    // 登记进行中的请求
-    refreshes.set(key, pending)
-    // 返回共享副本
-    return share(pending)
-  }
-  // 返回构造好的发送函数
-  return send
-})
+const rejections = new Set<string>([
+  OAuthErrorCode.InvalidGrant,
+  OAuthErrorCode.InvalidClient,
+  OAuthErrorCode.UnauthorizedClient,
+])
 
 // loggedFetch：为某台服务器构造带日志的 fetch（请求开始/成功/失败均记录）
 export const loggedFetch = (fields: { readonly server: string; readonly directory?: string }) =>
   Effect.gen(function* () {
     // 捕获上下文并把 Effect 转成 Promise 运行器
     const run = Effect.runPromiseWith(yield* Effect.context())
-    // 取回共享去重的发送函数
-    const send = yield* sender
-    // 构造带日志的请求函数
+    const fetch = yield* FetchHttpClient.Fetch
+    // Bun's idle deadline is off because a tool call can stay silent for minutes; the MCP execution timeout still
+    // applies. Requests use `FetchHttpClient.Fetch`, which an embedder can replace, rather than the global fetch.
+    const send: FetchLike = (url, init) => fetch(url, { ...init, timeout: false } as BunFetchRequestInit)
     const request: FetchLike = (url, init) => {
       // 识别 grant 类型（刷新 / 授权码交换）
       const grant = init?.body instanceof URLSearchParams ? init.body.get("grant_type") : undefined
@@ -211,24 +184,16 @@ interface Options {
   readonly config: typeof ConfigMCP.Remote.Type
   // 凭证存取实现
   readonly store: Store
-  // 发送函数
-  readonly fetch: FetchLike
-  /** Absent on connect: the provider then refuses to register a client or redirect, ending in needs_auth. */
-  // redirect：连接时缺省——此时拒绝注册客户端或跳转，最终以 needs_auth 结束
-  readonly redirect?: {
-    // 回调地址
-    readonly url: string
-    // 防 CSRF 的 state 值
+  readonly redirect: {
+    readonly url: () => string
+    readonly registered: string[]
     readonly state: string
     // 打开授权 URL 的动作
     readonly open: (url: URL) => void | Promise<void>
   }
   // 可选的 CIMD 客户端元数据 URL
   readonly clientMetadataUrl?: string
-  // 可选的预置发现状态
-  readonly discovery?: OAuthDiscoveryState
-  // 可选的凭证失效回调
-  readonly invalidate?: OAuthClientProvider["invalidateCredentials"]
+  readonly discovery: OAuthDiscoveryState
 }
 
 // provider：把选项组装成 SDK 的 OAuthClientProvider
@@ -239,56 +204,20 @@ const provider = (options: Options): OAuthClientProvider => {
   const client = oauth?.client_id ? { client_id: oauth.client_id, client_secret: oauth.client_secret } : undefined
   // 取 redirect 选项
   const redirect = options.redirect
-  // A missing redirectUrl selects the client-credentials grant in the SDK, so connect still names one.
-  // 回调地址：优先 redirect 选项，其次配置，最后给占位（避免 SDK 误选客户端凭证模式）
-  const redirectUrl = redirect?.url ?? oauth?.redirect_uri ?? "http://127.0.0.1/callback"
-  // refuse：构造“需要某物”的未授权错误
-  const refuse = (what: string) => new UnauthorizedError(`MCP server "${options.config.url}" requires ${what}`)
-  // 服务器身份 URL（去掉 hash）
-  const identity = new URL(options.config.url)
-  identity.hash = ""
-  // 缓存的发现状态
-  let discovery: OAuthDiscoveryState | undefined = options.discovery
+  let discovery = options.discovery
   return {
-    // 回调地址
-    redirectUrl,
-    // discoveryState：首次调用时按配置文档构建发现状态
-    discoveryState: async () => {
-      discovery ??= await configuredDiscovery({ config: options.config, fetchFn: options.fetch })
-      return discovery
+    get redirectUrl() {
+      return redirect.url()
     },
-    // 保存发现状态（仅内存）
+    discoveryState: async () => discovery,
     saveDiscoveryState: (state) => {
       discovery = state
     },
-    // The SDK sends no RFC 8707 resource when the server publishes no resource metadata; some
-    // authorization servers require one, so fall back to the configured URL.
-    // validateResourceURL：校验/选择 RFC 8707 资源标识
-    validateResourceURL: async (_serverUrl, resource) => {
-      // 服务器未给出资源时回退到配置的 URL
-      if (!resource) return identity
-      // 配置的资源不覆盖服务器宣告的资源时报错
-      if (!checkResourceAllowed({ requestedResource: identity, configuredResource: resource }))
-        throw new Error(`Protected resource ${resource} does not cover ${identity}`)
-      // 解析服务器宣告的资源
-      const canonical = new URL(resource)
-      // The transport dials the configured URL with extra query parameters and some servers echo
-      // that back as the resource. Query is transport detail, not identity: the token stays bound
-      // to the configured URL so a later refresh names the same resource the login did.
-      // 同源同路径（仅查询参数差异）时视为同一身份，保持绑定到配置 URL
-      if (canonical.origin === identity.origin && canonical.pathname === identity.pathname) return identity
-      // 否则采用服务器宣告的资源
-      return canonical
-    },
-    // CIMD 客户端元数据 URL（可选）
+    validateResourceURL: async (_serverUrl, resource) => selectResource(options.config, resource),
     ...(options.clientMetadataUrl ? { clientMetadataUrl: options.clientMetadataUrl } : {}),
-    // state 读取器（有 redirect 时）
-    ...(redirect ? { state: () => redirect.state } : {}),
-    // RFC 7591 客户端元数据
+    state: () => redirect.state,
     clientMetadata: {
-      // 回调地址列表
-      redirect_uris: [redirectUrl],
-      // 客户端名
+      redirect_uris: redirect.registered,
       client_name: "opencode",
       // 客户端主页
       client_uri: "https://opencode.ai",
@@ -303,14 +232,7 @@ const provider = (options: Options): OAuthClientProvider => {
       // 配置了 scope 时附加
       ...(oauth?.scope ? { scope: oauth.scope } : {}),
     },
-    // clientInformation：静态客户端优先，其次读存储；连接场景（无 redirect）缺失即拒绝
-    clientInformation: async () => {
-      if (client) return client
-      const stored = await options.store.clientInformation()
-      if (!stored && !redirect) throw refuse("a login before it can register a client")
-      return stored
-    },
-    // 保存客户端信息（透传存储）
+    clientInformation: async () => client ?? (await options.store.clientInformation()),
     saveClientInformation: (info) => options.store.saveClientInformation(info),
     // 读取令牌（透传存储）
     tokens: () => options.store.tokens(),
@@ -318,9 +240,6 @@ const provider = (options: Options): OAuthClientProvider => {
     saveTokens: (tokens) => options.store.saveTokens(tokens),
     // redirectToAuthorization：跳转浏览器授权；无 redirect 或协议不合法时拒绝
     redirectToAuthorization: (url) => {
-      // 连接场景没有 redirect：直接拒绝（最终 needs_auth）
-      if (!redirect) throw refuse("user authorization")
-      // 仅支持 http/https 的授权地址
       if (url.protocol !== "http:" && url.protocol !== "https:")
         throw new Error(
           `MCP server "${options.config.url}" returned a ${url.protocol} authorization URL; only http and https are supported`,
@@ -328,9 +247,6 @@ const provider = (options: Options): OAuthClientProvider => {
       // 执行打开动作
       return redirect.open(url)
     },
-    // 凭证失效回调（可选）
-    ...(options.invalidate ? { invalidateCredentials: options.invalidate } : {}),
-    // 保存 PKCE 校验器（透传存储）
     saveCodeVerifier: (verifier) => options.store.saveCodeVerifier(verifier),
     // 读取 PKCE 校验器：缺失时报错（令牌交换需要）
     codeVerifier: async () => {
@@ -341,7 +257,22 @@ const provider = (options: Options): OAuthClientProvider => {
   }
 }
 
-// memoryStore：纯内存的凭证存取（用于匿名连接或登录流程的临时状态）
+// The SDK sends no RFC 8707 resource when the server publishes no resource metadata; some
+// authorization servers require one, so fall back to the configured URL.
+const selectResource = (config: typeof ConfigMCP.Remote.Type, resource: string | undefined) => {
+  const identity = new URL(config.url)
+  identity.hash = ""
+  if (!resource) return identity
+  if (!checkResourceAllowed({ requestedResource: identity, configuredResource: resource }))
+    throw new Error(`Protected resource ${resource} does not cover ${identity}`)
+  const canonical = new URL(resource)
+  // The transport dials the configured URL with extra query parameters and some servers echo
+  // that back as the resource. Query is transport detail, not identity: the token stays bound
+  // to the configured URL so a later refresh names the same resource the login did.
+  if (canonical.origin === identity.origin && canonical.pathname === identity.pathname) return identity
+  return canonical
+}
+
 const memoryStore = (): Store => {
   // 令牌
   let tokens: StoredOAuthTokens | undefined
@@ -375,7 +306,12 @@ const memoryStore = (): Store => {
 export const clientFromCredential = (credential: Credential.OAuth) =>
   credential.metadata?.client as StoredOAuthClientInformation | undefined
 
-// toCredential：把 SDK 令牌结构转换成内部 OAuth 凭证
+// Where the login found its authorization server and which resource it named, so a refresh need not discover them.
+const Discovery = Schema.Struct({ authorizationServer: Schema.String, resource: Schema.String })
+const decodeDiscovery = Schema.decodeUnknownOption(Discovery)
+const discoveryFromCredential = (credential: Credential.OAuth) =>
+  Option.getOrUndefined(decodeDiscovery(credential.metadata?.discovery))
+
 const toCredential = (input: {
   // 认证方式 ID
   readonly methodID: Integration.MethodID
@@ -385,6 +321,7 @@ const toCredential = (input: {
   readonly tokens: StoredOAuthTokens
   // 已注册客户端信息（可选）
   readonly client: StoredOAuthClientInformation | undefined
+  readonly discovery: typeof Discovery.Type | undefined
 }) =>
   Credential.OAuth.make({
     // 凭证类型
@@ -395,8 +332,7 @@ const toCredential = (input: {
     access: input.tokens.access_token,
     // 刷新令牌（缺失记空串）
     refresh: input.tokens.refresh_token ?? "",
-    // 0 is non-expiring; toTokens then omits expires_in so the SDK does not force a refresh.
-    // 过期时间：0 表示永不过期；有 expires_in 时换算成绝对时间戳
+    // 0 means the server gave no lifetime, so the token is only refreshed after a 401.
     expires: input.tokens.expires_in ? Date.now() + input.tokens.expires_in * 1000 : 0,
     // 元数据：服务器 URL、令牌类型、可选的 scope/issuer/客户端信息
     metadata: {
@@ -404,126 +340,168 @@ const toCredential = (input: {
       tokenType: input.tokens.token_type,
       ...(input.tokens.scope ? { scope: input.tokens.scope } : {}),
       ...(input.tokens.issuer ? { issuer: input.tokens.issuer } : {}),
+      ...(input.discovery ? { discovery: input.discovery } : {}),
       ...(input.client ? { client: input.client } : {}),
     },
   })
 
-// toTokens：把内部 OAuth 凭证还原成 SDK 令牌结构
-const toTokens = (credential: Credential.OAuth): StoredOAuthTokens => {
-  // 取元数据（可能为空对象）
-  const metadata = credential.metadata ?? {}
-  return {
-    // 访问令牌
-    access_token: credential.access,
-    // 令牌类型（缺省 Bearer）
-    token_type: typeof metadata.tokenType === "string" ? metadata.tokenType : "Bearer",
-    // 有刷新令牌才带
-    ...(credential.refresh ? { refresh_token: credential.refresh } : {}),
-    // 有过期时间才带（换算回剩余秒数，不为负）
-    ...(credential.expires ? { expires_in: Math.max(0, Math.floor((credential.expires - Date.now()) / 1000)) } : {}),
-    // scope 仅在为字符串时带
-    ...(typeof metadata.scope === "string" ? { scope: metadata.scope } : {}),
-    // issuer 仅在为字符串时带
-    ...(typeof metadata.issuer === "string" ? { issuer: metadata.issuer } : {}),
-  }
-}
-
 /**
- * A provider for one credential the caller already selected, or none. It never looks up the active credential
- * itself: it reads and refreshes only the selected row, and a provider made without one stays anonymous.
+ * Bearer tokens for one credential the caller already selected, or none. It never looks up the active credential
+ * itself: it reads and refreshes only the selected row, and one made without a credential stays anonymous. A
+ * connection never starts a login, so a token the server refuses and cannot be refreshed ends in needs_auth.
  */
 // connectProvider：为调用方已选定的（或没有的）一条凭证构造提供者；只读写该行，不自行查找活跃凭证
 export const connectProvider = Effect.fnUntraced(function* (input: {
-  // 远程服务器配置
+  readonly server: string
   readonly config: typeof ConfigMCP.Remote.Type
   // 选定的凭证（可能为 undefined）
   readonly credential: Credential.Info | undefined
-}) {
-  // 取回凭证服务
-  const credentials = yield* Credential.Service
-  // 捕获上下文并构造 Promise 运行器
-  const run = Effect.runPromiseWith(yield* Effect.context())
-  // 取回共享去重的发送函数
-  const fetch = yield* sender
-  // 选定的凭证
+}): Effect.fn.Return<AuthProvider, never, Credential.Service> {
   const found = input.credential
-  // 无凭证或类型不是 oauth：使用内存存储的匿名提供者
-  if (!found || found.value.type !== "oauth") return provider({ config: input.config, store: memoryStore(), fetch })
-  // 凭证行 ID
+  // Without onUnauthorized the transport answers a 401 with UnauthorizedError.
+  if (found?.value.type !== "oauth") return { token: async () => undefined }
   const id = found.id
-  // 认证方式 ID
-  const methodID = found.value.methodID
-  // read：读取当前凭证行（仍是 oauth 类型时返回）
-  const read = async () => {
-    const stored = await run(credentials.get(id))
-    return stored?.value.type === "oauth" ? stored.value : undefined
+  const credentials = yield* Credential.Service
+  const fetchFn = yield* loggedFetch({ server: input.server })
+  const run = Effect.runPromiseWith(yield* Effect.context())
+  const read = credentials.get(id).pipe(Effect.map((row) => (row?.value.type === "oauth" ? row.value : undefined)))
+  const refresh = (stale: (current: Credential.OAuth, now: number) => boolean, resourceMetadataUrl?: URL) =>
+    credentials.refresh(id, {
+      stale,
+      refresh: (current) =>
+        exchange({ config: input.config, fetchFn, current, resourceMetadataUrl }).pipe(
+          Effect.tapError((error) =>
+            error instanceof RefreshRejected
+              ? Effect.logWarning("mcp oauth credential invalidated", { credentialID: id, reason: error.message }).pipe(
+                  Effect.andThen(credentials.remove(id)),
+                )
+              : Effect.void,
+          ),
+        ),
+    })
+  const due = (current: Credential.OAuth, now: number) => Credential.expiring(current, now, REFRESH_AHEAD)
+  const refused = () => new UnauthorizedError(`MCP server "${input.config.url}" requires user authorization`)
+  // The token last sent. A 401 refreshes only while the row still holds it: another connection or process may
+  // have refreshed it already.
+  let presented: string | undefined
+  return {
+    token: () =>
+      run(
+        Effect.gen(function* () {
+          const current = yield* read
+          // Refreshing ahead needs the discovery the login saved. If it fails, the current token goes out and a
+          // 401 decides.
+          const ahead =
+            current?.refresh && discoveryFromCredential(current) && due(current, yield* Clock.currentTimeMillis)
+          const value = ahead ? yield* refresh(due).pipe(Effect.orElseSucceed(() => current)) : current
+          presented = value?.access
+          return presented
+        }),
+      ),
+    onUnauthorized: (context) =>
+      run(
+        Effect.gen(function* () {
+          const rejected = presented
+          if (!(yield* read)?.refresh) return yield* Effect.fail(refused())
+          const value = yield* refresh(
+            (current) => current.access === rejected,
+            extractWWWAuthenticateParams(context.response).resourceMetadataUrl,
+          ).pipe(
+            Effect.catch((error) =>
+              error instanceof RefreshRejected || error instanceof IssuerChanged
+                ? Effect.fail(refused())
+                : // Not a lost login: keep the credential and fail this attempt so the next one tries again. An OAuth
+                  // error names only its code: its description can quote the server's whole response.
+                  Effect.fail(
+                    new OAuthError(
+                      OAuthErrorCode.TemporarilyUnavailable,
+                      `Could not refresh the OAuth token: ${
+                        error instanceof OAuthError
+                          ? error.code
+                          : error instanceof Error
+                            ? error.message
+                            : String(error)
+                      }`,
+                    ),
+                  ),
+            ),
+          )
+          if (!value) return yield* Effect.fail(refused())
+        }),
+      ),
   }
-  // Refresh tokens rotate and the row is shared across connections: only drop it while it still holds ours.
-  // 记住当前持有的刷新令牌：多连接共享该行，只有仍持有 ours 时才能删
-  let presented = found.value.refresh
-  return provider({
-    // 配置
-    config: input.config,
-    // 发送函数
-    fetch,
-    // invalidate：凭证被服务器判定失效时的回调
-    invalidate: async (scope) => {
-      // 校验器/发现状态的失效无需动凭证行
-      if (scope === "verifier" || scope === "discovery") return
-      // 读取当前行
-      const oauth = await read()
-      // 行已不持有我们呈现的刷新令牌（已被别的连接替换）时不动
-      if (!oauth || oauth.refresh !== presented) return
-      // 记警告日志
-      await run(Effect.logWarning("mcp oauth credential invalidated", { credentialID: id, scope }))
-      // 删除该凭证行
-      await run(credentials.remove(id))
-    },
-    // store：把凭证行映射成 SDK 的存取接口
-    store: {
-      // tokens：读当前行并更新“已呈现”的刷新令牌
-      tokens: async () => {
-        const oauth = await read()
-        if (!oauth) return undefined
-        presented = oauth.refresh
-        return toTokens(oauth)
-      },
-      // saveTokens：把新令牌写回该行（保留已有客户端信息）
-      saveTokens: async (tokens) => {
-        // 读取旧行（用于保留客户端信息）
-        const previous = await read()
-        // 组装新凭证
-        const value = toCredential({
-          methodID,
-          serverUrl: input.config.url,
-          tokens,
-          client: previous ? clientFromCredential(previous) : undefined,
-        })
-        // 更新“已呈现”的刷新令牌
-        presented = value.refresh
-        // 写回该行
-        await run(credentials.update(id, { value }))
-      },
-      // clientInformation：读当前行的客户端信息
-      clientInformation: async () => {
-        const oauth = await read()
-        return oauth ? clientFromCredential(oauth) : undefined
-      },
-      // saveClientInformation：把客户端信息写回该行（无行则忽略）
-      saveClientInformation: async (client) => {
-        const oauth = await read()
-        if (!oauth) return
-        await run(credentials.update(id, { value: { ...oauth, metadata: { ...oauth.metadata, client } } }))
-      },
-      // 校验器：跨连接不共享，恒为空
-      codeVerifier: async () => undefined,
-      // 校验器写入：空实现
-      saveCodeVerifier: async () => {},
-    },
-  })
 })
 
-// authorize：发起一次 MCP OAuth 登录（启动本地回调服务器并返回授权 URL）
+// Refreshes with the discovery the login saved, or discovers as the login did and saves the result.
+const exchange = (input: {
+  readonly config: typeof ConfigMCP.Remote.Type
+  readonly fetchFn: FetchLike
+  readonly current: Credential.OAuth
+  readonly resourceMetadataUrl: URL | undefined
+}) =>
+  Effect.tryPromise({
+    try: async (signal) => {
+      const fetchFn: FetchLike = async (url, init) => {
+        const response = await input.fetchFn(url, { ...init, signal })
+        // A failing token endpoint says nothing about the login; report its status, not its body.
+        if (init?.method === "POST" && (response.status === 429 || response.status >= 500))
+          throw new Error(`HTTP ${response.status}`)
+        return response
+      }
+      const oauth = input.config.oauth || undefined
+      const client = oauth?.client_id
+        ? { client_id: oauth.client_id, client_secret: oauth.client_secret }
+        : clientFromCredential(input.current)
+      if (!client) throw new RefreshRejected({ message: "no OAuth client information" })
+      const saved = discoveryFromCredential(input.current)
+      const configured = await configuredDiscovery({ config: input.config, fetchFn })
+      const server =
+        configured ??
+        (saved
+          ? {
+              authorizationServerUrl: saved.authorizationServer,
+              authorizationServerMetadata: await discoverAuthorizationServerMetadata(saved.authorizationServer, {
+                fetchFn,
+              }),
+              resourceMetadata: undefined,
+            }
+          : await discoverOAuthServerInfo(input.config.url, {
+              resourceMetadataUrl: input.resourceMetadataUrl,
+              fetchFn,
+            }))
+      const found = server.authorizationServerMetadata?.issuer ?? server.authorizationServerUrl
+      const issuer = input.current.metadata?.issuer
+      if (typeof issuer === "string" && found.replace(/\/$/, "") !== issuer.replace(/\/$/, ""))
+        throw new IssuerChanged({ message: `issued by ${issuer}, but discovery names ${found}` })
+      const resource = saved?.resource ?? selectResource(input.config, server.resourceMetadata?.resource).toString()
+      const tokens = await refreshAuthorization(server.authorizationServerUrl, {
+        metadata: server.authorizationServerMetadata,
+        clientInformation: client,
+        refreshToken: input.current.refresh,
+        resource,
+        fetchFn,
+      })
+      return toCredential({
+        methodID: input.current.methodID,
+        serverUrl: input.config.url,
+        tokens: {
+          refresh_token: input.current.refresh,
+          ...tokens,
+          issuer: found,
+        },
+        client: clientFromCredential(input.current),
+        // A configured metadata URL is read on every refresh, so changing it applies at once.
+        discovery: configured ? undefined : { authorizationServer: server.authorizationServerUrl, resource },
+      })
+    },
+    catch: (error) =>
+      error instanceof RefreshRejected || error instanceof IssuerChanged
+        ? error
+        : error instanceof OAuthError && rejections.has(error.code)
+          ? new RefreshRejected({ message: error.message })
+          : error,
+  })
+
 export const authorize = (input: {
   // 服务器名
   readonly name: string
@@ -560,9 +538,10 @@ export const authorize = (input: {
       const client = clientFromCredential(previous)
       if (client) yield* Effect.promise(() => store.saveClientInformation(client))
     }
-    // Deferred：等待回调结果（授权码、iss、HTTP 响应）或失败
-    const code = yield* Deferred.make<{ code: string; iss: string | undefined; response?: ServerResponse }, Error>()
-    // 解析配置的回调地址
+    const code = yield* Deferred.make<
+      { code: string; iss: string | undefined; host?: string; response?: ServerResponse },
+      Error
+    >()
     const redirect = oauth?.redirect_uri ? new URL(oauth.redirect_uri) : undefined
     // 回调路径（缺省 /callback）
     const redirectPath = redirect?.pathname ?? "/callback"
@@ -613,7 +592,12 @@ export const authorize = (input: {
       // 交付回调结果；若已被占用（第二次回调）回 409
       if (
         !Effect.runSync(
-          Deferred.succeed(code, { code: value, iss: url.searchParams.get("iss") ?? undefined, response }),
+          Deferred.succeed(code, {
+            code: value,
+            iss: url.searchParams.get("iss") ?? undefined,
+            host: request.headers.host,
+            response,
+          }),
         )
       )
         response.writeHead(409).end("OAuth callback already received")
@@ -682,7 +666,10 @@ export const authorize = (input: {
       registration: oauth?.client_id ? "static" : cimd ? "cimd" : "dcr",
     })
 
-    // 授权 URL（open 回调时赋值）
+    // Some authorization servers (Clerk) rewrite a 127.0.0.1 redirect to localhost before sending the browser back,
+    // and issue the code for the rewritten URI. Both are registered, and the token exchange repeats the one used.
+    const loopback = (host: string) => `http://${host}:${port}${redirectPath}`
+    let reached = "127.0.0.1"
     let authorizationUrl: URL | undefined
     // 组装登录用的 OAuth 提供者
     const oauthProvider = provider({
@@ -690,15 +677,13 @@ export const authorize = (input: {
       config: input.config,
       // 内存存储
       store,
-      // 带日志的发送
-      fetch: fetchFn,
-      // 走 CIMD 时给客户端元数据 URL
       clientMetadataUrl: cimd ? CLIENT_METADATA_URL : undefined,
       // 预置发现状态（含资源元数据地址）
       discovery: { ...discovery, resourceMetadataUrl: resourceMetadataUrl?.toString() },
       // redirect：本地回调地址、state 与打开动作
       redirect: {
-        url: oauth?.redirect_uri ?? `http://127.0.0.1:${port}${redirectPath}`,
+        url: () => oauth?.redirect_uri ?? loopback(reached),
+        registered: oauth?.redirect_uri ? [oauth.redirect_uri] : [loopback("127.0.0.1"), loopback("localhost")],
         state,
         open: (url) => {
           // 记下授权 URL
@@ -723,8 +708,18 @@ export const authorize = (input: {
         hasRefreshToken: Boolean(tokens.refresh_token),
         expiresIn: tokens.expires_in,
       })
-      // 转换为内部凭证
-      return toCredential({ methodID: input.methodID, serverUrl: input.config.url, tokens, client })
+      return toCredential({
+        methodID: input.methodID,
+        serverUrl: input.config.url,
+        tokens,
+        client,
+        discovery: oauth?.auth_server_metadata_url
+          ? undefined
+          : {
+              authorizationServer: discovery.authorizationServerUrl,
+              resource: selectResource(input.config, discovery.resourceMetadata?.resource).toString(),
+            },
+      })
     })
 
     // 第一步 auth：触发授权 URL 生成（内部会调用 redirect.open）
@@ -742,7 +737,7 @@ export const authorize = (input: {
     // 后台纤程：等回调结果并完成令牌交换
     yield* Deferred.await(code).pipe(
       Effect.flatMap((value) => {
-        // respond：向浏览器回调连接回 200/400 页面
+        if (value.host === `localhost:${port}`) reached = "localhost"
         const respond = (error?: string) =>
           Effect.sync(() =>
             value.response
@@ -803,31 +798,11 @@ export const authorize = (input: {
       // A pasted URL is held to the same checks as the browser's redirect, but a wrong paste keeps the login waiting.
       // submit：手动粘贴回调 URL（与浏览器回调同样的校验；粘错则登录继续等待）
       submit: (pasted: string) =>
-        Effect.gen(function* () {
-          // 去空白
-          const text = pasted.trim()
-          // 必须是可解析的 URL
-          if (!URL.canParse(text)) return yield* Effect.fail(new Error("Paste the full URL from the browser's address bar"))
-          // 解析 URL
-          const url = new URL(text)
-          // state 必须匹配本次登录
-          if (url.searchParams.get("state") !== state)
-            return yield* Effect.fail(new Error("This URL belongs to a different sign-in"))
-          // 授权服务器回传的错误
-          const error = url.searchParams.get("error_description") ?? url.searchParams.get("error")
-          if (error) {
-            yield* Deferred.fail(code, new Error(error))
-            return
-          }
-          // 取授权码
-          const value = url.searchParams.get("code")
-          // 缺授权码即失败
-          if (!value) return yield* Effect.fail(new Error("The URL does not contain an authorization code"))
-          // 记录粘贴重定向日志
-          yield* Effect.logInfo("mcp oauth redirect pasted", fields)
-          // 交付回调结果（与浏览器回调同路）
-          yield* Deferred.succeed(code, { code: value, iss: url.searchParams.get("iss") ?? undefined })
-        }),
+        OauthRedirect.submit({
+          state,
+          callback: code,
+          received: (value, params) => ({ code: value, iss: params.get("iss") ?? undefined }),
+        })(pasted).pipe(Effect.tap(() => Effect.logInfo("mcp oauth redirect pasted", fields))),
     }
   }).pipe(
     // 登录初始化失败：记警告日志（含错误摘要）

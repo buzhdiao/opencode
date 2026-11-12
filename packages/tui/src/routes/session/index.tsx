@@ -25,9 +25,7 @@ import {
 } from "solid-js"
 // node:path：路径拼接/解析（导出文件、附件路径处理用）
 import path from "node:path"
-// node:os：换行符 EOL 与系统临时目录 tmpdir
-import { EOL, tmpdir } from "node:os"
-// node:fs/promises：递归建目录与写文件（导出会话用）
+import { EOL } from "node:os"
 import { mkdir, writeFile } from "node:fs/promises"
 // 路由上下文：读取路由数据与编程式导航
 import { useRoute, useRouteData } from "../../context/route"
@@ -37,9 +35,8 @@ import { createStore } from "solid-js/store"
 import { useData } from "../../context/data"
 // SplitBorder：分屏边框绘制组件
 import { SplitBorder } from "../../ui/border"
-// 终端运行时环境（TERM 等信息）
-import { useTuiTerminalEnvironment } from "../../context/runtime"
-// Spinner 与帧序列：加载动画
+import { useSessionLinks } from "../../ui/session-link"
+import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner, SPINNER_FRAMES } from "../../component/spinner"
 // PatchDiff：diff 补丁渲染组件
 import { PatchDiff } from "../../component/patch-diff"
@@ -297,7 +294,7 @@ export function Session(props: {
   const epilogue = useEpilogue()
   // 剪贴板上下文：复制文本/图片
   const clipboard = useClipboard()
-  // writeExport：把内容写到指定文件（先递归建目录）
+  const paths = useTuiPaths()
   const writeExport = async (file: string, content: string) => {
     await mkdir(path.dirname(file), { recursive: true })
     await writeFile(file, content)
@@ -1727,7 +1724,7 @@ export function Session(props: {
 
           // 选择保存：写入系统临时目录下的随机文件名，再展示结果对话框
           const filepath = path.join(
-            tmpdir(),
+            paths.cwd,
             `session-${crypto.randomUUID()}.${options.format === "markdown" ? "md" : "json"}`,
           )
           await writeExport(filepath, content)
@@ -1754,8 +1751,9 @@ export function Session(props: {
       title: "Toggle subagent picker",
       id: "session.child.first",
       group: "Session",
-      run: () => {
-        if (composer.open || session()?.parentID) setComposer("open", false)
+      run: (tab?: string) => {
+        if (tab === "shell" || tab === "subagents") setComposer({ open: true, tab })
+        else if (composer.open || session()?.parentID) setComposer("open", false)
         else setComposer({ open: true, tab: "subagents" })
         dialog.clear()
       },
@@ -1809,6 +1807,7 @@ export function Session(props: {
 
   // 快捷键层 2：仅当没有编辑器聚焦时启用（避免与输入框按键冲突）
   Keymap.createLayer(() => ({
+    mode: "composer",
     enabled: () => renderer.currentFocusedEditor === null,
     bindings: baseAndUnfocusedCommands.map((command) => command.id),
   }))
@@ -2341,8 +2340,7 @@ function BackgroundToolHint(props: { messages: SessionMessageInfo[] }) {
     )
     const part = current?.content.find((part): part is SessionMessageAssistantTool => {
       if (part.type !== "tool" || part.state.status !== "running") return false
-      const name = canonicalToolName(part.name)
-      return name === "shell" || name === "subagent"
+      return canonicalToolName(part.name) === "shell"
     })
     if (!current || !part) return
     // key 用于区分不同工具实例，started 用于计算剩余延迟
@@ -2485,7 +2483,7 @@ function AssistantFooter(props: { message: SessionMessageAssistant }) {
   // 本轮耗时与每秒 token 数
   const duration = createMemo(() => SessionTurn.duration(messages(), props.message, turn()))
   const tokensPerSecond = createMemo(() => SessionTurn.tokensPerSecond(messages(), props.message, turn()))
-  // 是否被用户中断
+  const timeToFirstToken = createMemo(() => SessionTurn.timeToFirstToken(messages(), props.message, turn()))
   const interrupted = createMemo(() => props.message.error?.message === "Step interrupted")
   // 是否触发免费额度限制
   const freeLimit = createMemo(() => props.message.error?.type === "provider.free-limit")
@@ -2524,6 +2522,9 @@ function AssistantFooter(props: { message: SessionMessageAssistant }) {
           </Show>
           <Show when={config.data.session.tps && tokensPerSecond()}>
             {(value) => <span style={{ fg: theme.text.muted }}> · {value().toFixed(1)} tok/s</span>}
+          </Show>
+          <Show when={config.data.session.tps && ctx.terminal.width >= 36 && timeToFirstToken()}>
+            {(value) => <span style={{ fg: theme.text.muted }}> · {Locale.duration(value())} ttft</span>}
           </Show>
           <Show when={interrupted()}>
             <span style={{ fg: theme.text.muted }}> · interrupted</span>
@@ -2705,6 +2706,7 @@ function CompactionMessage(props: { message: Extract<SessionMessageInfo, { type:
       <Show when={content()}>
         <box paddingTop={1} paddingLeft={3}>
           <markdown
+            ref={useSessionLinks()}
             syntaxStyle={syntax()}
             renderNode={plugins.markdown()}
             streaming={true}
@@ -2780,6 +2782,7 @@ function RevertMessage(props: {
         paddingTop={1}
         paddingBottom={1}
         paddingLeft={2}
+        paddingRight={2}
         backgroundColor={hover() ? theme.decrease(theme.background.raised.base) : theme.background.raised.base}
       >
         <text fg={theme.text.muted}>
@@ -2797,7 +2800,7 @@ function RevertMessage(props: {
                     maxWidth={Math.max(
                       2,
                       ctx.width -
-                        5 -
+                        7 -
                         (file.additions > 0 ? stringWidth(`+${file.additions}`) + 1 : 0) -
                         (file.deletions > 0 ? stringWidth(`-${file.deletions}`) + 1 : 0),
                     )}
@@ -2920,6 +2923,7 @@ function UserMessage(props: { message: SessionMessageUser }) {
           paddingTop={1}
           paddingBottom={1}
           paddingLeft={2}
+          paddingRight={2}
           backgroundColor={hover() ? theme.decrease(theme.background.raised.base) : theme.background.raised.base}
           flexShrink={0}
         >
@@ -3003,7 +3007,7 @@ function QueuedPromptDock(props: { prompts: { id: string; text: string }[]; onOp
         paddingTop={1}
         paddingBottom={1}
         paddingLeft={2}
-        paddingRight={1}
+        paddingRight={2}
         backgroundColor={hover() ? theme.decrease(theme.background.raised.base) : theme.background.raised.base}
         flexDirection="row"
       >
@@ -3457,6 +3461,7 @@ function BlockTool(props: BlockToolProps) {
       paddingTop={1}
       paddingBottom={1}
       paddingLeft={2}
+      paddingRight={2}
       gap={1}
       backgroundColor={hover() ? theme.decrease(background()) : background()}
       customBorderChars={SplitBorder.customBorderChars}
@@ -3512,7 +3517,7 @@ function BlockTool(props: BlockToolProps) {
             {/* 路径按剩余宽度截断展示 */}
             <FilePath
               value={path().value}
-              maxWidth={Math.max(2, ctx.width - 4 - stringWidth(path().label) - (props.spinner ? 2 : 0))}
+              maxWidth={Math.max(2, ctx.width - 6 - stringWidth(path().label) - (props.spinner ? 2 : 0))}
               fg={permission() ? theme.text.feedback.warning.base : (props.headerColor ?? theme.text.muted)}
             />
           </box>
@@ -3531,6 +3536,7 @@ const SHELL_DISPLAY_LIMIT = 1024 * 1024
 
 /** Shell 工具渲染：转发给 ShellDisplay，带 shell 会话 ID 与后台状态。 */
 function Shell(props: ToolProps) {
+  const stopped = createMemo(() => stoppedShell(props.part, props.metadata))
   return (
     <ShellDisplay
       part={props.part}
@@ -3540,17 +3546,22 @@ function Shell(props: ToolProps) {
       status={props.part.state.status}
       // 工具状态已完成但元数据显示 shell 仍在跑 => 已转后台
       background={props.part.state.status === "completed" && props.metadata.status === "running"}
-      // 有 shell 会话时走增量拉取，不用消息里附带的输出
-      output={stringValue(props.metadata.shellID) ? undefined : props.output}
+      output={stopped()?.output ?? (stringValue(props.metadata.shellID) ? undefined : props.output)}
+      error={stopped()?.notice}
     />
   )
 }
 
-/**
- * ShellDisplay：shell 命令块展示。
- * 支持两种来源：消息内嵌输出，或按 shellID 从 server 增量拉取（后台/长时命令）。
- * 折叠规则：默认最多 10 行/若干字符，超出显示首尾并允许点击展开。
- */
+// A call the user stopped fails with its output followed by a notice, which its metadata names. Its output shows like
+// a finished call's and only the notice as the error. A plugin that rewrote the error gets it shown as is.
+function stoppedShell(part: SessionMessageAssistantTool, metadata: Record<string, unknown>) {
+  if (part.state.status !== "error" || metadata.interrupted !== true) return
+  const notice = stringValue(metadata.notice)
+  const message = part.state.error.message
+  if (!notice || !message.endsWith(notice)) return
+  return { output: message.slice(0, -notice.length).replace(/\n+$/, ""), notice }
+}
+
 function ShellDisplay(props: {
   part?: SessionMessageAssistantTool
   shellID?: string
@@ -3663,8 +3674,7 @@ function ShellDisplay(props: {
   })
   // 折叠上限：10 行，按可用宽度换算字符数（运行中多留 2 列给 spinner）
   const maxLines = 10
-  const maxChars = createMemo(() => maxLines * Math.max(20, ctx.width - 6 - (isRunning() ? 2 : 0)))
-  // 工作目录前缀（cd xxx &&）
+  const maxChars = createMemo(() => maxLines * Math.max(20, ctx.width - 8 - (isRunning() ? 2 : 0)))
   const prefix = createMemo(() => (workdir() && workdir() !== "." ? `cd ${workdir()} && ` : ""))
   // 完整命令文本：运行中不带 $ 提示符
   const input = createMemo(() => (props.command ? `${isRunning() ? "" : "$ "}${prefix()}${props.command}` : ""))
@@ -3908,11 +3918,6 @@ function Subagent(props: ToolProps) {
         const id = sessionID()
         if (id) navigate({ type: "session", sessionID: id })
       }}
-      status={
-        isBackgroundSubagent(props.metadata, props.part.state.status) ? (
-          <StatusBadge>Background</StatusBadge>
-        ) : undefined
-      }
     >
       {`${continuation() ? "Continue subagent" : `${Locale.titlecase(stringValue(props.input.agent) ?? stringValue(props.input.subagent_type) ?? "General")} Subagent`} — ${description() ?? "Subagent"}${model() ? ` · ${model()}` : ""}`}
     </InlineTool>
@@ -3932,14 +3937,6 @@ export function subagentModelLabel(
   const modelID = separator === -1 ? reference : reference.slice(separator + 1)
   const name = models?.find((item) => item.providerID === providerID && item.id === modelID)?.name
   return `${name ?? reference}${variant ? ` (${variant})` : ""}`
-}
-
-// isBackgroundSubagent：工具已完成但元数据显示仍在运行 => 已转后台。
-export function isBackgroundSubagent(
-  metadata: Record<string, unknown>,
-  status: SessionMessageAssistantTool["state"]["status"],
-) {
-  return status === "completed" && metadata.status === "running"
 }
 
 export { executeCallSummary }
@@ -4075,7 +4072,7 @@ function Edit(props: ToolProps) {
       <Match when={file()}>
         {(item) => (
           <BlockTool path={{ label: "← Edit", value: pathFormatter.format(path()) }} part={props.part}>
-            <box paddingLeft={1} paddingRight={3}>
+            <box paddingLeft={1} paddingRight={1}>
               <PatchDiff
                 diff={item().patch}
                 hunkFg={theme.diff.text.hunkHeader}
@@ -4174,7 +4171,7 @@ function ApplyPatch(props: ToolProps) {
                     </text>
                   }
                 >
-                  <box paddingLeft={1} paddingRight={3}>
+                  <box paddingLeft={1} paddingRight={1}>
                     <PatchDiff
                       diff={file.patch}
                       hunkFg={theme.diff.text.hunkHeader}
@@ -4216,7 +4213,7 @@ function ApplyPatch(props: ToolProps) {
               >
                 <FilePath
                   value={file.resource}
-                  maxWidth={Math.max(2, ctx.width - 3)}
+                  maxWidth={Math.max(2, ctx.width - 5)}
                   fg={file.type === "delete" ? theme.diff.text.removed : theme.text.muted}
                 />
               </BlockTool>

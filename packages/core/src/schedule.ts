@@ -27,9 +27,6 @@ import {
   toCreateInput,
   When,
 } from "@opencode/schema/schedule"
-// 导入应用（App）元数据服务
-import { App } from "./app.js"
-// 导入配置（Config）服务
 import { Config } from "./config.js"
 // 导入数据库服务
 import { Database } from "./database/database.js"
@@ -328,22 +325,16 @@ const layer = Layer.effect(
     const execution = yield* SessionExecution.Service
     // 创建门铃（doorbell latch）：新建/恢复任务时唤醒循环
     const doorbell = yield* Latch.make()
-    // 依赖：特性开关解析器
-    const flags = yield* Flag.resolver
 
     // Config is per location, so a schedule follows the config where its Session lives.
     // 读取某会话所在位置的定时任务配置：是否启用 + 时区
     const settings = (session: SessionSchema.Info) =>
       Effect.gen(function* () {
-        // 可选获取配置服务（可能不存在）
-        const config = yield* Effect.serviceOption(Config.Service)
-        // 无配置服务时视为禁用
-        if (Option.isNone(config)) return { enabled: false, timezone: undefined }
-        // 读取配置条目
-        const entries = yield* config.value.entries()
-        // 返回启用状态与时区设置
+        const config = yield* Config.Service
+        const flags = yield* Flag.Service
+        const entries = yield* config.entries()
         return {
-          enabled: flags(entries).schedules.enabled,
+          enabled: flags.resolve(entries).schedules.enabled,
           timezone: Config.latest(entries, "timezone"),
         }
       }).pipe(instances.provide(session))
@@ -1108,5 +1099,5 @@ const layer = Layer.effect(
 export const node: LayerNode.Provider<Service, never, typeof Node.tags.values.global> = makeGlobalNode({
   service: Service,
   layer,
-  deps: [App.node, Database.node, Session.node, SessionExecution.node, Instance.node],
+  deps: [Database.node, Session.node, SessionExecution.node, Instance.node],
 })

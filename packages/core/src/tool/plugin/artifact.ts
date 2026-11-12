@@ -99,11 +99,8 @@ export const Plugin = {
       Effect.forkScoped({ startImmediately: true }),
     )
 
-    // 获取功能开关解析器
-    const flags = yield* Flag.resolver
-    // 根据（已观察的）配置条目判断 artifacts 工具是否启用
-    const enabled = () => flags(loaded.entries).artifacts.enabled
-    // 把服务层错误映射为工具失败的辅助函数
+    const flags = yield* Flag.Service
+    const enabled = () => flags.resolve(loaded.entries).artifacts.enabled
     const failure = (error: { readonly message: string }) => new ToolFailure({ message: error.message, error })
 
     // 对工具注册中心做一次变换，批量注册 artifact 工具

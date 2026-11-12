@@ -236,7 +236,8 @@ export function args(file: string, command: string) {
   if (n === "cmd") return ["/c", command]
   // PowerShell 系：禁用横幅、配置文件与交互模式
   if (ps(file)) return ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
-  // POSIX 系 shell 用 -c
+  // zsh aborts the whole line on an unmatched glob; pass it through literally as bash does.
+  if (n === "zsh") return ["+o", "nomatch", "-c", command]
   return ["-c", command]
 }
 

@@ -12,6 +12,7 @@ import { Credential } from "../../credential.js"
 import { Integration } from "../../integration.js"
 // 导入 OAuth 回调页面渲染工具
 import { OauthCallbackPage } from "../../oauth/page.js"
+import { OauthRedirect } from "../../oauth/redirect.js"
 
 // Poe 集成的 ID
 const integrationID = Integration.ID.make("poe")
@@ -72,9 +73,8 @@ export const PoePlugin = define({
             ).toString("base64url")
             // 生成随机 state 防 CSRF
             const state = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url")
-            // Deferred 用于等待回调服务器收到授权码
-            const callback = yield* Deferred.make<{ code: string; response: ServerResponse }, Error>()
-            // 惰性加载 node:http（无环回监听能力的运行时不会执行）
+            // `response` is the browser's pending callback request; a pasted redirect has none.
+            const callback = yield* Deferred.make<{ code: string; response?: ServerResponse }, Error>()
             const { createServer } = yield* Effect.promise(() => import("node:http"))
             // 惰性加载 node:events（用于等待 listening 事件）
             const { EventEmitter } = yield* Effect.promise(() => import("node:events"))
@@ -142,7 +142,7 @@ export const PoePlugin = define({
                 const respond = (error?: string) =>
                   Effect.sync(() =>
                     request.response
-                      .writeHead(error ? 400 : 200, { "Content-Type": "text/html" })
+                      ?.writeHead(error ? 400 : 200, { "Content-Type": "text/html" })
                       .end(
                         error
                           ? OauthCallbackPage.error(error, { provider: "Poe" })
@@ -154,10 +154,20 @@ export const PoePlugin = define({
                   Effect.tap(() => respond()),
                   Effect.tapError((error) => respond(error.message)),
                   // Bun's server.closeAllConnections() leaves an unanswered callback response pending.
-                  // Bun 下关闭连接会让回调响应悬空，因此中断时强制销毁响应
-                  Effect.onInterrupt(() => Effect.sync(() => request.response.destroy())),
+                  Effect.onInterrupt(() => Effect.sync(() => request.response?.destroy())),
                 )
               }),
+              // Not `OauthRedirect.submit`: a pasted redirect also has to pass Poe's issuer check.
+              submit: (pasted: string) =>
+                OauthRedirect.pasted(pasted, state).pipe(
+                  Effect.flatMap((result) => {
+                    const error = callbackError(result.params, state)
+                    return error
+                      ? Deferred.fail(callback, new Error(error))
+                      : Deferred.succeed(callback, { code: result.params.get("code") ?? "" })
+                  }),
+                  Effect.asVoid,
+                ),
             }
           }),
       })

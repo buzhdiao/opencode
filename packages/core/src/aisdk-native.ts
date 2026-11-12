@@ -3,8 +3,65 @@ export * as AISDKNative from "./aisdk-native.js"
 
 // 导入 Effect 库原语：Effect、Option（可选值）、Schema（校验/编解码）、Struct（对象键剔除等工具）
 import { Effect, Option, Schema, Struct } from "effect"
-// 导入 Provider 模块：提供包名归一化、请求头/请求体合并、内置包集合等工具
-import { Provider } from "./provider.js"
+import { isRecord } from "@opencode/util/record"
+import type { Provider } from "./provider.js"
+
+export const AISDK_PREFIX = "aisdk:"
+export const isAISDK = (value: string | undefined): value is string => value?.startsWith(AISDK_PREFIX) ?? false
+export const aisdk = (value: string) => (isAISDK(value) ? value : `${AISDK_PREFIX}${value}`)
+export function packageName(value: string): string
+export function packageName(value: undefined): undefined
+export function packageName(value: string | undefined): string | undefined
+export function packageName(value: string | undefined) {
+  // Native provider entrypoints can persist in user configuration across the npm scope migration.
+  if (value?.startsWith("@opencode-ai/ai/")) return value.replace("@opencode-ai/", "@opencode/")
+  if (value === undefined || !isAISDK(value)) return value
+  return value.slice(AISDK_PREFIX.length)
+}
+
+type Json = Schema.Schema.Type<typeof Schema.Json>
+const JsonRecord = Schema.Record(Schema.String, Schema.Json)
+const decodeJsonRecord = Schema.decodeUnknownSync(JsonRecord)
+
+export function mergeOverlay(
+  base: Readonly<Record<string, unknown>> | undefined,
+  overlay: Readonly<Record<string, unknown>> | undefined,
+): Record<string, Json> | undefined {
+  if (base === undefined) return overlay && decodeJsonRecord({ ...overlay })
+  if (overlay === undefined) return decodeJsonRecord({ ...base })
+  return decodeJsonRecord(mergeRecord(base, overlay))
+}
+
+function mergeRecord(
+  base: Readonly<Record<string, unknown>>,
+  overlay: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    new Set([...Object.keys(base), ...Object.keys(overlay)]).values().map((key): [string, unknown] => {
+      const left = base[key]
+      const right = overlay[key]
+      if (right === undefined) return [key, left]
+      if (isRecord(left) && isRecord(right)) return [key, mergeRecord(left, right)]
+      return [key, right]
+    }),
+  )
+}
+
+export function mergeHeaders(
+  base: Readonly<Record<string, string>> | undefined,
+  overlay: Readonly<Record<string, string>> | undefined,
+) {
+  if (base === undefined) return overlay && { ...overlay }
+  if (overlay === undefined) return { ...base }
+  return Object.fromEntries(
+    [...Object.entries(base), ...Object.entries(overlay)]
+      .reduce((result, entry) => {
+        result.set(entry[0].toLowerCase(), entry)
+        return result
+      }, new Map<string, [string, string]>())
+      .values(),
+  )
+}
 
 // 叠加配置（Overlays）：可在目标上覆盖的三类信息——SDK 设置、请求头、请求体
 type Overlays = {
@@ -30,7 +87,7 @@ type Context = {
 // 重写入口：把用户配置里指向官方 AI SDK 包的 specifier 改写为 OpenCode 内置的原生（native）包，并翻译其设置
 export function rewrite<ID extends string>(
   target: Target<ID>,
-  input: Context & { readonly specifier: string | undefined },
+  input: Context & { readonly specifier: string | undefined; readonly builtins: ReadonlySet<string> },
 ) {
   // 没有 specifier 就无事可做
   if (input.specifier === undefined) return
@@ -47,24 +104,18 @@ export function rewrite<ID extends string>(
   // Without `provider`, the native compatible package reports every AI SDK-mapped host as `openai-compatible`.
   // （若不带 `provider` 标识，原生 openai-compatible 包会把所有 AI SDK 映射主机都上报为 `openai-compatible`）
   const identity =
-    replacement === "@opencode/ai/providers/openai-compatible" && !Provider.builtinPackages.has(input.specifier)
+    replacement === "@opencode/ai/providers/openai-compatible" && !input.builtins.has(input.specifier)
       ? { provider: input.canonical ?? input.providerID }
       : {}
   // 最终设置：目标原本无 settings 时保持 undefined，否则用翻译后的设置并附加 identity 标识
   target.settings = target.settings === undefined ? undefined : { ...translated.settings, ...identity }
-  // 请求头：翻译出的头与目标已有的头合并（后者优先）
-  target.headers = Provider.mergeHeaders(translated.headers, target.headers)
-  // 请求体：同样做叠加合并（后者优先）
-  target.body = Provider.mergeOverlay(translated.body, target.body)
-  // 对每个变体（variant）也做同样的选项翻译与合并，仅在值存在时输出对应键
+  target.headers = mergeHeaders(translated.headers, target.headers)
+  target.body = mergeOverlay(translated.body, target.body)
   target.variants = target.variants?.map((variant) => {
     // 用变体自身的设置解码后计算选项叠加
     const overlay = options(replacement, input.modelID, decode(variant.settings ?? {}))
-    // 合并变体的请求头
-    const headers = Provider.mergeHeaders(overlay.headers, variant.headers)
-    // 合并变体的请求体
-    const body = Provider.mergeOverlay(overlay.body, variant.body)
-    // 返回新变体：保留 id，settings/headers/body 只在原值存在且合并结果存在时带上
+    const headers = mergeHeaders(overlay.headers, variant.headers)
+    const body = mergeOverlay(overlay.body, variant.body)
     return {
       id: variant.id,
       ...(variant.settings === undefined ? {} : { settings: overlay.settings }),
@@ -189,14 +240,12 @@ const LEGACY_VERTEX: Readonly<Record<string, string>> = {
   "@opencode/ai/providers/google-vertex-mistral": "@opencode/ai/providers/google-vertex/mistral",
 }
 
-// 核心解析：把任意 specifier（官方 AI SDK 包、旧版内置包、内置包名）归一化为当前可用的原生包名
-function resolve(specifier: string, context: Context & { readonly settings?: Provider.Settings }): string | undefined {
-  // 取 specifier 的 npm 包名部分（去掉子路径）
-  const npm = Provider.packageName(specifier)
-  // 官方 AI SDK 包、通用映射表或主机表命中的包：直接交给 native() 解析
-  if (Provider.isAISDK(specifier) || npm in PACKAGES || npm in (HOSTS[context.providerID] ?? {}))
-    return native(npm, context)
-  // 旧版 Bedrock Mantle 包名：按模型 ID 重新拆分协议
+function resolve(
+  specifier: string,
+  context: Context & { readonly settings?: Provider.Settings; readonly builtins: ReadonlySet<string> },
+): string | undefined {
+  const npm = packageName(specifier)
+  if (isAISDK(specifier) || npm in PACKAGES || npm in (HOSTS[context.providerID] ?? {})) return native(npm, context)
   if (npm === "@opencode/ai/providers/amazon-bedrock/mantle" || npm === "@opencode/ai/providers/amazon-bedrock-mantle")
     return mantle(context.modelID)
   // 旧版 Vertex 连字符包名：映射到新的斜杠路径
@@ -207,8 +256,7 @@ function resolve(specifier: string, context: Context & { readonly settings?: Pro
     azureChat(context)
   )
     return "@opencode/ai/providers/azure/chat"
-  // 已是内置包则原样返回；否则视为未知包，返回 undefined（保持原样不改写）
-  return Provider.builtinPackages.has(npm) ? npm : undefined
+  return context.builtins.has(npm) ? npm : undefined
 }
 
 // 选项叠加（Overlay）：翻译后的最终产物——设置 + 可选请求头 + 可选请求体
@@ -322,9 +370,7 @@ function bedrockRequest(modelID: string | undefined, settings: Legacy): Pick<Ove
   const display = reasoning?.display
   // 已配置的 anthropicBeta 头列表
   const betas = settings.anthropicBeta ?? []
-  // 把转译出的字段与用户附加字段合并，得到最终的 additionalModelRequestFields
-  const fields = Provider.mergeOverlay(additional, {
-    // 合并 anthropic_beta 列表（原有项在前）
+  const fields = mergeOverlay(additional, {
     ...(betas.length > 0 ? { anthropic_beta: [...(additional.anthropic_beta ?? []), ...betas] } : {}),
     // Anthropic 自适应思考模式：thinking.type=adaptive，可选 display
     ...(anthropic && type === "adaptive"
@@ -368,7 +414,7 @@ const OPENROUTER_KEYS = ["appName", "appUrl", "api_keys", "compatibility"] as co
 function openRouterRequest(settings: Legacy): Pick<Overlay, "headers"> {
   // 合成应用相关头（标题/Referer/API 密钥列表）并叠加用户自定义头
   const headers =
-    Provider.mergeHeaders(
+    mergeHeaders(
       {
         ...(settings.appName === undefined ? {} : { "X-OpenRouter-Title": settings.appName }),
         ...(settings.appUrl === undefined ? {} : { "HTTP-Referer": settings.appUrl }),

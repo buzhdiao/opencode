@@ -1392,7 +1392,7 @@ const layer = Layer.effectDiscard(
         yield* touch(db, event)
       }),
     )
-    // 步骤流式事件：走通用消息投影
+    yield* bus.project(SessionEvent.Step.FirstToken, (event) => run(db, event))
     yield* bus.project(SessionEvent.Step.Streamed, (event) => run(db, event))
     // 步骤结束事件：投影并累加该步骤的用量
     yield* bus.project(SessionEvent.Step.Ended, (event) =>

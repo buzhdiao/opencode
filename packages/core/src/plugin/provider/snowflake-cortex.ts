@@ -14,7 +14,7 @@ import { Credential } from "../../credential.js"
 import { Integration } from "../../integration.js"
 // 导入 OAuth 回调页面渲染工具
 import { OauthCallbackPage } from "../../oauth/page.js"
-// 导入 Provider 服务与 ID 工具
+import { OauthRedirect } from "../../oauth/redirect.js"
 import { Provider } from "../../provider.js"
 // 导入用户配置的提供商设置读取函数
 import { configuredSettings } from "./configured.js"
@@ -238,6 +238,7 @@ export const SnowflakeCortexPlugin = define({
                   code_verifier: verifier,
                 })
               }),
+              submit: OauthRedirect.submit({ state, callback: code, received: (value) => value }),
             }
           }),
       })

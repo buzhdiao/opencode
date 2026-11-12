@@ -49,7 +49,9 @@ export function locationErrors<A, E, R>(effect: Effect.Effect<A, E, R>) {
   )
 }
 
-// awaitPlugins：等待插件激活完成；超过 5 秒未完成则失败为服务不可用（避免请求无限挂起）
+// Temporary: managed policy is applied by the last internal plugin, and State shows each registration as soon as it is
+// made, so until activation finishes a provider the policy denies is still listed and usable. Only the endpoints that
+// list or use providers wait. Remove once a plugin batch becomes visible only when it ends.
 export const awaitPlugins = Plugin.awaitActivation.pipe(
   Effect.timeoutOrElse({
     // 超时阈值 5 秒

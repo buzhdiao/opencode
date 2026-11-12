@@ -13,7 +13,7 @@ import { supportsForeignKeyToggle } from "#sqlite"
 import { EffectDrizzleSqlite } from "./drizzle.js"
 // 导入自动生成的迁移列表（按时间戳排序）
 import { migrations } from "./migration.gen.js"
-// 导入生成的初始 schema：负责一次性建出全部表结构
+import legacyCredentials from "./migration/20260805200742_import_legacy_credentials.js"
 import schema from "./schema.gen.js"
 // 导入全局服务 Global：迁移过程中可能读取（如 v1 数据导入需要数据目录）
 import { Global } from "@opencode/util/global"
@@ -58,7 +58,7 @@ export function apply(db: Database) {
       Effect.gen(function* () {
         // 先用生成的 schema 一次性建出全部表结构
         yield* schema.up(tx)
-        // 创建 migration 日志表：id 为主键，time_completed 记录完成时间
+        yield* legacyCredentials.up(tx)
         yield* tx.run(
           sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
         )

@@ -758,8 +758,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         // 处理 session.generate：让会话直接生成一段文本（不经消息循环）
         "session.generate",
         Effect.fn(function* (ctx) {
-          // 执行生成；会话不存在映射为 SessionNotFoundError，其余失败映射为服务不可用
-          const text = yield* session
+          const result = yield* session
             .generate({ sessionID: ctx.params.sessionID, prompt: ctx.payload.prompt })
             .pipe(
               Effect.mapError((error) =>
@@ -768,8 +767,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                   : new ServiceUnavailableError({ message: error.message, service: "session generation" }),
               ),
             )
-          // 返回生成的文本
-          return { data: { text } }
+          return { data: result }
         }),
       )
       .handle(

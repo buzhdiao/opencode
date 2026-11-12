@@ -2,7 +2,7 @@
 export * as Credential from "./credential.js"
 
 import { asc, desc, eq, type SQL } from "drizzle-orm"
-import { Cause, Context, Effect, Fiber, Layer, Schema } from "effect"
+import { Cause, Clock, Context, Duration, Effect, Fiber, Layer, Schema } from "effect"
 import { Credential } from "@opencode/schema/credential"
 import { CredentialLegacy } from "@opencode/schema/credential-legacy"
 import { Integration } from "@opencode/schema/integration"
@@ -36,7 +36,10 @@ export type Value = Credential.Value
 // 凭据事件定义（Updated / Switched 等）
 export const Event = Credential.Event
 
-// 凭据信息（Info）：ID、所属集成、显示标签与机密取值
+/** Whether an access token is due for a refresh. `expires` 0 means the issuer gave no lifetime. */
+export const expiring = (value: OAuth, now: number, margin: Duration.Input = Duration.minutes(5)) =>
+  value.expires !== 0 && value.expires <= now + Duration.toMillis(margin)
+
 export class Info extends Schema.Class<Info>("Credential.Info")({
   // 凭据唯一 ID
   id: ID,
@@ -59,11 +62,19 @@ export interface Interface {
   /** Returns one stored credential by ID. */
   // 按 ID 返回单个凭据
   readonly get: (id: ID) => Effect.Effect<Info | undefined>
-  /** Concurrent callers for the same credential share the running operation's result, including failures. */
-  // 同一凭据的并发调用共享正在运行的操作结果（包括失败）
-  readonly lock: (
+  /**
+   * Refreshes a stored OAuth credential and saves the result. Every process and Location sharing the database
+   * refreshes a credential one at a time, and concurrent callers share the running refresh, including its
+   * failure. The row is read again under the lock: if `stale` is false, another caller already refreshed it and
+   * that row is returned. If the row changes while `refresh` runs, the stored row wins. Resolves undefined when
+   * the credential is gone.
+   */
+  readonly refresh: (
     id: ID,
-    operation: Effect.Effect<OAuth | undefined, unknown>,
+    input: {
+      readonly stale: (current: OAuth, now: number) => boolean
+      readonly refresh: (current: OAuth) => Effect.Effect<OAuth, unknown>
+    },
   ) => Effect.Effect<OAuth | undefined, unknown>
   /**
    * Creates a credential for an integration and returns the new record. The new credential becomes the
@@ -164,30 +175,46 @@ const layer = Layer.effect(
           Effect.orDie,
         )
 
-    return Service.of({
-      // lock：同一凭据的并发刷新去重——已有进行中的 Fiber 就直接等待并共享其结果
-      lock: Effect.fn("Credential.lock")((id, operation) =>
-        Effect.uninterruptibleMask((restore) =>
+    const lock = (id: ID, operation: Effect.Effect<OAuth | undefined, unknown>) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const current = pending.get(id)
+          if (current) return yield* restore(Fiber.join(current))
+          // The global scope owns the operation, not the first Session or Location waiting for it.
+          // The file lock extends this to other processes sharing the database.
+          const fiber = yield* operation.pipe(
+            flock.withLock(`credential-refresh:${id}`),
+            Effect.ensuring(Effect.sync(() => pending.delete(id))),
+            Effect.forkIn(scope),
+          )
+          pending.set(id, fiber)
+          return yield* restore(Fiber.join(fiber))
+        }),
+      )
+
+    const service: Interface = Service.of({
+      refresh: Effect.fn("Credential.refresh")((id, input) =>
+        lock(
+          id,
           Effect.gen(function* () {
-            // 查看是否已有进行中的操作
-            const current = pending.get(id)
-            // 有则共享等待其完成
-            if (current) return yield* restore(Fiber.join(current))
-            // The global scope owns the operation, not the first Session or Location waiting for it.
-            // The file lock extends this to other processes sharing the database.
-            // 操作托管在全局作用域上（而非首个等待者），文件锁进一步把互斥扩展到共享数据库的其他进程
-            const fiber = yield* operation.pipe(
-              // 跨进程互斥
-              flock.withLock(`credential-refresh:${id}`),
-              // 完成后清理 pending 登记
-              Effect.ensuring(Effect.sync(() => pending.delete(id))),
-              // 在全局作用域后台运行
-              Effect.forkIn(scope),
-            )
-            // 登记进行中的操作
-            pending.set(id, fiber)
-            // 等待并共享结果
-            return yield* restore(Fiber.join(fiber))
+            const current = yield* service.get(id)
+            if (current?.value.type !== "oauth") return undefined
+            if (!input.stale(current.value, yield* Clock.currentTimeMillis)) {
+              yield* Effect.logInfo("credential refresh skipped", { credentialID: id, reason: "already_refreshed" })
+              return current.value
+            }
+            const value = yield* input.refresh(current.value).pipe(Effect.timeout("30 seconds"))
+            const latest = yield* service.get(id)
+            if (latest?.value.type !== "oauth") return undefined
+            if (latest.value.access !== current.value.access || latest.value.refresh !== current.value.refresh) {
+              yield* Effect.logWarning("credential refresh discarded", {
+                credentialID: id,
+                reason: "changed_meanwhile",
+              })
+              return latest.value
+            }
+            yield* service.update(id, { value })
+            return value
           }),
         ),
       ),
@@ -251,8 +278,11 @@ const layer = Layer.effect(
           type: credential.value.type,
           active: activated,
         })
-        // 广播凭据更新事件（全局）
-        yield* bus.publish(Event.Updated, {}, { global: true })
+        yield* bus.publish(
+          Event.Updated,
+          { integrationID: credential.integrationID, credentialID: credential.id },
+          { global: true },
+        )
         if (activated)
           // 若新凭据被激活，再广播切换事件
           yield* bus.publish(
@@ -325,8 +355,11 @@ const layer = Layer.effect(
           labelChanged: updates.label !== undefined && updates.label !== credential.label,
         })
         if (updates.label !== undefined && updates.label !== credential.label)
-          // 标签确实变化才广播更新事件
-          yield* bus.publish(Event.Updated, {}, { global: true })
+          yield* bus.publish(
+            Event.Updated,
+            { integrationID: credential.integrationID, credentialID: id },
+            { global: true },
+          )
       }),
       remove: Effect.fn("Credential.remove")(function* (id) {
         // 事务内完成删除与激活替补选择
@@ -371,8 +404,12 @@ const layer = Layer.effect(
           active: removed.switched,
           ...(removed.switched ? { replacementID: removed.credentialID } : {}),
         })
-        // 广播更新
-        yield* bus.publish(Event.Updated, {}, { global: true })
+        if (removed.integrationID)
+          yield* bus.publish(
+            Event.Updated,
+            { integrationID: removed.integrationID, credentialID: id },
+            { global: true },
+          )
         if (removed.switched)
           // 发生切换则广播切换事件
           yield* bus.publish(
@@ -382,6 +419,7 @@ const layer = Layer.effect(
           )
       }),
     })
+    return service
   }),
 )
 

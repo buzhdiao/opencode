@@ -13,10 +13,7 @@ export interface Info {
   readonly channel: string
 }
 
-// 应用元数据的全局引用（Context.Reference）：未显式提供时用 make() 生成默认值
-export const Metadata = Context.Reference<Info>("@opencode/App", {
-  defaultValue: () => make(),
-})
+export class Service extends Context.Service<Service, Info>()("@opencode/App") {}
 
 // 构造应用信息：缺省名为 "opencode"，版本与渠道缺省为 "unknown"
 export function make(input: Partial<Info> = {}): Info {
@@ -32,12 +29,11 @@ export function useragent(app: Info) {
   return `opencode/${app.channel}/${app.version}/${app.name}`
 }
 
-// 构建“提供应用元数据”的层（Layer），可选地传入部分信息覆盖默认值
-export const layer = (input?: Partial<Info>) => Layer.succeed(Metadata, make(input))
+export const layer = (input?: Partial<Info>) => Layer.succeed(Service, make(input))
 
 // 构建带配置的全局节点：服务为 Metadata，层为上面的 layer，无其他依赖
 export const configured = (input?: Partial<Info>) =>
-  makeGlobalNode({ service: Metadata, layer: layer(input), deps: [] })
+  makeGlobalNode({ service: Service, layer: layer(input), deps: [] })
 
 // 默认导出的节点：使用默认配置的应用元数据节点
 export const node = configured()

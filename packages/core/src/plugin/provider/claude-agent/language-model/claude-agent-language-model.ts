@@ -117,9 +117,6 @@ export class Model implements LanguageModelV3 {
               sessionID,
               // 复制源会话 ID（fork/分支）
               sourceID,
-              // 是否为压缩（compaction）请求
-              compaction: kind === "compaction",
-              // 模型 ID
               model: this.modelId,
               // 努力等级
               effort,

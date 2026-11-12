@@ -3,9 +3,8 @@ export * as ConfigMigrateV1 from "./migrate.js"
 
 // v2 的代理配置 Schema（迁移目标格式）
 import { ConfigAgent } from "@opencode/schema/config/agent"
-// effect 库：Schema 校验
-import { Schema } from "effect"
-// v1 的各类配置 Schema（迁移源格式）
+import { ConfigModel } from "@opencode/schema/config/model"
+import { Option, Schema } from "effect"
 import { ConfigAgentV1 } from "./agent.js"
 import { ConfigCommandV1 } from "./command.js"
 import { ConfigMCPV1 } from "./mcp.js"
@@ -21,6 +20,7 @@ import { Model } from "../../model.js"
 const decodeOptions = { errors: "all", onExcessProperty: "ignore" } as const
 // v2 代理配置的同步解码器（输入为 JSON 字符串）
 const decodeAgent = Schema.decodeUnknownSync(Schema.fromJsonString(ConfigAgent.Info), decodeOptions)
+const decodeSelection = Schema.decodeUnknownOption(ConfigModel.Selection)
 
 // 把 v1 权限配置（键值对数组）转换为 v2 的权限规则数组
 function permissions(info?: ConfigPermissionV1.Info) {
@@ -106,18 +106,13 @@ export function migrateCommand(command: ConfigCommandV1.Info) {
 
 // 解析 v1 的 "provider/model"（及可选 "#variant"）字符串为结构化模型选择
 export function modelSelection(input?: string, variant?: string) {
-  // 为空或不符合 provider/model 格式时返回 undefined
-  if (input === undefined || !/^[^/#]+\/[^#]+$/.test(input)) return undefined
-  // 找到第一个 "/" 的位置作为分隔
-  const separator = input.indexOf("/")
-  // 返回结构化的选择对象
+  const selection = Option.getOrUndefined(decodeSelection(input))
+  if (selection === undefined) return undefined
+  const selected = selection.variant ?? variant
   return {
-    // 提供商 ID（同时做旧 ID 更名）
-    providerID: providerID(input.slice(0, separator)),
-    // 模型 ID
-    model: input.slice(separator + 1),
-    // 变体：非空且不含 "#" 时附带
-    ...(variant === undefined || variant.length === 0 || variant.includes("#") ? {} : { variant }),
+    providerID: providerID(selection.providerID),
+    model: selection.model,
+    ...(selected === undefined || selected.length === 0 || selected.includes("#") ? {} : { variant: selected }),
   }
 }
 
@@ -206,9 +201,11 @@ function migrateStandardProvider(info: ConfigProviderV1.Info) {
     package: info.npm ? packageSpecifier(info.npm) : undefined,
     // 兼容性信息：setCacheKey 映射为 supportsPromptCacheKey
     compatibility: setCacheKey === undefined ? undefined : { supportsPromptCacheKey: setCacheKey },
-    // 设置项：有 api 时把 baseURL 覆盖为 api；否则用解析出的 settings
-    settings: info.api ? { ...options.settings, baseURL: info.api } : info.options ? options.settings : undefined,
-    // 请求头覆盖（有 options 时才携带）
+    settings: info.api
+      ? { ...options.settings, baseURL: options.settings.baseURL || info.api }
+      : info.options
+        ? options.settings
+        : undefined,
     headers: info.options && options.headers,
     // 请求体覆盖（有 options 时才携带）
     body: info.options && options.body,
@@ -352,19 +349,9 @@ function migrateModel(info: typeof ConfigProviderV1.Model.Type, npm: string | un
         ]
       : []),
   ]
-  // 取模型能力默认值
-  const defaults = Model.Capabilities.default()
-  // 显式声明过工具调用或模态时才构造能力对象
   const capabilities =
     info.tool_call !== undefined || info.modalities?.input !== undefined || info.modalities?.output !== undefined
-      ? {
-          // 工具调用能力（缺省用默认）
-          tools: info.tool_call ?? defaults.tools,
-          // 输入模态（缺省用默认）
-          input: info.modalities?.input ?? defaults.input,
-          // 输出模态（缺省用默认）
-          output: info.modalities?.output ?? defaults.output,
-        }
+      ? { tools: info.tool_call, input: info.modalities?.input, output: info.modalities?.output }
       : undefined
   // 组装 v2 模型配置
   return {
@@ -398,9 +385,9 @@ function migrateModel(info: typeof ConfigProviderV1.Model.Type, npm: string | un
     disabled: info.status === "deprecated" ? true : undefined,
     // 限制：截断为安全整数范围
     limit: info.limit && {
-      context: int(info.limit.context),
+      context: info.limit.context === undefined ? undefined : int(info.limit.context),
       input: info.limit.input === undefined ? undefined : int(info.limit.input),
-      output: int(info.limit.output),
+      output: info.limit.output === undefined ? undefined : int(info.limit.output),
     },
   }
 }

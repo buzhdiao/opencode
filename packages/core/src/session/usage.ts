@@ -32,8 +32,6 @@ export const tokens = (usage: Usage | undefined): TokenUsage.Info => ({
 })
 
 // Catalog pricing is the fallback for endpoints that don't report what they charged (`Usage.cost`).
-// TODO(#35765): Normalize Copilot's reported billed amount into `Usage.cost`.
-// 按模型目录定价估算成本：作为端点未上报实际费用（Usage.cost）时的兜底
 export function calculateCost(costs: Model.Info["cost"], usage: TokenUsage.Info) {
   // 上下文 token 量：输入 + 缓存读 + 缓存写，用于匹配分层定价档位
   const context = usage.input + usage.cache.read + usage.cache.write

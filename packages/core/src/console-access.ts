@@ -1,28 +1,8 @@
 // 控制台访问（Console Access）：为已连接的 OpenCode Console 提供配置刷新选项与请求头工具。
 export * as ConsoleAccess from "./console-access.js"
 
-import { Context, Layer } from "effect"
-import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import type { Credential } from "./credential.js"
 
-/**
- * How the host keeps a connected Console's config fresh. `poll` re-checks it every minute in the background; without
- * it, the config refreshes only when a prompt starts, so a host that suspends between prompts stays idle.
- */
-// 上下文引用（Context.Reference）：宿主（host）如何保持已连接 Console 的配置新鲜；poll 为 true 时后台每分钟复查
-export const Options = Context.Reference<{ readonly poll: boolean }>("@opencode/ConsoleAccess/Options", {
-  // 默认开启轮询
-  defaultValue: () => ({ poll: true }),
-})
-
-// 按给定选项构造全局节点（global node）；未传 poll 时默认开启轮询
-export const configured = (options?: { readonly poll?: boolean }) =>
-  makeGlobalNode({ service: Options, layer: Layer.succeed(Options, { poll: options?.poll ?? true }), deps: [] })
-
-// 默认导出的全局节点，直接使用默认轮询选项
-export const node = configured()
-
-// Console 服务端的默认地址
 export const defaultServer = "https://opencode.ai/console"
 
 /** The OpenCode Console a credential signed in to. */

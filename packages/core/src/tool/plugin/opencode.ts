@@ -13,7 +13,7 @@ import { Model } from "@opencode/schema/model"
 import { AbsolutePath } from "@opencode/schema/schema"
 // 导入会话 Schema
 import { Session } from "@opencode/schema/session"
-// 导入 Effect 原语：Effect、Schema
+import { FSUtil } from "@opencode/util/fs-util"
 import { Effect, Schema } from "effect"
 // 导入统一的工具失败映射函数
 import { toolFailure } from "../runtime.js"
@@ -211,16 +211,27 @@ export const Plugin = {
             Effect.gen(function* () {
               // 目标会话：未传则用当前会话
               const sessionID = input.sessionID ?? context.sessionID
-              // 执行迁移（delivery: "steer" 表示在下一个安全边界生效）
+              const session = yield* ctx.session.get({ sessionID })
+              const directory = AbsolutePath.make(
+                FileAccess.resolvePath(session.location.directory, input.directory.trim()),
+              )
+              // The destination becomes the session's internal directory, so leaving the project
+              // needs the same approval as reaching outside it. The project's own worktrees don't.
+              const target = yield* access.resolve({ path: directory, kind: "directory" })
+              const worktrees = target.externalDirectory
+                ? yield* ctx.worktree.list({ projectID: ctx.location.project.id })
+                : []
+              if (!worktrees.some((worktree) => FSUtil.contains(worktree.directory, directory)))
+                yield* access.authorizeExternal([target], context)
               yield* ctx.session.move({
                 sessionID,
-                directory: input.directory,
+                directory,
                 delivery: "steer",
               })
               // 返回迁移结果
               return {
-                output: { sessionID, directory: input.directory },
-                content: `Moved session ${sessionID} to ${input.directory}.`,
+                output: { sessionID, directory },
+                content: `Moved session ${sessionID} to ${directory}.`,
               }
             }).pipe(
               // 失败映射为工具失败

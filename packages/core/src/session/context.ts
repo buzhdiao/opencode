@@ -9,7 +9,7 @@ import { Permission } from "../permission.js"
 import { Context, Effect, Layer } from "effect"
 // 导入 Agent 服务
 import { Agent } from "../agent.js"
-// 导入 Code Mode 的说明注入
+import type { SessionRequestKind } from "@opencode/plugin/effect/session"
 import { CodeModeInstructions } from "../codemode/instructions.js"
 // 导入数据库服务
 import { Database } from "../database/database.js"
@@ -85,6 +85,7 @@ export interface Interface {
   // 仅解析会话使用的模型
   readonly resolveModel: (
     session: SessionSchema.Info,
+    request: { readonly kind: SessionRequestKind; readonly agent: Agent.ID },
   ) => Effect.Effect<SessionRunnerModel.Resolved, SessionRunnerModel.Error>
   /** Selects auxiliary title capabilities without instruction or tool preflight. */
   // 选择生成标题用的能力（跳过指令与工具预检）
@@ -125,17 +126,19 @@ const layer = Layer.effect(
     const store = yield* SessionStore.Service
     const registry = yield* Tool.Service
 
-    // 解析会话使用的模型（基于可用模型清单）
-    const resolveModel = (session: SessionSchema.Info) => models.resolve(session, model.available)
+    const resolveModel = (
+      session: SessionSchema.Info,
+      request: { readonly kind: SessionRequestKind; readonly agent: Agent.ID },
+    ) => models.resolve(session, model.available, request)
 
     // 选择标题生成能力：专用的 title agent + 尽量小/便宜的模型
     const selectTitle = Effect.fn("SessionContext.selectTitle")(function* (session: SessionSchema.Info) {
       // 获取内置的 title agent；不存在则无法生成标题
       const agent = yield* agents.get(Agent.ID.make("title"))
       if (!agent) return
-      // 先解析会话的主模型（失败则视为无主模型）
-      const primary = yield* resolveModel(session).pipe(Effect.orElseSucceed(() => undefined))
-      // 计算标题模型候选：agent 指定模型 > 供应商的小模型 > 主模型的更低推理档位
+      const primary = yield* resolveModel(session, { kind: "title", agent: agent.id }).pipe(
+        Effect.orElseSucceed(() => undefined),
+      )
       const candidate = yield* Effect.gen(function* () {
         // agent 显式指定了模型：取其详情与变体（缺省用最小推理档）
         if (agent.model) {
@@ -156,15 +159,17 @@ const layer = Layer.effect(
       // 校验候选模型确实可用（解析失败则回退）
       const preferred =
         candidate &&
-        (yield* resolveModel({
-          ...session,
-          model: Model.Ref.make({
-            providerID: candidate.info.providerID,
-            id: candidate.info.id,
-            ...(candidate.variant ? { variant: candidate.variant } : {}),
-          }),
-        }).pipe(Effect.orElseSucceed(() => undefined)))
-      // 最终选择：优先专用候选，否则用主模型
+        (yield* resolveModel(
+          {
+            ...session,
+            model: Model.Ref.make({
+              providerID: candidate.info.providerID,
+              id: candidate.info.id,
+              ...(candidate.variant ? { variant: candidate.variant } : {}),
+            }),
+          },
+          { kind: "title", agent: agent.id },
+        ).pipe(Effect.orElseSucceed(() => undefined)))
       const selected = preferred ?? primary
       // 没有任何可用模型：返回 undefined
       if (!selected) return
@@ -226,9 +231,7 @@ const layer = Layer.effect(
 
     // 加载阶段：为选择解析模型与活跃历史
     const load = Effect.fn("SessionContext.load")(function* (selection: Selection) {
-      // 解析模型
-      const model = yield* resolveModel(selection.session)
-      // 加载供运行器使用的历史条目（含初始指令渲染）
+      const model = yield* resolveModel(selection.session, { kind: "primary", agent: selection.agent.id })
       const history = yield* SessionHistory.entriesForRunner(
         db,
         selection.session.id,

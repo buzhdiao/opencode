@@ -9,9 +9,7 @@ import { Document, Info, type Entry } from "@opencode/schema/config"
 import { ConfigAgent } from "@opencode/schema/config/agent"
 // 导入 Node 的 path 模块。
 import path from "path"
-// 导入 Effect、Option 与 Schema 工具。
-import { Effect, Option, Schema } from "effect"
-// 导入运行时代理服务。
+import { Effect, Result, SchemaIssue, SchemaParser } from "effect"
 import { Agent } from "../../agent.js"
 // 导入配置服务。
 import { Config } from "../../config.js"
@@ -46,11 +44,9 @@ const legacySources = [
 // Keep in sync with the legacySources patterns and the name-strip regex in decode.
 // 与 legacySources 模式及 decode 中剥离目录名的正则保持同步。
 const sourceDirectories = ["agent", "agents", "mode", "modes"] as const
-// V2 代理模式的解码器。
-const decodeAgent = Schema.decodeUnknownOption(ConfigAgent.Info)
-// V1 旧版代理模式的解码器。
-const decodeLegacyAgent = Schema.decodeUnknownOption(ConfigAgentV1.Info)
-// 路径类权限动作类型：外部目录授权、读取、编辑。
+const decodeAgent = SchemaParser.decodeUnknownResult(ConfigAgent.Info)
+const decodeLegacyAgent = SchemaParser.decodeUnknownResult(ConfigAgentV1.Info)
+const formatIssue = SchemaIssue.makeFormatterDefault()
 type PathAction = FileAccess.ExternalDirectoryAuthorization["action"] | typeof ReadTool.name | typeof EditTool.name
 // 路径类动作的取值列表。
 const pathActions = ["external_directory", "read", "edit"] as const satisfies readonly PathAction[]
@@ -206,7 +202,7 @@ function expandHome(resource: string, home: string) {
 function discover(fs: FSUtil.Interface, directory: string) {
   return Effect.forEach(legacySources, (source) =>
     fs
-      .scan(source.pattern, { cwd: directory, absolute: true, dot: true, symlink: true })
+      .scan(source.pattern, { cwd: directory, absolute: true, dot: true, symlink: true, ignore: FSUtil.ignoreGlobs })
       .pipe(
         // 扫描结果排序并附上所在目录与是否主代理的标记。
         Effect.map((files) => files.toSorted().map((filepath) => ({ directory, filepath, primary: source.primary }))),
@@ -226,8 +222,10 @@ const decode = Effect.fnUntraced(function* (
 ) {
   // 解析 Markdown；失败则忽略该文件。
   const markdown = ConfigMarkdown.parseOption(content)
-  if (!markdown) return
-  // 计算代理名：相对目录路径，去掉 agent(s)/mode(s) 前缀与 .md 后缀。
+  if (!markdown) {
+    yield* Effect.logWarning("agent file skipped", { filepath: file.filepath, reason: "markdown" })
+    return
+  }
   const name = path
     .relative(file.directory, file.filepath)
     .replaceAll("\\", "/")
@@ -254,18 +252,21 @@ const decode = Effect.fnUntraced(function* (
     /^[^#]+$/.test(markdown.data.variant)
       ? { ...markdown.data, model: `${markdown.data.model}#${markdown.data.variant}` }
       : markdown.data
-  // 旧版走 V1 解码加迁移；新版直接按 V2 模式解码（正文作为 system）。
-  const agent = legacy
-    ? Option.getOrUndefined(
-        Option.map(
-          decodeLegacyAgent({ name, ...markdown.data, prompt: body }, { errors: "all" }),
-          ConfigMigrateV1.migrateAgent,
-        ),
+  const decoded = legacy
+    ? Result.map(
+        decodeLegacyAgent({ name, ...markdown.data, prompt: body }, { errors: "all" }),
+        ConfigMigrateV1.migrateAgent,
       )
-    : Option.getOrUndefined(decodeAgent({ ...data, system: body }, { errors: "all" }))
-  // 解码失败则忽略该文件。
-  if (!agent) return
-  // 组装只含该代理的配置信息；mode 目录下的文件强制为主代理。
+    : decodeAgent({ ...data, system: body }, { errors: "all" })
+  if (Result.isFailure(decoded)) {
+    yield* Effect.logWarning("agent file skipped", {
+      filepath: file.filepath,
+      reason: "frontmatter",
+      issue: formatIssue(decoded.failure),
+    })
+    return
+  }
+  const agent = decoded.success
   const info = Info.make({
     agents: { [name]: file.primary ? ConfigAgent.Info.make({ ...agent, mode: "primary" }) : agent },
   })

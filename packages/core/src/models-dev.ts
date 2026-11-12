@@ -11,7 +11,7 @@ import { MaxTokensField, MediaInput } from "@opencode/schema/model-compatibility
 import { ModelsDev } from "@opencode/schema/models-dev"
 // 导入 Money：按美元每百万 token 计的价格类型
 import { Money } from "@opencode/schema/money"
-// 导入 App 元数据服务：用于生成 User-Agent
+import { FreeformFormat } from "@opencode/schema/tool"
 import { App } from "./app.js"
 // 导入 Hash：快速哈希与 sha256，用于缓存键与内容摘要
 import { Hash } from "@opencode/util/hash"
@@ -115,7 +115,12 @@ type SourceCost = typeof SourceCost.Type
 const SourceApi = Schema.Struct({
   // API 的基础 URL（可为空字符串，表示无 URL）
   base_url: Schema.optional(Schema.String),
-  // SDK 入口点信息
+  capabilities: Schema.optional(
+    Schema.Struct({
+      // Format names this version doesn't know are skipped when the route is built.
+      tools: Schema.optional(Schema.Struct({ freeform: Schema.optional(Schema.Array(Schema.String)) })),
+    }),
+  ),
   sdk: Schema.optional(
     Schema.Struct({ aisdk: Schema.optional(Schema.String), opencodeai: Schema.optional(Schema.String) }),
   ),
@@ -227,7 +232,7 @@ const decodeContext = Schema.decodeUnknownOption(ContextCondition)
 const decodeMaxTokensField = Schema.decodeUnknownOption(MaxTokensField)
 // 媒体输入解码器（Option）
 const decodeMediaInput = Schema.decodeUnknownOption(MediaInput)
-// 状态字面量解码器（Option）：alpha/beta/deprecated
+const knownFreeformFormat = Schema.is(FreeformFormat)
 const decodeStatus = Schema.decodeUnknownOption(Schema.Literals(["alpha", "beta", "deprecated"]))
 
 // Snapshot：规范化后的目录快照——供应商信息、模型列表、环境变量名
@@ -244,7 +249,7 @@ export type Snapshot = {
 type Route = {
   // 提供商包名（@opencode/ai/providers/... 或 aisdk:xxx）
   readonly package: string
-  // 基础 URL（可选）
+  readonly freeform?: Model.Capabilities["freeform"]
   readonly baseURL?: string
   // 兼容性信息（可选）
   readonly compatibility?: Model.Compatibility
@@ -460,6 +465,7 @@ function route(providerID: Provider.ID, model: SourceModel, unknown: Set<string>
   return {
     // 包名
     package: packageName,
+    freeform: api.capabilities?.tools?.freeform?.filter(knownFreeformFormat),
     // An empty base_url is how models.dev says it has no URL for the API.
     // 自建 URL 的包或无 base_url 时不携带 baseURL；空字符串表示目录明确无 URL
     ...(BUILDS_OWN_URL.has(packageName) || !api.base_url ? {} : { baseURL: api.base_url }),
@@ -737,7 +743,7 @@ function modelInfo(
     capabilities: {
       // 工具调用支持
       tools: model.capabilities.tools.supported,
-      // 归并后的输入媒体类型
+      ...(source.route.freeform && { freeform: source.route.freeform }),
       input: modalities(model.modalities.input),
       // 归并后的输出媒体类型
       output: modalities(model.modalities.output),
@@ -885,9 +891,7 @@ export const layer = (options?: Options) =>
       const fs = yield* FSUtil.Service
       // 获取事件总线服务
       const bus = yield* Bus.Service
-      // 获取应用元数据（生成 User-Agent 用）
-      const app = yield* App.Metadata
-      // 获取键值存储服务
+      const app = yield* App.Service
       const kv = yield* KV.Service
       // 获取 HTTP 客户端并包装瞬时错误重试：最多 2 次、200ms 指数退避加抖动
       const http = (yield* HttpClient.HttpClient).pipe(

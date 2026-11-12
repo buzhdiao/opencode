@@ -12,7 +12,7 @@ export type Tool = {
   readonly name: string
   // 工具描述
   readonly description: string
-  // 调用签名（展示给模型的代码形态）
+  /** Read only for the tools the catalog shows. */
   readonly signature: string
   // 是否固定展示（pinned）：为 true 时始终进入摘要
   readonly pinned?: boolean
@@ -43,6 +43,7 @@ const Listing = Schema.Struct({
   // 渲染后的单行文本
   line: Schema.String,
 })
+export type Listing = typeof Listing.Type
 
 // 定义 NamespaceSummary 模式：单个命名空间的摘要
 const NamespaceSummary = Schema.Struct({
@@ -50,19 +51,16 @@ const NamespaceSummary = Schema.Struct({
   name: Schema.String,
   // 可选描述
   description: Schema.optionalKey(Schema.String),
-  // 该命名空间的工具总数
-  count: Schema.Number,
-  // 实际展示的条目列表
+  /** Every tool's path, so an update can tell a new tool from one that was not shown. */
+  tools: Schema.Array(Schema.String),
   entries: Schema.Array(Listing),
 })
+export type NamespaceSummary = typeof NamespaceSummary.Type
 
 // 导出 Summary 模式：整个清单的摘要（总数、展示数、各命名空间摘要）
 export const Summary = Schema.Struct({
   // 工具总数
   total: Schema.Number,
-  // 本次展示的工具数
-  shown: Schema.Number,
-  // 各命名空间的摘要数组
   namespaces: Schema.Array(NamespaceSummary),
 })
 // 导出 Summary 的类型别名
@@ -81,9 +79,8 @@ const CHARACTERS_PER_TOKEN = 4
 // 默认的内联预算：约 2000 token
 const INLINE_BUDGET = 2_000
 
-// Keep every namespace visible, then select full listings one per namespace per round,
-// considering shorter listings first until the inline budget is exhausted.
-// summarize：把完整清单压缩为摘要——保留所有命名空间行，再按"每轮各命名空间挑一条、短者优先"的规则挑选条目，直到预算耗尽
+// Keep every namespace visible, then select full listings one per namespace per round, in path order, until the
+// inline budget is exhausted. The selection depends only on the tools, and only selected signatures are rendered.
 export function summarize(inventory: Inventory, options: Options = {}): Summary {
   // 读取预算（未传时用默认值）
   const budget = options.budget ?? INLINE_BUDGET
@@ -101,45 +98,18 @@ export function summarize(inventory: Inventory, options: Options = {}): Summary 
     .map(([name, namespaceEntries]) => {
       // 取该命名空间的描述（若有）
       const description = flattened.namespaces.get(name)?.description
-      // 为组内每个工具生成展示行，并按路径排序
-      const listings = namespaceEntries
-        .map((entry) => {
-          // 取描述的第一行并去除首尾空白
-          const firstLine = entry.description.split("\n", 1)[0]?.trim() ?? ""
-          // 超过长度上限时截断并加省略号
-          const description =
-            firstLine.length > DESCRIPTION_LIMIT ? firstLine.slice(0, DESCRIPTION_LIMIT - 3) + "..." : firstLine
-          // 描述非空时拼出 " // 描述" 后缀
-          const suffix = description.length === 0 ? "" : ` // ${description}`
-          // 生成形如 "  - signature // 描述" 的展示行
-          return { path: entry.path, line: `  - ${entry.signature}${suffix}` }
-        })
-        .toSorted((left, right) => {
-          // 展示行按路径字典序排序
-          if (left.path < right.path) return -1
-          if (left.path > right.path) return 1
-          return 0
-        })
-      // 对排序后的展示行做"成本排名"（按行长度换算的 token 成本升序）
-      const ranked = rankListings(listings)
-      // 收集被 pinned 的工具对应的展示行集合
-      const pinned = new Set(
-        namespaceEntries
-          .filter((entry) => entry.pinned)
-          .map((entry) => listings.find((listing) => listing.path === entry.path))
-          .filter((listing) => listing !== undefined),
-      )
-      // 组装内部命名空间对象：含备选顺序、已选集合与选择游标
+      const sorted = namespaceEntries.toSorted((left, right) => {
+        if (left.path < right.path) return -1
+        if (left.path > right.path) return 1
+        return 0
+      })
       return {
         name,
         // 描述存在时才带上该字段
         ...(description === undefined ? {} : { description }),
-        listings,
-        // 候选顺序：成本排名中未被 pinned 的条目
-        selectionOrder: ranked.filter((candidate) => !pinned.has(candidate.listing)),
-        // 已选集合初始为 pinned 的条目
-        selectedListings: pinned,
-        // 选择游标：下一轮应取的候选下标
+        tools: sorted.map((entry) => entry.path),
+        selectionOrder: sorted.filter((entry) => !entry.tool.pinned),
+        selectedListings: sorted.filter((entry) => entry.tool.pinned).map(listing),
         selectionIndex: 0,
       }
     })
@@ -157,71 +127,68 @@ export function summarize(inventory: Inventory, options: Options = {}): Summary 
           namespaceLine({
             name: namespace.name,
             ...(namespace.description === undefined ? {} : { description: namespace.description }),
-            count: namespace.listings.length,
+            tools: namespace.tools,
             entries: [],
           }),
         ),
       0,
     ) -
     namespaces
-      .flatMap((namespace) => namespace.listings.filter((listing) => namespace.selectedListings.has(listing)))
+      .flatMap((namespace) => namespace.selectedListings)
       .reduce((total, listing) => total + cost(listing.line), 0)
   // 多轮挑选：每轮每个活跃命名空间尝试纳入一个候选
   while (active.size > 0) {
     // 遍历当前活跃的命名空间
     for (const namespace of active) {
-      // 取该命名空间的下一个候选
-      const candidate = namespace.selectionOrder[namespace.selectionIndex]
-      // 没有更多候选，或该候选成本超过剩余预算：本命名空间出局
-      if (!candidate || candidate.cost > remaining) {
+      const entry = namespace.selectionOrder[namespace.selectionIndex]
+      const candidate = entry && listing(entry)
+      if (!candidate || cost(candidate.line) > remaining) {
         active.delete(namespace)
         continue
       }
-      // 把候选加入已选集合
-      namespace.selectedListings.add(candidate.listing)
-      // 前进选择游标
+      namespace.selectedListings.push(candidate)
       namespace.selectionIndex += 1
-      // 扣减剩余预算
-      remaining -= candidate.cost
-      // 候选耗尽时把命名空间移出活跃集合
+      remaining -= cost(candidate.line)
       if (namespace.selectionIndex === namespace.selectionOrder.length) active.delete(namespace)
     }
   }
 
-  // 把内部命名空间对象映射为最终的 NamespaceSummary
-  const namespaceSummaries = namespaces.map((namespace) => ({
-    name: namespace.name,
-    // 描述存在时才携带
-    ...(namespace.description === undefined ? {} : { description: namespace.description }),
-    count: namespace.listings.length,
-    // entries 只包含最终被选中的展示行
-    entries: namespace.listings.filter((listing) => namespace.selectedListings.has(listing)),
-  }))
-  // 返回最终摘要：总数、展示数与各命名空间摘要
   return {
     total: flattened.tools.length,
-    shown: namespaceSummaries.reduce((total, namespace) => total + namespace.entries.length, 0),
-    namespaces: namespaceSummaries,
+    namespaces: namespaces.map((namespace) => ({
+      name: namespace.name,
+      ...(namespace.description === undefined ? {} : { description: namespace.description }),
+      tools: namespace.tools,
+      entries: namespace.selectedListings,
+    })),
   }
 }
 
-// 定义 flatten：把嵌套的 Tool/Namespace 树摊平为工具列表与"命名空间全名 -> 命名空间"映射
+/** Looks up any tool's listing as the catalog would show it. */
+export function lookup(inventory: Inventory) {
+  const tools = new Map(flatten(inventory.tools).tools.map((entry) => [entry.path, entry]))
+  return (path: string) => {
+    const entry = tools.get(path)
+    return entry === undefined ? undefined : listing(entry)
+  }
+}
+
+function listing(entry: { readonly path: string; readonly tool: Tool }) {
+  const firstLine = entry.tool.description.split("\n", 1)[0]?.trim() ?? ""
+  const description =
+    firstLine.length > DESCRIPTION_LIMIT ? firstLine.slice(0, DESCRIPTION_LIMIT - 3) + "..." : firstLine
+  const suffix = description.length === 0 ? "" : ` // ${description}`
+  return { path: entry.path, line: `  - ${entry.tool.signature}${suffix}` }
+}
+
 function flatten(entries: ReadonlyArray<Tool | Namespace>, path: ReadonlyArray<string> = []) {
-  // 累积的工具列表（path 为点分全路径）
-  const tools: Array<Omit<Tool, "name"> & { readonly path: string }> = []
-  // 累积的命名空间映射
+  const tools: Array<{ readonly path: string; readonly tool: Tool }> = []
   const namespaces = new Map<string, Namespace>()
   // 遍历每个条目
   for (const entry of entries) {
     // 工具条目：记录为带全路径的展示项
     if (entry.type === "tool") {
-      tools.push({
-        type: "tool",
-        path: [...path, entry.name].join("."),
-        description: entry.description,
-        signature: entry.signature,
-        ...(entry.pinned === undefined ? {} : { pinned: entry.pinned }),
-      })
+      tools.push({ path: [...path, entry.name].join("."), tool: entry })
       continue
     }
     // 命名空间条目：计算子路径全名并登记
@@ -238,37 +205,13 @@ function flatten(entries: ReadonlyArray<Tool | Namespace>, path: ReadonlyArray<s
   return { tools, namespaces }
 }
 
-// 导出 namespaceLine：渲染命名空间标题行，例如 "- fs (3 tools, 1 shown) // 描述"
-export function namespaceLine(namespace: typeof NamespaceSummary.Type) {
-  // 工具数文案：单数不带 s
-  const count = namespace.count === 1 ? "1 tool" : `${namespace.count} tools`
-  // 展示情况文案：全部展示 / 一个都没展示 / 部分展示
+export function namespaceLine(namespace: NamespaceSummary, shown = namespace.entries.length) {
+  const count = namespace.tools.length === 1 ? "1 tool" : `${namespace.tools.length} tools`
   const label =
-    namespace.entries.length === namespace.count
-      ? count
-      : namespace.entries.length === 0
-        ? `${count}, none shown`
-        : `${count}, ${namespace.entries.length} shown`
-  // 拼接标题行（有描述时追加 " // 描述"）
+    shown === namespace.tools.length ? count : shown === 0 ? `${count}, none shown` : `${count}, ${shown} shown`
   return `- ${namespace.name} (${label})${namespace.description === undefined ? "" : ` // ${namespace.description}`}`
 }
 
-// 定义 rankListings：把展示行按"成本（token 估算）升序、路径字典序次之"排名
-function rankListings(listings: ReadonlyArray<typeof Listing.Type>) {
-  return listings
-    // 为每行计算成本
-    .map((listing) => ({ listing, cost: cost(listing.line) }))
-    .toSorted((left, right) => {
-      // 先按成本升序
-      if (left.cost !== right.cost) return left.cost - right.cost
-      // 成本相同再按路径字典序
-      if (left.listing.path < right.listing.path) return -1
-      if (left.listing.path > right.listing.path) return 1
-      return 0
-    })
-}
-
-// 定义 cost：按"字符数 / 4"粗略估算文本的 token 数
-function cost(text: string) {
+export function cost(text: string) {
   return Math.round(text.length / CHARACTERS_PER_TOKEN)
 }

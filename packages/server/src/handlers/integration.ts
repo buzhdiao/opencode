@@ -1,8 +1,5 @@
 // 引入集成（Integration）核心服务：管理外部服务的发现、连接与授权
 import { Integration } from "@opencode/core/integration"
-// 引入插件（Plugin）服务：等待插件激活
-import { Plugin } from "@opencode/core/plugin"
-// 引入 Effect 运行时
 import { Effect } from "effect"
 // 引入 HTTP API 构建器与 Schema 工具（204 响应）
 import { HttpApiBuilder, HttpApiSchema } from "effect/http-api"
@@ -79,9 +76,6 @@ export const IntegrationHandler = HttpApiBuilder.group(Api, "server.integration"
         // 处理 integration.list：列出可用的集成（按策略过滤）
         "integration.list",
         Effect.fn(function* () {
-          // 等待插件激活完成（部分集成由插件提供）
-          yield* Plugin.awaitActivation
-          // 获取集成服务
           const service = yield* Integration.Service
           // 读取当前托管策略语句
           const current = yield* statements()

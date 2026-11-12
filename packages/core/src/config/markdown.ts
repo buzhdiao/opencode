@@ -32,10 +32,9 @@ export function parseOption(content: string) {
   }
 }
 
-// Other coding agents accept unquoted colons in frontmatter values. Retry
-// those values as YAML block scalars so existing config files keep working.
-// 其他编码代理允许 frontmatter 值中出现未加引号的冒号；这里把这些值改写为 YAML 块标量（block scalar）再重试，
-// 使旧配置文件继续可用。
+// Other coding agents accept unquoted colons and leading tags like `[Tag] text`
+// in frontmatter values. Retry those values as YAML block scalars so existing
+// config files keep working.
 export function sanitize(content: string) {
   // 匹配文件开头的 frontmatter 区块（--- 包围）。
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
@@ -55,9 +54,7 @@ export function sanitize(content: string) {
     const value = entry[2].trim()
     // 空值或已是块标量指示符/带引号的值无需处理。
     if (value === "" || value === ">" || value === "|" || value.startsWith('"') || value.startsWith("'")) return [line]
-    // 值中不含冒号时也无需处理。
-    if (!value.includes(":")) return [line]
-    // 把值改写为 YAML 块标量：`键: |-` 加两空格缩进的原文。
+    if (!value.includes(":") && !/^[[{].*[\]}]\s*\S/.test(value)) return [line]
     return [`${entry[1]}: |-`, `  ${value}`]
   })
   // 用处理后的行替换原 frontmatter 文本（回调形式可避免 $ 替换符被展开）。

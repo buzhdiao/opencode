@@ -232,22 +232,11 @@ export const Plugin = {
           // 工具执行体
           execute: (input, context) =>
             Effect.gen(function* () {
-              // Rules are matched against the URL that is requested, so `HTTPS://EVIL.COM` meets a rule for
-              // `https://evil.com/*`.
-              // 解析并规范化请求 URL：权限规则按请求的 URL 匹配
-              const url = yield* Effect.try({
-                try: () => {
-                  // 解析 URL 字符串
-                  const parsed = new URL(input.url)
-                  // 校验协议与凭据
-                  assertHttpUrl(parsed)
-                  // The fragment is never sent, and would keep a rule for the exact URL from matching.
-                  // 去掉 fragment（不会发送，但会妨碍精确 URL 规则匹配）
-                  parsed.hash = ""
-                  // 返回规范化后的 URL
-                  return parsed.href
-                },
-                // 解析/校验异常原样抛出
+              // Rules match the URL as written. The fragment is never sent, and would keep a rule for the exact
+              // URL from matching.
+              const url = input.url.split("#")[0]
+              yield* Effect.try({
+                try: () => assertHttpUrl(new URL(url)),
                 catch: (error) => error,
               })
 

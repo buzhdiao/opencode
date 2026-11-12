@@ -8,16 +8,12 @@ import { FileNotFoundError } from "@opencode/protocol/errors"
 import { Effect } from "effect"
 // 引入 HTTP 请求/响应工具
 import { type HttpServerRequest, HttpServerResponse } from "effect/http"
+import { ContentHeaders } from "../content-headers"
 
 // 允许内联（inline）展示的图片 MIME 类型集合；其余一律按附件下载
 const INLINE_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"])
 // 缓存策略：私有缓存一年且内容不可变（blob 以哈希寻址，内容永不变）
 const CACHE_CONTROL = "private, max-age=31536000, immutable"
-// 安全响应头：禁止 MIME 嗅探；CSP 仅允许沙箱（防止把媒体页当 HTML 执行）
-const SECURITY_HEADERS = {
-  "x-content-type-options": "nosniff",
-  "content-security-policy": "default-src 'none'; sandbox",
-}
 
 /** `media.get` in the `server.experimental` group; serves only blobs a message or inbox item still references. */
 /** 构造 `server.experimental` 分组的 `media.get` 处理器；仅提供仍被消息或收件项引用的媒体 blob */
@@ -41,8 +37,9 @@ export const makeMediaGet = Effect.gen(function* () {
       const headers = {
         "cache-control": CACHE_CONTROL,
         etag,
-        ...SECURITY_HEADERS,
-        ...(inline ? {} : { "content-disposition": "attachment" }),
+        "content-disposition": ContentHeaders.disposition(""),
+        "content-security-policy": ContentHeaders.CONTENT_SECURITY_POLICY,
+        "x-content-type-options": "nosniff",
       }
       // 客户端缓存命中（If-None-Match 匹配）时返回 304 Not Modified
       if (matchesIfNoneMatch(request.headers["if-none-match"], etag))

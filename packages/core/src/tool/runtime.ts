@@ -44,7 +44,7 @@ export const definition = (tool: Tool.Info<any, any>): ToolDefinition => ({
   description: tool.description,
   // 输入参数的 JSON Schema
   inputSchema: inputJsonSchema(tool.input),
-  // 有输出 Schema 时才附带输出 JSON Schema
+  ...(tool.freeform && { freeform: tool.freeform }),
   ...(tool.output === undefined ? {} : { outputSchema: outputJsonSchema(tool.output) }),
 })
 

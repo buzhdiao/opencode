@@ -182,40 +182,58 @@ const toolResult = (tool: SessionMessage.AssistantTool, providerMetadata: Provid
   }
 }
 
-// 把投影后的助手消息转为规范助手消息（含工具调用/结果部件）
+// Sessions migrated from V1 never recorded `time.ran`, so a completed call also counts as run.
+const ranTool = (item: SessionMessage.AssistantContent) =>
+  item.type === "tool" && (item.time.ran !== undefined || item.state.status === "completed")
+
 const assistant = (message: SessionMessage.Assistant, model: Model.Ref, providerMetadataKey: string) => {
   // 消息是否出自同一提供方
   const sameProvider = message.model.providerID === model.providerID
   // 是否同一模型（同提供方且同 ID）
   const sameModel = sameProvider && message.model.id === model.id
-  // 能否复用提供方绑定元数据：同一模型且消息没有错误
-  const reuseProviderMetadata = sameModel && message.error === undefined
-  // 是否存在被中断的推理部件（未完成）
-  const reasoningInterrupted = message.content.some(
-    (item) => item.type === "reasoning" && item.time !== undefined && item.time.completed === undefined,
-  )
-  // 逐部件转换
-  const content = message.content.flatMap((item): Array<AssistantMessage["content"][number]> => {
-    // 文本部件
+  // A failed stream is retried from what had already happened: the local calls that ran and everything
+  // before them. Cutting after a local call's result keeps the retried request from ending on an assistant
+  // reply; hosted calls after it are provider-side reads, so the retry can redo them.
+  const kept =
+    message.error === undefined || message.error.type === "aborted"
+      ? message.content
+      : message.content.slice(
+          0,
+          message.content.findLastIndex((item) => item.type === "tool" && item.executed !== true && ranTool(item)) + 1,
+        )
+  // A stream cut by Esc, a crash or a failure may end mid-block, so its last block's provider state is not
+  // replayed, and reasoning is only replayed once the model moved on to output. Calls it cut off before
+  // they ran are dropped; input errors stay so the model can reissue the call.
+  const cut = message.error !== undefined || message.finish === undefined
+  const tail = cut ? message.content.at(-1) : undefined
+  const items = cut
+    ? kept.filter(
+        (item) =>
+          item.type !== "tool" ||
+          ranTool(item) ||
+          (item.state.status === "error" && item.state.error.type.startsWith("tool.input")),
+      )
+    : kept
+  const content = items.flatMap((item, index): Array<AssistantMessage["content"][number]> => {
     if (item.type === "text")
       return [
         {
           type: "text",
           text: item.text,
-          // Text can carry provider-bound state (e.g. Gemini thought signatures),
-          // which is only replayable against the model that produced it.
-          // 文本可能携带提供方绑定的状态（如 Gemini 思考签名），
-          // 只有产出它的模型才能重放
-          providerMetadata: reuseProviderMetadata ? providerMetadata(providerMetadataKey, item.native) : undefined,
+          providerMetadata: sameModel && item !== tail ? providerMetadata(providerMetadataKey, item.native) : undefined,
         },
       ]
     // Let the destination adapter handle readable reasoning after a model/provider switch.
     // 推理部件：模型/提供方切换后交给目标适配器处理可读推理
     if (item.type === "reasoning") {
-      // 有错误或推理被中断时不发送推理
-      if (message.error !== undefined || reasoningInterrupted) return []
-      // 可复用元数据时附带原生状态重放
-      return reuseProviderMetadata
+      if (
+        cut &&
+        !items
+          .slice(index + 1)
+          .some((after) => after.type === "tool" || (after.type === "text" && after.text.trim() !== ""))
+      )
+        return []
+      return sameModel
         ? [
             {
               type: "reasoning",
@@ -231,17 +249,7 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
     // Call-side metadata is model-scoped proof of generation (Gemini thought
     // signatures, OpenAI encrypted reasoning): only the producing model may
     // replay it.
-    // 调用侧元数据是模型范围的生成凭证（Gemini 思考签名、OpenAI 加密推理）：
-    // 只有产出模型可以重放
-    const reuseToolProviderMetadata =
-      reuseProviderMetadata ||
-      (sameModel && item.executed === true && (item.state.status === "completed" || item.state.status === "error"))
-    // 构造工具调用部件（按规则决定是否附原生元数据）
-    const call = toolCall(
-      item,
-      reuseToolProviderMetadata ? providerMetadata(providerMetadataKey, item.native) : undefined,
-    )
-    // 非托管执行的调用只发调用部件
+    const call = toolCall(item, sameModel ? providerMetadata(providerMetadataKey, item.native) : undefined)
     if (item.executed !== true) return [call]
     // Hosted tools (e.g. google_search) run inside the provider, so their
     // native data is provider-format result data rather than model-scoped
@@ -254,19 +262,14 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
   })
   // 过滤出有意义的部件：非空文本；推理需非空或带可重放元数据
   const meaningful = content.filter((part) => {
-    // 空文本丢弃
-    if (part.type === "text") return part.text !== ""
-    // 非推理部件保留
+    if (part.type === "text") return cut ? part.text.trim() !== "" : part.text !== ""
     if (part.type !== "reasoning") return true
     // 推理：有文本或带元数据才保留
     return part.text !== "" || (part.providerMetadata !== undefined && Object.keys(part.providerMetadata).length > 0)
   })
-  // 非托管调用的结果部件：单独作为 tool 消息发送
-  const results = message.content
+  const results = items
     .filter((item): item is SessionMessage.AssistantTool => item.type === "tool" && item.executed !== true)
-    .map((item) =>
-      toolResult(item, reuseProviderMetadata ? providerMetadata(providerMetadataKey, item.native) : undefined),
-    )
+    .map((item) => toolResult(item, sameModel ? providerMetadata(providerMetadataKey, item.native) : undefined))
     .filter((message) => message !== undefined)
     .map(Message.tool)
   // 没有有意义内容时只返回结果消息

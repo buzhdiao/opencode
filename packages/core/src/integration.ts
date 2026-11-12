@@ -916,33 +916,9 @@ const layer = Layer.effect(
             .get()
             .integrations.get(credential.integrationID)
             ?.implementations.get(credential.value.methodID)?.refresh
-          // expiring：判断令牌是否会在 5 分钟内过期
-          const expiring = (value: Credential.OAuth) =>
-            Clock.currentTimeMillis.pipe(
-              Effect.map((now) => value.expires <= now + Duration.toMillis(Duration.minutes(5))),
-            )
-          // 无刷新实现或未临近过期：直接返回现值
-          if (!refresh || !(yield* expiring(credential.value))) return credential.value
-          // 临近过期：加凭据锁后刷新（避免并发重复刷新）
-          return yield* authorize(
-            credentials.lock(
-              credential.id,
-              Effect.gen(function* () {
-                // Another Location may have refreshed while this caller waited.
-                // 拿到锁后重新读取：其他 Location 可能已在等待期间刷新过
-                const current = yield* credentials.get(credential.id)
-                // 凭据消失或类型变了：返回 undefined
-                if (!current || current.value.type !== "oauth") return undefined
-                // 已不再临近过期：直接用现值
-                if (!(yield* expiring(current.value))) return current.value
-                // 调用刷新（最多 30 秒），成功后写回存储
-                const value = yield* refresh(current.value).pipe(Effect.timeout("30 seconds"))
-                yield* credentials.update(current.id, { value })
-                // 返回新令牌
-                return value
-              }),
-            ),
-          )
+          if (!refresh || !Credential.expiring(credential.value, yield* Clock.currentTimeMillis))
+            return credential.value
+          return yield* authorize(credentials.refresh(credential.id, { stale: Credential.expiring, refresh }))
         }),
         // key：保存密钥凭据
         key: Effect.fn("Integration.connection.key")(function* (input) {

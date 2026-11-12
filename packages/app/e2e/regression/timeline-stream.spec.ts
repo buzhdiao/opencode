@@ -784,49 +784,6 @@ test("holds undelivered input still while live status above it comes and goes", 
   await expect.poll(lane).toBe(36)
 })
 
-// 从完成的 shell notice 点击跳转到时间线里的原始调用并展开
-test("jumps from a finished shell's notice to its call", async ({ page }) => {
-  await setupTimeline(page, {
-    settings: { timelineDetail: detailed },
-    sessionMessages: [
-      userMessage(),
-      assistantMessage([
-        ...searches(0, 2),
-        toolPart(
-          "prt_notice_shell",
-          "shell",
-          "completed",
-          { command: "bun serve.ts" },
-          { output: "listening", metadata: { shellID: "shell_notice" } },
-        ),
-        ...searches(2, 2),
-        textPart("prt_notice_notes", notes("Later", 80)),
-      ]),
-      {
-        id: "msg_shell_finished",
-        type: "synthetic",
-        text: '<shell id="shell_notice" state="completed" command="bun serve.ts">\nlistening\n</shell>',
-        description: "bun serve.ts",
-        metadata: { source: "shell", shellID: "shell_notice", state: "completed" },
-        time: { created: 1700000003000 },
-      },
-    ],
-  })
-
-  const notice = page.getByRole("button", { name: /^Shell finished/ })
-  const shellTrigger = page.locator('[data-timeline-part-id="prt_notice_shell"] [data-slot="collapsible-trigger"]')
-
-  // notice 在视口内；原始调用的触发器此时不可见
-  await expect(notice).toBeInViewport()
-  await expect(shellTrigger).toHaveCount(0)
-  await notice.click()
-
-  // 点击后：调用展开并滚动到视口
-  await expect(shellTrigger).toHaveAttribute("aria-expanded", "true")
-  await expect(shellTrigger).toBeInViewport()
-})
-
-// Working 指示器行为测试组
 test.describe("Working", () => {
   test("shows Working between busy and reasoning states", async ({ page }) => {
     const timeline = await setupTimeline(page, {
@@ -1160,9 +1117,8 @@ test("grows a streaming row without a ResizeObserver loop error", async ({ page 
   expect(await page.evaluate(() => document.documentElement.dataset.resizeObserverLoops)).toBeUndefined()
 })
 
-// 后台快捷键测试组
-test.describe("background shortcut", () => {
-  test("offers a standalone running subagent to the background with Ctrl+B", async ({ page }) => {
+test.describe("background work", () => {
+  test("does not offer a running subagent to the background", async ({ page }) => {
     await setupTimeline(page, {
       settings: { timelineDetail: { ...detailed, subagents: { placement: "separate" } } },
       sessionMessages: [user, runningSubagent()],
@@ -1173,21 +1129,8 @@ test.describe("background shortcut", () => {
     await expect(card).not.toContainText("(background)")
     await expect(page.getByText("Called `subagent`", { exact: false })).toHaveCount(0)
     await expect(page.locator('[data-component="background-tool-control"]')).toHaveCount(0)
-    // 后台提示行可见（Ctrl+B），且与卡片左对齐、位于其下方
-    const hint = backgroundHint(page)
-    await expect(hint).toBeVisible()
+    await expect(backgroundHint(page)).toHaveCount(0)
     await expect(page.locator('[data-timeline-row="Thinking"]')).toHaveCount(0)
-    await expect
-      .poll(async () => {
-        const [cardBox, hintBox] = await Promise.all([card.boundingBox(), hint.boundingBox()])
-
-        if (!cardBox || !hintBox) return undefined
-
-        return { aligned: Math.abs(cardBox.x - hintBox.x) < 2, ordered: cardBox.y < hintBox.y }
-      })
-      .toEqual({ aligned: true, ordered: true })
-    // Ctrl+B 发出后台请求
-    await expectBackgroundRequest(page)
   })
 
   // 分组运行中的 read/shell：保持 Working 与快捷键
@@ -1285,7 +1228,9 @@ test.describe("background shortcut", () => {
       const capsule = page.getByRole("button", { name: "1 shell", exact: true, includeHidden: true })
       const list = page.getByRole("menu", { name: "1 shell", exact: true })
       const closed = (await capsule.boundingBox())!
-      const inset = (await capsule.locator('[data-component="session-progress-indicator-v2"]').boundingBox())!.x - closed.x
+
+      const inset =
+        (await capsule.locator('[data-component="session-progress-indicator-v2"]').boundingBox())!.x - closed.x
 
       await capsule.click()
       // Right placement shares the capsule's end edge and mirrors its inset there; centre placement shares its centre.
@@ -1318,8 +1263,7 @@ test.describe("background shortcut", () => {
   }) => {
     const childID = "ses_background_stale_call"
 
-    // As after a lost completion notice: the call still reads running, while the child session has finished.
-    // 模拟丢失完成通知后的状态：调用仍显示 running，而子会话其实已经结束
+    // The call records the launch; the child can finish without changing that metadata.
     const timeline = await setupTimeline(page, {
       settings: { timelineDetail: detailed },
       sessionMessages: [
@@ -1336,7 +1280,7 @@ test.describe("background shortcut", () => {
               name: "subagent",
               state: {
                 status: "completed",
-                input: { description: "Stale task", agent: "explore", background: true },
+                input: { description: "Stale task", agent: "explore" },
                 content: [{ type: "text", text: "working" }],
                 metadata: { sessionID: childID, status: "running" },
               },
@@ -1351,8 +1295,9 @@ test.describe("background shortcut", () => {
 
     const capsule = page.locator('[data-slot="session-activity-chip"]')
 
-    // 卡片带后台标注；子会话空闲时无活动胶囊
-    await expect(page.locator('[data-timeline-part-id="call_stale"]')).toContainText("Stale task (background)")
+    await expect(
+      page.locator('[data-timeline-part-id="call_stale"]').getByText("Stale task", { exact: true }),
+    ).toBeVisible()
     await expect(capsule).toHaveCount(0)
     // 子会话 busy：出现活动按钮；idle 后消失
     await timeline.transport.send(status("busy", 1, childID))
@@ -1361,10 +1306,8 @@ test.describe("background shortcut", () => {
     await expect(capsule).toHaveCount(0)
   })
 
-  // 阻塞中的工作与已后台化的工作分两行展示
-  test("separates blocking and already-backgrounded work into two rows", async ({ page }) => {
+  test("shows the shortcut for a blocking shell and lists background work in the capsule", async ({ page }) => {
     const backgroundID = "ses_background_existing"
-    const blockingID = "ses_background_blocking"
 
     const timeline = await setupTimeline(page, {
       settings: { timelineDetail: detailed },
@@ -1378,18 +1321,6 @@ test.describe("background shortcut", () => {
           content: [
             {
               type: "tool",
-              id: "call_backgrounded",
-              name: "subagent",
-              state: {
-                status: "completed",
-                input: { description: "Background task", agent: "explore" },
-                content: [{ type: "text", text: "working" }],
-                metadata: { sessionID: backgroundID, status: "running" },
-              },
-              time: { created: 2, completed: 3 },
-            },
-            {
-              type: "tool",
               id: "call_shell_backgrounded",
               name: "shell",
               state: {
@@ -1397,6 +1328,18 @@ test.describe("background shortcut", () => {
                 input: { command: "sleep 120" },
                 content: [{ type: "text", text: "working" }],
                 metadata: { shellID: "shell_backgrounded", status: "running" },
+              },
+              time: { created: 2, completed: 3 },
+            },
+            {
+              type: "tool",
+              id: "call_backgrounded",
+              name: "subagent",
+              state: {
+                status: "completed",
+                input: { description: "Background task", agent: "explore" },
+                content: [{ type: "text", text: "working" }],
+                metadata: { sessionID: backgroundID, status: "running" },
               },
               time: { created: 2, completed: 3 },
             },
@@ -1412,12 +1355,8 @@ test.describe("background shortcut", () => {
             {
               type: "tool",
               id: "call_blocking",
-              name: "subagent",
-              state: {
-                status: "running",
-                input: { description: "Foreground task", agent: "build" },
-                metadata: { sessionID: blockingID },
-              },
+              name: "shell",
+              state: { status: "running", input: { command: "sleep 10" }, metadata: { shellID: "shell_blocking" } },
               time: { created: 4 },
             },
           ],
@@ -1427,41 +1366,28 @@ test.describe("background shortcut", () => {
       sessions: [
         session(),
         session({ id: backgroundID, parentID: sessionID, title: "Background task", agent: "explore" }),
-        session({ id: blockingID, parentID: sessionID, title: "Foreground task", agent: "build" }),
       ],
       sessionStatus: {
         [sessionID]: { type: "busy" },
         [backgroundID]: { type: "busy" },
-        [blockingID]: { type: "busy" },
       },
+      shellCommands: [
+        { id: "shell_backgrounded", command: "sleep 120" },
+        { id: "shell_blocking", command: "sleep 10" },
+      ].map((shell) => ({
+        ...shell,
+        status: "running" as const,
+        cwd: directory,
+        shell: "bash",
+        file: `/tmp/${shell.id}.out`,
+        metadata: { sessionID },
+        time: { started: 2 },
+      })),
     })
 
-    // 注入 shell.created 事件（后台 shell 上线）
-    await timeline.transport.send({
-      id: "evt_background_shell_created",
-      created: 3,
-      type: "shell.created",
-      location: { directory },
-      data: {
-        info: {
-          id: "shell_backgrounded",
-          status: "running",
-          command: "sleep 120",
-          cwd: directory,
-          shell: "bash",
-          file: "/tmp/background.out",
-          metadata: { sessionID },
-          time: { started: 2 },
-        },
-      },
-    })
     const backgroundCard = page.locator('[data-timeline-part-id="call_backgrounded"]')
-    const blockingCard = page.locator('[data-timeline-part-id="call_blocking"]')
-    // 后台卡片带 (background)，阻塞卡片不带
     await expect(backgroundHint(page)).toBeVisible()
-    await expect(backgroundCard).toContainText("Background task (background)")
-    await expect(blockingCard).toContainText("Foreground task")
-    await expect(blockingCard).not.toContainText("(background)")
+    await expect(backgroundCard).toContainText("Background task")
 
     const used = page
       .locator('[data-timeline-part-ids="call_shell_backgrounded"]')
@@ -1469,21 +1395,18 @@ test.describe("background shortcut", () => {
 
     await expect(used).toHaveText(/^Used\s*1\s*Shell$/)
     await expect(used).toHaveAttribute("aria-expanded", "false")
-    const activity = page.getByRole("button", { name: "2 subagents · 1 shell", exact: true })
-    const list = page.getByRole("menu", { name: "2 subagents · 1 shell", exact: true })
+    const summary = "1 subagent · 1 shell"
+    const list = page.getByRole("menu", { name: summary, exact: true })
     // The open menu hides the rest of the page from the accessibility tree, the capsule included.
-    // 打开的菜单把页面其余部分从无障碍树隐藏，胶囊也在其中——所以 includeHidden
-    const capsule = page.getByRole("button", { name: "2 subagents · 1 shell", exact: true, includeHidden: true })
-    const label = capsule.getByText("2 subagents · 1 shell", { exact: true })
-    // 记录胶囊上图标与文本的几何基准
+    const capsule = page.getByRole("button", { name: summary, exact: true, includeHidden: true })
+    const label = capsule.getByText(summary, { exact: true })
     const glyph = await capsule.locator('[data-component="session-progress-indicator-v2"]').boundingBox()
     const text = await label.boundingBox()
     const inset = glyph!.x - (await capsule.boundingBox())!.x
 
-    await activity.click()
-    // 面板打开：无分组标签/分隔线；胶囊自身隐藏，标签仍在（includeHidden）
+    await capsule.click()
     await expect(list.locator('[data-slot="menu-v2-group-label"], [data-slot="menu-v2-separator"]')).toHaveCount(0)
-    await expect(list.getByText("2 subagents · 1 shell", { exact: true })).toHaveCount(0)
+    await expect(list.getByText(summary, { exact: true })).toHaveCount(0)
     await expect(label).toBeVisible()
 
     // The panel opens above the capsule on its grid: row glyphs on the capsule's glyph, names and commands on its
@@ -1509,7 +1432,7 @@ test.describe("background shortcut", () => {
 
         return (
           panel!.y + panel!.height <= anchor!.y &&
-          rows.length === 3 &&
+          rows.length === 2 &&
           rows.every(
             ([left, start, end]) =>
               Math.abs(left - glyph!.x) < 0.5 &&
@@ -1521,8 +1444,6 @@ test.describe("background shortcut", () => {
       .toBe(true)
     await expect(list.getByRole("menuitem")).toHaveText([
       // The fixture starts every task near the epoch, so each row ends with an hours-long run time.
-      // 夹具把每个任务的开始时间都设得接近纪元，所以每行的运行时长都是小时级
-      /^Build\s*Foreground task\d+h \d{2}m$/,
       /^Explore\s*Background task\d+h \d{2}m$/,
       /^sleep 120\d+h \d{2}m$/,
     ])
@@ -1536,78 +1457,87 @@ test.describe("background shortcut", () => {
     // 中断前台子代理：等待中断请求
     const interrupt = page.waitForRequest(
       (request) =>
-        request.method() === "POST" && new URL(request.url()).pathname === `/api/session/${blockingID}/interrupt`,
+        request.method() === "POST" && new URL(request.url()).pathname === `/api/session/${backgroundID}/interrupt`,
     )
 
-    const foreground = list.getByRole("menuitem", { name: /Foreground task/ })
+    const subagent = list.getByRole("menuitem", { name: /Background task/ })
 
-    await foreground.hover()
-    await foreground.getByRole("button", { name: "Interrupt subagent", exact: true }).click()
+    await subagent.hover()
+    await subagent.getByRole("button", { name: "Interrupt subagent", exact: true }).click()
     await interrupt
     await expect(list).toBeVisible()
 
-    // 删除后台 shell：等待 DELETE 请求
-    const kill = page.waitForRequest(
-      (request) => request.method() === "DELETE" && new URL(request.url()).pathname === "/api/shell/shell_backgrounded",
-    )
+    const kill = await holdRoute(page, /\/api\/shell\/shell_backgrounded(\?|$)/, { method: "DELETE" })
+    const shellRow = list.getByRole("menuitem", { name: /sleep 120/ })
 
-    await list.getByRole("menuitem", { name: /sleep 120/ }).hover()
+    await shellRow.hover()
     await page.keyboard.press("Delete")
-    await kill
+    await kill.arrived
+    // A second Delete, or a click on the row's stop button, while the first stop runs sends nothing more.
+    const stopping = shellRow.getByRole("button", { name: "Kill shell command", exact: true })
+    await expect(stopping).toHaveAttribute("aria-busy", "true")
+    await page.keyboard.press("Delete")
+    // aria-disabled leaves a real click through, which Playwright's actionability check would refuse.
+    await stopping.click({ force: true })
+    await expect(stopping).toHaveAttribute("aria-busy", "true")
+    expect(kill.requests).toHaveLength(1)
+    kill.release()
+    await expect(stopping).not.toHaveAttribute("aria-busy")
+    expect(kill.requests).toHaveLength(1)
     await page.keyboard.press("Escape")
     await expect(list).toHaveCount(0)
-    // 后台卡片仍显示后台状态与进度图标；展开 Used 后 shell 的 shimmer 重新激活
-    await expect(backgroundCard).toContainText("Background task (background)")
     await expect(backgroundCard.locator('[data-component="session-progress-indicator-v2"]')).toBeVisible()
     await used.click()
     await expect(
       page.locator('[data-timeline-part-id="call_shell_backgrounded"] [data-component="text-shimmer"]'),
     ).toHaveAttribute("data-active", "true")
 
-    // SAFETY: the transport forwards this payload unchanged, and the client marks a session idle from
-    // `type` and `data.sessionID` alone; the child session's event needs no durable metadata here.
-    // 传输层原样转发该载荷；客户端仅凭 `type` 与 `data.sessionID` 即可将会话置为 idle，
-    // 子会话事件在这里无需持久化元数据
-    await timeline.transport.send({
-      id: "evt_background_succeeded",
-      created: Date.now(),
-      type: "session.execution.succeeded",
-      data: { sessionID: backgroundID },
-    } as never)
+    await timeline.send(status("idle", 1, backgroundID))
     await expect(backgroundCard.locator('[data-component="session-progress-indicator-v2"]')).toHaveCount(0)
-    await expect(backgroundCard).toContainText("Background task (background)")
+    await expect(backgroundCard).toContainText("Background task")
   })
 
   // 展开的调用应停在卡住的分组头下方（三种初始滚动位置）
   for (const fixture of [
     { name: "from far below", before: 40, searches: 40, after: 80 },
     // The collapsed timeline fits the viewport, so it only becomes scrollable once the group opens.
-    // 折叠时间线恰好占满视口，只有分组展开后才可滚动
-    { name: "that opens the last row", before: 0, searches: 40, after: 0 },
+    { name: "in an initially unscrollable timeline", before: 0, searches: 40, after: 0 },
     // Reaching the shell lands on the end of the timeline, which would otherwise follow new content again.
     // 到达 shell 时已位于时间线末尾，否则会继续跟随新内容滚动
     { name: "at the end of the timeline", before: 40, searches: 0, after: 0 },
   ]) {
-    // A starting subagent call is the pill's row that reveals its call; grouping subagents puts it inside the group.
-    // 处于开头的 subagent 调用是胶囊所在行上揭示其调用的入口；分组模式把它收进组内
-    test(`holds a revealed call ${fixture.name} just under its stuck group header`, async ({ page }) => {
+    test(`holds the call revealed by a shell notice ${fixture.name} just under its stuck group header`, async ({
+      page,
+    }) => {
       const timeline = await setupTimeline(page, {
-        settings: { timelineDetail: { ...detailed, subagents: { placement: "grouped" } } },
-        sessionStatus: { [sessionID]: { type: "busy" } },
-        messages: [
+        settings: { timelineDetail: detailed },
+        sessionMessages: [
           userMessage(),
-          assistantMessage(
-            [
-              ...(fixture.before ? [textPart("prt_earlier", notes("Earlier", fixture.before))] : []),
-              ...searches(0, 42 - fixture.searches),
-              toolPart("prt_far_call", "subagent", "running", { description: "Map the far code", agent: "explore" }),
-              // The open group outgrows the viewport, so aligning the group instead of the call misses it.
-              // 展开的分组超出视口，因此对齐分组（而非调用本身）会错过它
-              ...searches(42 - fixture.searches, fixture.searches),
-              ...(fixture.after ? [textPart("prt_follow_up", notes("Follow-up", fixture.after))] : []),
-            ],
-            { completed: false },
-          ),
+          assistantMessage([
+            ...(fixture.before ? [textPart("prt_earlier", notes("Earlier", fixture.before))] : []),
+            ...searches(0, 42 - fixture.searches),
+            toolPart(
+              "prt_far_call",
+              "shell",
+              "completed",
+              { command: "bun serve.ts" },
+              {
+                output: "listening",
+                metadata: { shellID: "shell_notice", status: "running" },
+              },
+            ),
+            // The open group outgrows the viewport, so aligning the group instead of the call misses it.
+            ...searches(42 - fixture.searches, fixture.searches),
+            ...(fixture.after ? [textPart("prt_follow_up", notes("Follow-up", fixture.after))] : []),
+          ]),
+          {
+            id: "msg_1002_shell_finished",
+            type: "synthetic",
+            text: '<shell id="shell_notice" state="completed" command="bun serve.ts">\nlistening\n</shell>',
+            description: "bun serve.ts",
+            metadata: { source: "shell", shellID: "shell_notice", state: "completed" },
+            time: { created: 1700000003000 },
+          },
         ],
       })
 
@@ -1627,31 +1557,26 @@ test.describe("background shortcut", () => {
           })
           .toBe(0)
 
-      // 初始视口停在远处（或分组本身）
-      await expect(
-        fixture.after ? page.getByText(`Follow-up note ${fixture.after}.`, { exact: true }) : group,
-      ).toBeInViewport()
+      const notice = page.getByRole("button", { name: /^Shell finished/ })
+      await expect(notice).toBeInViewport()
       await expect(call).toHaveCount(0)
-      // 从活动菜单跳转到该调用：分组展开、调用进入视口
-      await page.getByRole("button", { name: "1 subagent", exact: true }).click()
-      await page
-        .getByRole("menu", { name: "1 subagent", exact: true })
-        .getByRole("menuitem", { name: /Map the far code/ })
-        .click()
+      await notice.click()
 
       await expect(group).toHaveAttribute("aria-expanded", "true")
-      await expect(call).toBeInViewport()
+      const trigger = call.locator('[data-slot="collapsible-trigger"]')
+      await expect(trigger).toHaveAttribute("aria-expanded", "true")
+      await expect(trigger).toBeInViewport()
 
       // A call at the very end cannot rise under the header until more content arrives below it.
       // 位于末尾的调用只有在下方有更多内容后才可能升到分组头之下
       if (fixture.searches) await aligned()
       // Nothing covers the row, so it takes the next click.
-      // 行未被遮挡，下一次点击可以命中
-      await call.click({ trial: true })
+      await trigger.click({ trial: true })
 
       // The agent keeps writing below the call; the call stays where it was revealed.
-      // 代理继续在下方写入；调用保持在揭示位置不动
-      await timeline.send(partUpdated(textPart("prt_late", notes("Late", 30))))
+      const late = assistantMessage([], { id: "msg_1003_late", completed: false, created: 1700000004000 })
+      await timeline.send(stepStarted(late))
+      await timeline.send(partUpdated({ id: "prt_late", messageID: late.id, type: "text", text: notes("Late", 30) }))
       await expect(page.getByText("Late note 30.", { exact: true })).toBeAttached()
       await aligned()
     })
@@ -3556,6 +3481,8 @@ test("opens an optional comment beside the quote action and skips it with Alt-cl
   await page.keyboard.press("Enter")
   await expect(comment).toHaveCount(0)
   await expect(chips.nth(0)).toContainText("Why first?")
+  // The editor takes focus back a frame after the comment closes, and its caret would replace the next selection.
+  await expect(editor).toBeFocused()
 
   // 第二条引用：无评论直接提交
   await select("The second sentence to quote.")

@@ -14,29 +14,23 @@ import path from "path"
 // 导入配置服务。
 import { Config } from "../../config.js"
 
-/**
- * Runs `reload` on every `config.updated`. The returned `entries` always reads the current config, so a reload that
- * runs before the event arrives already sees the change.
- */
-// 基础观察：每次 config.updated 事件都会运行 reload；返回的 entries 始终读取当前配置，
-// 因此先于事件执行的 reload 也能看到变更。
 export const observe = Effect.fnUntraced(function* (
   config: Config.Interface,
   event: EventDomain,
   reload: Effect.Effect<void>,
 ) {
-  // 订阅 config.updated 事件，每收到一次就执行一次 reload。
+  const loaded = { entries: yield* config.entries() }
+  const refresh = config.entries().pipe(
+    Effect.tap((entries) => Effect.sync(() => (loaded.entries = entries))),
+    Effect.andThen(reload),
+  )
   yield* event.subscribe({ types: ["config.updated"] }).pipe(
-    Stream.runForEach(() => reload),
-    // 在后台 fiber 上立即启动。
+    Stream.runForEach(() => refresh),
     Effect.forkScoped({ startImmediately: true }),
   )
-  // 返回条目访问器：惰性读取当前配置快照。
-  return {
-    get entries() {
-      return config.snapshot()
-    },
-  }
+  // Close the race between the first read and establishing the subscription.
+  loaded.entries = yield* config.entries()
+  return loaded
 })
 
 /**

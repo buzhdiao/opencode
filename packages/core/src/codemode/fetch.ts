@@ -28,23 +28,14 @@ type Init = {
 // 定义 fetch：受权限约束、跟随重定向并复用 webfetch 规则的 HTTP 请求
 const fetch = (input: string | URL, init: Init = {}) =>
   Effect.gen(function* () {
-    // Rules are matched against the URL that is requested, so `HTTPS://EVIL.COM` meets a rule for `https://evil.com/*`.
-    // 解析请求 URL（规则匹配基于最终请求的 URL，大小写不敏感）
-    const parsed = URL.parse(String(input))
-    // 解析失败则报无效 URL
-    if (parsed === null) return yield* Effect.fail(new TypeError(`fetch received an invalid URL: ${String(input)}`))
-    // 禁止 file: 协议：fetch 不允许访问本地文件系统
-    if (parsed.protocol === "file:") return yield* Effect.fail(new Error("fetch cannot be used for filesystem access."))
+    // Rules match the URL as written. The fragment is never sent, and would keep a rule for the exact URL from
+    // matching.
+    const url = String(input).split("#")[0]
+    const parsed = URL.parse(url)
+    if (parsed?.protocol === "file:") return yield* Effect.fail(new Error("fetch cannot be used for filesystem access."))
     // Rules match the URL, so `https://user@evil.com` would slip past a rule for `https://evil.com/*`.
-    // 禁止 URL 内嵌凭据：否则可能绕过基于 URL 的规则匹配
-    if (parsed.username || parsed.password)
+    if (parsed?.username || parsed?.password)
       return yield* Effect.fail(new TypeError("fetch cannot be used with credentials in the URL."))
-    // The fragment is never sent, and would keep a rule for the exact URL from matching.
-    // 清掉锚点（fragment）：片段不会随请求发送，保留它反而会让精确 URL 规则失配
-    parsed.hash = ""
-    // 取规范化后的完整 URL 字符串
-    const url = parsed.href
-    // 取当前 Code Mode 执行上下文服务
     const execution = yield* CodeModeExecution.Service
     // 取权限服务
     const permission = yield* Permission.Service
@@ -57,7 +48,7 @@ const fetch = (input: string | URL, init: Init = {}) =>
         action: "webfetch",
         resources: [url],
         save: ["*"],
-        metadata: display([url, init]),
+        metadata: display([input, init]),
         sessionID: execution.sessionID,
         agent: execution.agent,
         source,

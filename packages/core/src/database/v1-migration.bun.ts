@@ -1,5 +1,4 @@
-// 把本模块以命名空间形式整体导出为 V1Migration，供其他模块按 V1Migration.xxx 引用
-export * as V1Migration from "./v1-migration.js"
+export * as V1Migration from "./v1-migration.bun.js"
 
 // 导入 effect 核心构件：Cause（错误原因）、Effect（效果运行时）、Fiber（纤程）、
 // Layer（服务层）、Option（可选值）、Schema（数据校验）、Semaphore（信号量）

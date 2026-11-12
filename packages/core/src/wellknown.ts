@@ -88,9 +88,10 @@ export interface Interface {
   /** Resolves and caches the configuration for a registered source. */
   // 解析某个已注册源的配置并缓存结果
   readonly resolve: (entry: Entry, variables: Readonly<Record<string, string>>) => Effect.Effect<Config[], Error>
-  /** Returns the last configuration resolved for an origin, kept until the source is removed. */
-  // 返回某源最后一次解析出的配置（在源被移除前一直保留）
+  /** Returns the last configuration resolved for an origin, kept until it is cleared or the source is removed. */
   readonly cached: (origin: string) => Effect.Effect<Config[]>
+  /** Drops the last configuration resolved for an origin while keeping the source registered. */
+  readonly clearCached: (origin: string) => Effect.Effect<void>
 }
 
 // 定义 Effect 服务（Service）标记类：以 "@opencode/WellKnown" 为标签，承载上面的 Interface
@@ -346,6 +347,9 @@ const layer = Layer.effect(
         const value = yield* kv.get(configKey(origin))
         // 校验为数组结构后返回副本，否则返回空数组
         return Schema.is(Configs)(value) ? [...value] : []
+      }),
+      clearCached: Effect.fn("WellKnown.clearCached")(function* (origin) {
+        yield* kv.remove(configKey(origin))
       }),
     })
   }),

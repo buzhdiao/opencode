@@ -3,9 +3,20 @@ export * as Job from "./job.js"
 
 // 从 drizzle-orm 引入查询辅助：asc(升序)、eq(等于)、or(或条件)
 import { asc, eq, or } from "drizzle-orm"
-// 从 effect 引入 Array(数组工具)、Cause(错误原因)、Clock、Context、Deferred、Effect、Exit、Layer、Schema、Scope、SynchronizedRef(同步引用)
-import { Array, Cause, Clock, Context, Deferred, Effect, Exit, Layer, Schema, Scope, SynchronizedRef } from "effect"
-// 引入全局节点构造器
+import {
+  Array,
+  Cause,
+  Clock,
+  Context,
+  Deferred,
+  Effect,
+  Exit,
+  Layer,
+  Ref,
+  Schema,
+  Scope,
+  SynchronizedRef,
+} from "effect"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 // 引入数据库服务
 import { Database } from "./database/database.js"
@@ -43,7 +54,24 @@ const Background = Schema.Struct({
 export type Background = typeof Background.Type
 export type Status = Background["status"]
 
-// 后台任务解码器：把未知数据解码为 Background，返回 Result 风格
+export type SubagentReportState =
+  | {
+      readonly mode: "background"
+      readonly notificationID: SessionMessage.ID
+      readonly recovery: Extract<Recovery, { kind: "subagent" }>
+      readonly startedAt: number
+    }
+  | { readonly mode: "none" }
+
+export type SubagentOutboxReport = {
+  readonly notificationID: SessionMessage.ID
+  readonly recovery: Extract<Recovery, { kind: "subagent" }>
+  readonly status: Exclude<Status, "running">
+  readonly output?: string
+  readonly error?: string
+  readonly startedAt?: number
+}
+
 const decodeBackground = Schema.decodeUnknownResult(Background)
 // 已完成任务在内存中的保留上限：25 条
 const COMPLETED_LIMIT = 25
@@ -68,15 +96,21 @@ type Active = {
   done: Deferred.Deferred<Info>
   backgrounded: Deferred.Deferred<Info>
   scope: Scope.Closeable
+  generation: number
   blockingSessions: Map<SessionSchema.ID, number>
   isBackgrounded: boolean
+  settling: boolean
   consumed: boolean
+  reported: boolean
+  cancelledByCaller: boolean
   recovery?: Recovery
+  cancel?: Effect.Effect<void>
 }
 
 // 服务内部状态：任务表（SynchronizedRef 保证并发安全）与所有者作用域
 type State = {
   jobs: SynchronizedRef.SynchronizedRef<Map<string, Active>>
+  generations: Ref.Ref<number>
   scope: Scope.Scope
 }
 
@@ -84,6 +118,7 @@ type State = {
 type FinishResult = {
   info?: Info
   done?: Deferred.Deferred<Info>
+  cancel?: Effect.Effect<void>
   scope?: Scope.Closeable
   generation?: Scope.Closeable
 }
@@ -94,8 +129,7 @@ type BackgroundResult = {
   backgrounded?: Deferred.Deferred<Info>
 }
 
-// start 的返回：仅快照（任务已在跑），或快照加新作用域（本次新启动）
-type StartResult = { info: Info } | { info: Info; scope: Scope.Closeable }
+type StartResult = { info: Info } | { info: Info; job: Active }
 
 // 阻塞等待所需的一组句柄：完成信号、后台信号与代际作用域
 type BlockWait = {
@@ -119,7 +153,11 @@ export type StartInput = {
   metadata?: Record<string, unknown>
   recovery?: Recovery
   notificationID?: SessionMessage.ID
+  background?: boolean
   run: Effect.Effect<string, unknown>
+  // Runs when the job is cancelled (`cancel`, `cancelSession`), before its work is interrupted. Teardown, such as
+  // a server shutdown, interrupts the work without it.
+  cancel?: Effect.Effect<void>
 }
 
 // 等待任务的输入：任务 ID 与可选超时毫秒数
@@ -163,6 +201,14 @@ export interface Interface {
   readonly runningBackground: Effect.Effect<readonly Recovery[]>
   readonly backgroundJobs: Effect.Effect<readonly JobList.Item[]>
   readonly completeBackground: (notificationID: SessionMessage.ID) => Effect.Effect<void>
+  /** Whether an explicit caller cancellation stopped this job (not shutdown teardown). */
+  readonly isCancelled: (id: string) => Effect.Effect<boolean>
+  readonly currentGeneration: (
+    id: string,
+  ) => Effect.Effect<{ readonly generation: number; readonly running: boolean } | undefined>
+  readonly prepareSubagentReport: (id: string, boundGeneration?: number) => Effect.Effect<SubagentReportState>
+  readonly recordSubagentReport: (report: SubagentOutboxReport) => Effect.Effect<void>
+  readonly deleteBackgroundRow: (notificationID: SessionMessage.ID) => Effect.Effect<void>
 }
 
 // 定义 Job 服务类：标识为 "@opencode/Job" 的上下文服务
@@ -243,6 +289,7 @@ export const make = Effect.gen(function* () {
   // 初始化内部状态：空任务表与所有者作用域
   const state: State = {
     jobs: yield* SynchronizedRef.make(new Map()),
+    generations: yield* Ref.make(0),
     scope: yield* Scope.Scope,
   }
 
@@ -303,42 +350,50 @@ export const make = Effect.gen(function* () {
       .pipe(Effect.orDie)
   })
 
-  // settle：任务运行效果退出后结算状态（完成/出错/取消），并通知等待者
-  const settle = Effect.fnUntraced(function* (id: string, scope: Scope.Closeable, exit: Exit.Exit<string, unknown>) {
-    // 记录完成时间
+  const settle = Effect.fnUntraced(function* (id: string, active: Active, exit: Exit.Exit<string, unknown>) {
     const completed_at = yield* Clock.currentTimeMillis
-    // 在任务表上做一次原子修改
+    const status: Exclude<Status, "running"> = Exit.isSuccess(exit)
+      ? "completed"
+      : Cause.hasInterruptsOnly(exit.cause)
+        ? "cancelled"
+        : "error"
+    const output = Exit.isSuccess(exit) ? exit.value : undefined
+    const error = Exit.isFailure(exit) ? errorText(exit.cause) : undefined
+    const terminal = (job: Active): Active => ({
+      ...job,
+      blockingSessions: new Map<SessionSchema.ID, number>(),
+      info: {
+        ...job.info,
+        status,
+        completed_at,
+        ...(output !== undefined ? { output } : {}),
+        ...(error !== undefined ? { error } : {}),
+      },
+    })
     const result = yield* SynchronizedRef.modifyEffect(
       state.jobs,
       Effect.fnUntraced(function* (jobs): Effect.fn.Return<readonly [FinishResult, Map<string, Active>]> {
         const job = jobs.get(id)
-        // 任务已不存在：无操作
-        if (!job) return [{}, jobs]
-        // 作用域代际不符（已被取代）：不结算
-        if (job.scope !== scope) return [{}, jobs]
-        // 已不是运行状态（重复结算）：只返回快照
-        if (job.info.status !== "running") return [{ info: snapshot(job) }, jobs]
-        // 根据退出结果判定状态：成功→completed，仅中断→cancelled，否则→error
-        const status: Exclude<Status, "running"> = Exit.isSuccess(exit)
-          ? "completed"
-          : Cause.hasInterruptsOnly(exit.cause)
-            ? "cancelled"
-            : "error"
-        // 构造更新后的任务记录：清空阻塞会话并写入状态/完成时间/输出或错误
-        const next = {
-          ...job,
-          blockingSessions: new Map<SessionSchema.ID, number>(),
-          info: {
-            ...job.info,
-            status,
-            completed_at,
-            ...(Exit.isSuccess(exit) ? { output: exit.value } : {}),
-            ...(Exit.isFailure(exit) ? { error: errorText(exit.cause) } : {}),
-          },
+        // Teardown (this registry closing) is not a terminal outcome: leave the job and its durable row running for
+        // the next server. The scope's own finalizer interrupts its observers. A cancel has already settled the job
+        // as cancelled before interrupting its work.
+        if (status === "cancelled" && active.scope.state._tag === "Closed") return [{}, jobs]
+        // A newer generation may already have replaced this one in the registry. Its waiters still
+        // need their deferred resolved and its scope closed, so never drop the settlement on the floor.
+        if (!job || job.scope !== active.scope) {
+          return [{ info: snapshot(terminal(active)), done: active.done, scope: active.scope }, jobs]
         }
-        // 取消的任务不写入持久表（取消通常伴随会话级清理）
-        if (status !== "cancelled") yield* persistBackground(next)
-        // 返回结算结果与更新后的任务表
+        if (job.info.status !== "running") return [{ info: snapshot(job) }, jobs]
+        const next = terminal(job)
+        if (job.consumed) {
+          const remaining = new Map(jobs)
+          remaining.delete(id)
+          return [{ info: snapshot(next), done: job.done, scope: job.scope }, remaining]
+        }
+        // A consumed job's notification row is gone; persisting here would resurrect it.
+        // A settling generation's row belongs to the settlement commit; leaving it alone keeps
+        // conflict-retained markers and late settlements consistent.
+        if (status !== "cancelled" && !job.settling && !job.consumed) yield* persistBackground(next)
         return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
       }),
     )
@@ -375,14 +430,17 @@ export const make = Effect.gen(function* () {
           state.jobs,
           Effect.fnUntraced(function* (jobs): Effect.fn.Return<readonly [StartResult, Map<string, Active>]> {
             const existing = jobs.get(input.id)
-            // 已有同 ID 任务在运行：返回其快照，不重复启动
-            if (existing?.info.status === "running") {
+            // A settling generation is already reporting; new work starts a fresh generation.
+            if (existing?.info.status === "running" && !existing.settling) {
               return [{ info: snapshot(existing) }, jobs]
             }
             // 从所有者作用域并行 fork 出本任务的作用域
             const scope = yield* Scope.fork(state.scope, "parallel")
-            // 构造新的活跃任务记录
-            const job = {
+            // Closing the registry interrupts the work without settling it; interrupt its observers too.
+            yield* Scope.addFinalizer(scope, Deferred.interrupt(done))
+            const notificationID =
+              input.notificationID ?? (input.background && input.recovery ? SessionMessage.ID.create() : undefined)
+            const job: Active = {
               info: {
                 id: input.id,
                 type: input.type,
@@ -390,27 +448,33 @@ export const make = Effect.gen(function* () {
                 status: "running" as const,
                 started_at,
                 metadata: input.metadata,
-                ...(input.notificationID ? { notificationID: input.notificationID } : {}),
+                ...(notificationID ? { notificationID } : {}),
               },
               done,
               backgrounded,
               scope,
+              generation: yield* Ref.updateAndGet(state.generations, (generation) => generation + 1),
               blockingSessions: new Map<SessionSchema.ID, number>(),
-              isBackgrounded: false,
+              isBackgrounded: input.background === true,
+              settling: false,
               consumed: false,
+              reported: false,
+              cancelledByCaller: false,
               recovery: input.recovery,
+              cancel: input.cancel,
             }
-            // 返回快照与新作用域，并把任务放入表
-            return [{ info: snapshot(job), scope }, new Map(jobs).set(input.id, job)]
+            // Background work becomes durable before its run is forked, so no drain can observe
+            // an unmarked period.
+            if (job.isBackgrounded) yield* persistBackground(job)
+            return [{ info: snapshot(job), job }, new Map(jobs).set(input.id, job)]
           }),
         )
-        // 新启动的任务才有作用域：fork 运行效果，结束后用 settle 结算
-        if ("scope" in result)
+        if ("job" in result)
           yield* restore(input.run).pipe(
             Effect.exit,
-            Effect.flatMap((exit) => settle(input.id, result.scope, exit)),
+            Effect.flatMap((exit) => settle(input.id, result.job, exit)),
             Effect.asVoid,
-            Effect.forkIn(result.scope, { startImmediately: true }),
+            Effect.forkIn(result.job.scope, { startImmediately: true }),
           )
         // 返回任务快照
         return result.info
@@ -597,22 +661,22 @@ export const make = Effect.gen(function* () {
         const next = {
           ...job,
           blockingSessions: new Map<SessionSchema.ID, number>(),
+          cancelledByCaller: persist,
           info: {
             ...job.info,
             status: "cancelled" as const,
             completed_at,
           },
         }
-        // 需要时持久化
-        if (persist) yield* persistBackground(next)
-        // 返回结算结果并更新任务表
+        // Settling work owns its outbox row: the settlement commit writes or deletes it.
+        if (persist && !job.settling) yield* persistBackground(next)
         return [
-          { info: snapshot(next), done: job.done, scope: job.scope, generation: job.scope },
+          { info: snapshot(next), done: job.done, scope: job.scope, generation: job.scope, cancel: job.cancel },
           new Map(jobs).set(id, next),
         ]
       }),
     )
-    // 通知等待者任务已取消
+    if (result.cancel) yield* result.cancel
     if (result.info && result.done) yield* Deferred.succeed(result.done, result.info)
     // 关闭任务作用域（终止运行中的效果）
     if (result.scope) yield* Scope.close(result.scope, Exit.void)
@@ -676,7 +740,9 @@ export const make = Effect.gen(function* () {
   const runningBackground: Interface["runningBackground"] = SynchronizedRef.get(state.jobs).pipe(
     Effect.map((jobs) =>
       [...jobs.values()].flatMap((job) =>
-        job.isBackgrounded && job.info.status === "running" && job.recovery ? [job.recovery] : [],
+        job.isBackgrounded && job.info.status === "running" && !job.settling && !job.consumed && job.recovery
+          ? [job.recovery]
+          : [],
       ),
     ),
     Effect.withSpan("Job.runningBackground"),
@@ -690,9 +756,9 @@ export const make = Effect.gen(function* () {
         yield* db.delete(JobTable).where(eq(JobTable.notification_id, notificationID)).run().pipe(Effect.orDie)
         // 在内存中查找匹配通知 ID 的任务
         const entry = [...jobs].find(([, job]) => job.info.notificationID === notificationID)
-        // 不存在或仍在运行则保留
-        if (!entry || entry[1].info.status === "running") return jobs
-        // 否则从内存表删除
+        if (!entry) return jobs
+        // Still-running work keeps its entry, but must not persist its row again when it settles.
+        if (entry[1].info.status === "running") return new Map(jobs).set(entry[0], { ...entry[1], consumed: true })
         const next = new Map(jobs)
         next.delete(entry[0])
         return next
@@ -700,7 +766,88 @@ export const make = Effect.gen(function* () {
     ),
   )
 
-  // 返回服务实现：backgroundJobs 委托给 JobList.read
+  const currentGeneration: Interface["currentGeneration"] = Effect.fn("Job.currentGeneration")(function* (id) {
+    const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
+    if (!job) return undefined
+    return { generation: job.generation, running: job.info.status === "running" && !job.settling }
+  })
+
+  const isCancelled: Interface["isCancelled"] = Effect.fn("Job.isCancelled")(function* (id) {
+    return (yield* SynchronizedRef.get(state.jobs)).get(id)?.cancelledByCaller === true
+  })
+
+  const prepareSubagentReport: Interface["prepareSubagentReport"] = Effect.fn("Job.prepareSubagentReport")(
+    function* (id, boundGeneration) {
+      return yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [SubagentReportState, Map<string, Active>] => {
+        const job = jobs.get(id)
+        // A generation reports at most once, even when an earlier attempt only observed a cancel.
+        if (!job?.isBackgrounded || job.reported || !job.info.notificationID || job.recovery?.kind !== "subagent") {
+          return [{ mode: "none" }, jobs]
+        }
+        const live = job.info.status === "running" && !job.settling
+        // A cancel within this busy period already consumed the live entry, but it still belongs
+        // here. A creation-tick interruption never bound a generation, so any cancel matches.
+        const cancelled =
+          job.info.status === "cancelled" && (boundGeneration === undefined || job.generation === boundGeneration)
+        if (!live && !cancelled) return [{ mode: "none" }, jobs]
+        const updated: Active = {
+          ...job,
+          reported: true,
+          ...(job.info.status === "running" ? { settling: true } : {}),
+        }
+        const next = new Map(jobs).set(id, updated)
+        return [
+          {
+            mode: "background",
+            notificationID: job.info.notificationID,
+            recovery: job.recovery,
+            startedAt: job.info.started_at,
+          },
+          next,
+        ]
+      })
+    },
+  )
+
+  // Called from inside Bus.publish's BEGIN IMMEDIATE commit callback: pure SQL only, never state.jobs.
+  const recordSubagentReport: Interface["recordSubagentReport"] = Effect.fn("Job.recordSubagentReport")(
+    function* (report) {
+      const now = yield* Clock.currentTimeMillis
+      yield* db
+        .insert(JobTable)
+        .values({
+          notification_id: report.notificationID,
+          id: report.recovery.childSessionID,
+          session_id: report.recovery.parentSessionID,
+          child_session_id: report.recovery.childSessionID,
+          kind: "subagent",
+          title: report.recovery.description,
+          status: report.status,
+          output: report.output ?? null,
+          error: report.error ?? null,
+          recovery: report.recovery,
+          time_created: report.startedAt ?? now,
+          time_updated: now,
+        })
+        .onConflictDoUpdate({
+          target: JobTable.notification_id,
+          set: {
+            status: report.status,
+            output: report.output ?? null,
+            error: report.error ?? null,
+            recovery: report.recovery,
+            time_updated: now,
+          },
+        })
+        .run()
+        .pipe(Effect.orDie)
+    },
+  )
+
+  const deleteBackgroundRow: Interface["deleteBackgroundRow"] = Effect.fn("Job.deleteBackgroundRow")((notificationID) =>
+    db.delete(JobTable).where(eq(JobTable.notification_id, notificationID)).run().pipe(Effect.orDie, Effect.asVoid),
+  )
+
   return Service.of({
     get,
     start,
@@ -714,6 +861,11 @@ export const make = Effect.gen(function* () {
     runningBackground,
     backgroundJobs: JobList.read(db, state.jobs),
     completeBackground,
+    isCancelled,
+    currentGeneration,
+    prepareSubagentReport,
+    recordSubagentReport,
+    deleteBackgroundRow,
   })
 })
 

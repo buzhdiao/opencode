@@ -8,8 +8,7 @@ import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/http-api"
 // 引入本服务 API 定义
 import { Api } from "../api"
-// 引入 awaitPlugins（等待插件激活）与 response（响应包装）
-import { awaitPlugins, response } from "../location"
+import { response } from "../location"
 
 // 导出 UsageHandler：注册 "server.usage" 分组处理器
 export const UsageHandler = HttpApiBuilder.group(Api, "server.usage", (handlers) =>
@@ -18,10 +17,6 @@ export const UsageHandler = HttpApiBuilder.group(Api, "server.usage", (handlers)
       // 处理 usage.limits：查询用量限制信息
       "usage.limits",
       Effect.fn("server.usage.limits")(function* () {
-        // The OpenCode Console plugin registers the sign-in method that refreshes an expired credential.
-        // 等待插件激活：OpenCode Console 插件会注册登录方法，用于刷新过期的凭证
-        yield* awaitPlugins
-        // 获取用量限制服务
         const limits = yield* UsageLimits.Service
         return yield* response(
           limits.get().pipe(

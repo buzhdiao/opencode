@@ -363,8 +363,7 @@ export const layer = Layer.effect(
     // 注入插件钩子、模型传输服务与应用元数据
     const hooks = yield* PluginHooks.Service
     const transport = yield* SessionModelTransport.Service
-    const app = yield* App.Metadata
-    // prepare：通用的请求准备流程（各流程通过 shape 回调差异化）
+    const app = yield* App.Service
     const prepare = Effect.fn("SessionModelRequest.prepare")(function* <
       S extends SessionRequest & { tools?: Definitions },
     >(kind: SessionRequestKind, input: Input, shape: (draft: SessionRequest, tools: Definitions) => Effect.Effect<S>) {
@@ -449,7 +448,11 @@ export const layer = Layer.effect(
         system: shaped.system,
         // 消息先剔除不支持的媒体，再对内联图片做体积裁剪
         messages: boundImages(unsupportedParts(shaped.messages, model.capabilities, model.model.provider)),
-        tools: Array.from(hooked, ([name, t]) => ({ ...t, name })),
+        tools: Array.from(hooked, ([name, t]) => ({
+          ...t,
+          name,
+          freeform: t.freeform && model.capabilities.freeform?.includes(t.freeform.type) ? t.freeform : undefined,
+        })),
         toolChoice: input.toolChoice,
         // 生成参数平铺进请求
         ...generation,

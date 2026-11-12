@@ -17,8 +17,7 @@ import {
 } from "@opencode/ai/effect"
 // Agent 的 Schema 类型（ID 等）。
 import type { Agent } from "@opencode/schema/agent"
-// Clock（时间）、Exit（结果）、Fiber（轻量线程）、Option、Stream（流）。
-import { Cause, Clock, Data, Effect, Exit, Fiber, Option, Stream } from "effect"
+import { Cause, Clock, Data, Deferred, Effect, Exit, Fiber, Option, Stream } from "effect"
 import { SessionError } from "@opencode/schema/session-error"
 // 事件总线。
 import { Bus } from "../../bus.js"
@@ -52,12 +51,10 @@ import { SessionRunnerRetry } from "./retry.js"
 export type Outcome = Data.TaggedEnum<{
   // Completed：正常完成；needsContinuation=还有工具结果要喂回。
   Completed: { readonly needsContinuation: boolean }
-  // Retry：未输出即失败，整体重试。
-  Retry: { readonly error: SessionError.Error; readonly decision: SessionRunnerRetry.Decision }
-  // Continue：已有部分输出后断流，续写。
-  Continue: {
+  Retry: {
     readonly error: SessionError.Error
     readonly decision: SessionRunnerRetry.Decision
+    readonly freshAssistant?: boolean
   }
   // RecoverFull：传输层要求整段重试。
   RecoverFull: {}
@@ -72,12 +69,18 @@ export const Outcome = Data.taggedEnum<Outcome>()
 // attempt 的输入参数。
 interface Input {
   readonly isLocationClosed: () => boolean
+  /** Why the execution is being interrupted, once it is: `"user"` when someone stopped it. */
+  readonly interruption?: () => "user" | "shutdown" | undefined
+  /** Whether this server is handing its process daemon over to the next one (see `PersistentPty.handoffPrepared`). */
+  readonly handoffPrepared?: () => boolean
   readonly sessionID: SessionSchema.ID
   readonly assistantMessageID: SessionMessage.ID
   readonly agent: Agent.ID
   readonly model: SessionRunnerModel.Resolved
   // prepared：请求钩子处理后的请求、选项、重试钩子与工具执行器。
   readonly prepared: Omit<SessionModelRequest.Prepared, "event">
+  /** Set when this attempt runs because an earlier one in the step scheduled a retry. */
+  readonly retryAttempt?: number
   readonly retry: (
     cause: AIError,
     error: SessionError.Error,
@@ -114,10 +117,14 @@ export const make = Effect.gen(function* () {
     // 记录开始时间（用于统计首 token 延迟等）。
     const started = yield* Clock.currentTimeMillis
     let firstOutputAt: number | undefined
-    // 给当前 span 打上 provider/model 注解（gen_ai.* 是 LLM 可观测性惯例字段）。
-    yield* Effect.annotateCurrentSpan({
+    const modelAttributes = {
       "gen_ai.provider.name": input.model.ref.providerID,
       "gen_ai.request.model": input.model.ref.id,
+    }
+    yield* Effect.annotateCurrentSpan({
+      ...modelAttributes,
+      "gen_ai.agent.name": input.agent,
+      ...(input.retryAttempt === undefined ? {} : { "opencode.retry.attempt": input.retryAttempt }),
     })
     // 创建事件发布器：把 provider 流事件翻译成 Bus 上的会话事件与消息更新。
     const publisher = createLLMEventPublisher(bus, {
@@ -134,11 +141,22 @@ export const make = Effect.gen(function* () {
     const toolRuns: Array<{
       readonly call: ToolCall
       readonly fiber: Fiber.Fiber<void, Permission.DeclinedError | QuestionTool.CancelledError>
+      readonly cancel: Cancel
     }> = []
     // interruptTools：中断所有还在跑的工具 fiber。
     const interruptTools = Effect.suspend(() => Fiber.interruptAll(toolRuns.map((run) => run.fiber)))
-    // 工具执行入口：步数上限（toolChoice=none）时直接报错；否则走 prepared.executeTool。
-    const executeTool = (call: ToolCall) => {
+    // A user's stop asks each tool awaiting `cancel` to stop and settle its own call, and interrupts every other
+    // tool. A tool that does not settle in time is interrupted too. Teardown interrupts every tool.
+    const stopTools = Effect.suspend(() => {
+      // A reloaded Location still serves the steps that borrow it, so its tools can stop on their own too.
+      const user = input.interruption?.() === "user"
+      const immediate = toolRuns.flatMap((run) => (user && run.cancel.trigger() ? [] : [run.fiber]))
+      return Fiber.interruptAll(immediate).pipe(
+        Effect.andThen(Fiber.awaitAll(toolRuns.map((run) => run.fiber)).pipe(Effect.timeoutOption(COOPERATIVE_STOP))),
+        Effect.flatMap((settled) => (Option.isSome(settled) ? Effect.void : interruptTools)),
+      )
+    })
+    const executeTool = (call: ToolCall, cancel: Cancel) => {
       if (input.prepared.request.toolChoice?.type === "none")
         return new Tool.Error({ message: "Tools are disabled after the maximum agent steps" })
       return input.prepared.executeTool({
@@ -148,17 +166,16 @@ export const make = Effect.gen(function* () {
         call,
         // progress 回调：工具运行中的元数据更新（如 bash 的输出流）。
         progress: (update) => publisher.progress(call.id, update),
+        cancel: cancel.effect,
       })
     }
 
     // Provider and tool fibers retain per-source order without a shared writer queue.
     // A local execution starts only after its Tool.Called publication completes.
     // Read to the end, not just the finish event, so the next request can reuse this response.
-    // 设计：provider 与各工具 fiber 各自保序发布（无需共享写队列）；本地工具
-    // 只在 Tool.Called 事件发布完成后才启动；流要读到末尾（而不仅是 finish
-    // 事件），下一次请求才能复用这次响应（缓存友好）。
+    // The span covers only the provider stream, so model time separates from tools, which run in this consumer.
     const providerStream = llm.stream(input.prepared.request, input.prepared.options).pipe(
-      // runForEach：逐事件处理，任一事件失败则整个流失败。
+      Stream.withSpan("LLM.stream", { attributes: modelAttributes }),
       Stream.runForEach((event) =>
         Effect.gen(function* () {
           // provider 已经失败过：丢弃后续残余事件。
@@ -173,11 +190,12 @@ export const make = Effect.gen(function* () {
             firstOutputAt = yield* Clock.currentTimeMillis
           // 只处理“本地执行”的工具调用：providerExecuted（服务端执行）的跳过。
           if (event.type !== "tool-call" || event.providerExecuted) return
-          // 为该工具调用 fork 一个 fiber：执行 → 截断输出 → 发布执行结果。
+          const cancel = makeCancel()
           toolRuns.push({
             call: event,
+            cancel,
             fiber: yield* Effect.uninterruptibleMask((restore) =>
-              restore(executeTool(event)).pipe(
+              restore(executeTool(event, cancel)).pipe(
                 Effect.flatMap(toolOutput.truncate),
                 Effect.flatMap((outcome) => publisher.toolExecution(event.id, event.name, outcome)),
                 Effect.catchTag("Tool.Error", (error) =>
@@ -213,13 +231,23 @@ export const make = Effect.gen(function* () {
           return yield* Effect.failCause(stream.cause)
         // 已产出过事件 → 通知发布器“流结束”。
         if (publisher.hasStarted()) yield* publisher.streamed()
-        // 流被中断 → 中断所有工具 fiber。
-        if (streamInterrupted) yield* interruptTools
-        // 等所有工具 fiber 结束（restore 窗口内可被中断）。
-        const joined = yield* restore(Fiber.awaitAll(toolRuns.map((run) => run.fiber))).pipe(Effect.exit)
-        if (Exit.isFailure(joined)) yield* interruptTools
-        // 分类工具结果：declines（用户拒绝）/ interrupted / failure。
-        const tools = classifyToolExits(joined, toolRuns)
+        if (streamInterrupted) yield* stopTools
+        const fibers = toolRuns.map((run) => run.fiber)
+        const joined = yield* restore(Fiber.awaitAll(fibers)).pipe(Effect.exit)
+        if (!streamInterrupted && Exit.isFailure(joined)) yield* stopTools
+        // Read each tool's exit once all have ended, so what they raised while stopping (a decline, a defect) counts.
+        const exits = Exit.isSuccess(joined) ? joined.value : yield* Fiber.awaitAll(fibers)
+        const tools = classifyToolExits(exits, toolRuns, Exit.hasInterrupts(joined))
+        // A server handing its process daemon over leaves the step as a crash would: unsettled calls and no step end.
+        // The next server settles them when the Session resumes, and takes over the shell commands still running for
+        // them. Any other interrupt settles the calls here.
+        if (
+          (streamInterrupted || tools.interrupted) &&
+          tools.declines.length === 0 &&
+          input.interruption?.() !== "user" &&
+          input.handoffPrepared?.() === true
+        )
+          return yield* Effect.interrupt
 
         // 一个字都没输出 + provider 判定上下文溢出 + runner 允许恢复 →
         // 返回 Compacted，由 runStep 压缩后重试。
@@ -261,6 +289,9 @@ export const make = Effect.gen(function* () {
           ...(tokens?.cacheReadInputTokens === undefined
             ? {}
             : { "gen_ai.usage.cache_read.input_tokens": tokens.cacheReadInputTokens }),
+          ...(tokens?.cacheWriteInputTokens === undefined
+            ? {}
+            : { "gen_ai.usage.cache_creation.input_tokens": tokens.cacheWriteInputTokens }),
           ...(llmFailure === undefined ? {} : { "error.type": llmFailure.reason._tag }),
         })
         // 传输层失败且可“整段重试”（如连接断在响应前）→ RecoverFull。
@@ -283,7 +314,7 @@ export const make = Effect.gen(function* () {
                 ),
               )
             : undefined
-        if (llmFailure && llmError && retry?.retry && !recorded.outputStarted) {
+        if (llmError && retry?.retry && !recorded.outputStarted) {
           // Retry state projects onto the existing assistant, even before it has produced output.
           // 重试状态投影到既有助手消息（哪怕它还没产出内容），保持 UI 连续。
           yield* publisher.startAssistant()
@@ -339,7 +370,7 @@ export const make = Effect.gen(function* () {
               : undefined
           // 记录 token/费用用量。
           const usage = record.finish ? SessionUsage.record(record.finish.usage, input.model.cost) : undefined
-          // 失败 → 发布 Step 失败事件；成功 → 发布 Step.Ended（含 finish 原因与用量）。
+          if (usage) yield* Effect.annotateCurrentSpan("opencode.usage.cost_usd", usage.cost)
           if (record.failure) yield* publisher.publishStepFailure({ ...usage, snapshot, files })
           if (record.finish && usage && !record.failure)
             yield* bus.publish(SessionEvent.Step.Ended, {
@@ -354,16 +385,8 @@ export const make = Effect.gen(function* () {
             })
         }
 
-        // 已有部分输出 + 决定重试 + 没有拒绝/中断 → Continue（续写而不是重放）。
-        if (
-          llmFailure &&
-          llmError &&
-          retry?.retry &&
-          record.outputStarted &&
-          tools.declines.length === 0 &&
-          !tools.interrupted
-        )
-          return Outcome.Continue({ error: llmError, decision: retry })
+        if (llmError && retry?.retry && tools.declines.length === 0 && !tools.interrupted)
+          return Outcome.Retry({ error: llmError, decision: retry, freshAssistant: true })
 
         // 流本身失败 → 原样上抛失败原因。
         if (Exit.isFailure(stream)) return yield* Effect.failCause(stream.cause)
@@ -402,12 +425,11 @@ const isInterruptedStream = (failure: AIError) => {
 // - interrupted：任意 fiber 带中断标记。
 // - failure：第一个真实的 Die（不可恢复异常）原因。
 const classifyToolExits = (
-  settled: Exit.Exit<Array<Exit.Exit<void, Permission.DeclinedError | QuestionTool.CancelledError>>>,
+  exits: ReadonlyArray<Exit.Exit<void, Permission.DeclinedError | QuestionTool.CancelledError>>,
   runs: ReadonlyArray<{ readonly call: ToolCall }>,
+  // The step was interrupted while it waited for its tools.
+  interruptedWhileWaiting: boolean,
 ) => {
-  // 外层 awaitAll 成功才有内层结果数组。
-  const exits = Exit.isSuccess(settled) ? settled.value : []
-  // 收集每个失败 fiber 的失败原因（连同对应的工具调用）。
   const declines = exits.flatMap((exit, index) =>
     Exit.isFailure(exit)
       ? exit.cause.reasons.flatMap((reason) =>
@@ -415,11 +437,7 @@ const classifyToolExits = (
         )
       : [],
   )
-  // 汇总所有失败 cause（外层失败或内层任一失败）。
-  const causes = Exit.isFailure(settled)
-    ? [settled.cause]
-    : exits.flatMap((exit) => (Exit.isFailure(exit) ? [exit.cause] : []))
-  // 找第一个含 Die（崩溃类错误）的 cause 作为失败代表。
+  const causes = exits.flatMap((exit) => (Exit.isFailure(exit) ? [exit.cause] : []))
   const failure = causes
     .flatMap((cause) => {
       if (Cause.hasInterrupts(cause)) return []
@@ -427,5 +445,39 @@ const classifyToolExits = (
       return reasons.length > 0 ? [Cause.fromReasons<never>(reasons)] : []
     })
     .at(0)
-  return { interrupted: causes.some(Cause.hasInterrupts), declines, failure }
+  return { interrupted: interruptedWhileWaiting || causes.some(Cause.hasInterrupts), declines, failure }
+}
+
+// How long a user's stop waits for the tools it asked to stop before interrupting them.
+const COOPERATIVE_STOP = "5 seconds"
+
+type Cancel = ReturnType<typeof makeCancel>
+
+/**
+ * A tool call's `cancel`. `trigger` completes it, and reports whether the tool was awaiting it, so would stop on its
+ * own; a tool that was not is interrupted instead.
+ */
+export const makeCancel = () => {
+  let listeners = 0
+  let cancelled = false
+  const gate = Deferred.makeUnsafe<void>()
+  return {
+    effect: Effect.suspend(() => {
+      if (cancelled) return Effect.void
+      listeners++
+      return Deferred.await(gate).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            listeners--
+          }),
+        ),
+      )
+    }),
+    trigger: () => {
+      cancelled = true
+      if (listeners === 0) return false
+      Deferred.doneUnsafe(gate, Exit.void)
+      return true
+    },
+  }
 }

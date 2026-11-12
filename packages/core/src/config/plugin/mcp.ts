@@ -3,9 +3,7 @@ export * as ConfigMcpPlugin from "./mcp.js"
 
 // 导入插件定义工具。
 import { define } from "@opencode/plugin/effect/plugin"
-// 导入配置文档类型。
-import { Document } from "@opencode/schema/config"
-// 导入 MCP 服务器配置类型。
+import { Document, type Entry } from "@opencode/schema/config"
 import type { ServerConfig } from "@opencode/schema/mcp"
 // 导入 Effect 与流工具。
 import { Effect, Stream } from "effect"
@@ -32,13 +30,18 @@ export const register = Effect.fn("ConfigMCPPlugin.register")(function* (
   const config = yield* Config.Service
   // 获取 MCP 服务。
   const mcp = yield* Mcp.Service
+  const loaded = { entries: [] as Entry[] }
 
   // 过滤出 config.updated 事件。
   yield* events.pipe(
     Stream.filter((event) => event.type === "config.updated"),
     // 每次事件触发 MCP 重载（失败记错误日志）。
     Stream.runForEach(() =>
-      mcp.reload().pipe(Effect.catchCause((cause) => Effect.logError("failed to reload MCP config", { cause }))),
+      config.entries().pipe(
+        Effect.tap((entries) => Effect.sync(() => (loaded.entries = entries))),
+        Effect.andThen(mcp.reload()),
+        Effect.catchCause((cause) => Effect.logError("failed to reload MCP config", { cause })),
+      ),
     ),
     // 忽略整个流的错误。
     Effect.ignore,
@@ -46,11 +49,10 @@ export const register = Effect.fn("ConfigMCPPlugin.register")(function* (
     Effect.forkScoped({ startImmediately: true }),
   )
 
-  // Read at reload time, so a reload right after a config change sees it before `config.updated` arrives.
-  // 应用初始配置：在重载时刻读取快照，紧随配置变更的重载能先于 config.updated 事件看到新值。
+  // Subscribe before the initial load so updates racing it trigger a rebuild.
+  loaded.entries = yield* config.entries()
   yield* mcp.transform((editor) => {
-    // 取当前配置快照中的文档条目。
-    const documents = config.snapshot().filter((entry): entry is Document => entry.type === "document")
+    const documents = loaded.entries.filter((entry): entry is Document => entry.type === "document")
     // Global timeout defaults merge in config order; each server can override them.
     // 按配置顺序合并各文档的全局超时默认值；每台服务器可再覆盖。
     const timeout = Object.assign(

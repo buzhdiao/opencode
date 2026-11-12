@@ -75,7 +75,12 @@ const cleanup = Effect.fn("ToolOutput.cleanup")(function* (fs: FSUtil.Interface,
   )
 })
 
-// 构建服务层
+// The system error message ("ENOSPC: no space left on device, write") without the stack or wrapper text.
+const describe = (error: FSUtil.Error) => {
+  const cause = error._tag === "PlatformError" ? error.reason.cause : error.cause
+  return cause instanceof Error ? cause.message.split("\n")[0] : error.message
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -106,51 +111,47 @@ const layer = Layer.effect(
       if (result.metadata?.truncated !== undefined) return result
       // 原始内容块
       const content = result.content
-      // 拼接全部文本块
-      const text = content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n")
-      // 读取当前限制
+      // A line break joins text parts unless the text before already ends in one.
+      const text = content.reduce(
+        (joined, item) =>
+          item.type !== "text"
+            ? joined
+            : joined === "" || joined.endsWith("\n")
+              ? joined + item.text
+              : `${joined}\n${item.text}`,
+        "",
+      )
       const limits = state.get()
-      // 按行拆分
-      const lines = text.split("\n")
-      // 末尾换行产生的空行不计入
-      if (text.endsWith("\n")) lines.pop()
-      // 全文的 UTF-8 字节数
-      const totalBytes = Buffer.byteLength(text, "utf-8")
-      // 未超限：仅补上 truncated=false 标记
-      if (lines.length <= limits.maxLines && totalBytes <= limits.maxBytes)
+      const totalLines = countLines(text)
+      if (totalLines <= limits.maxLines && Buffer.byteLength(text, "utf-8") <= limits.maxBytes)
         return { ...result, metadata: { ...result.metadata, truncated: false } }
 
-      // 保留在模型输出中的行
-      const kept: string[] = []
-      // 已保留的字节数
-      let bytes = 0
-      // 逐行收集，直到达到行数或字节上限
-      for (const line of lines.slice(0, limits.maxLines)) {
-        // 该行占用的字节（行间补一个换行符）
-        const size = Buffer.byteLength(line, "utf-8") + (kept.length > 0 ? 1 : 0)
-        // 超出字节上限即停止收集
-        if (bytes + size > limits.maxBytes) break
-        // 收录该行
-        kept.push(line)
-        bytes += size
-      }
-      // 全量文本的落盘路径
+      // Cut once, at the line or byte limit, whichever comes first, so a line too long for the space left shows its
+      // start. The preview never ends on a line break.
+      const end = Math.min(afterLines(text, limits.maxLines), byteBoundary(text, limits.maxBytes))
+      const shown = text.slice(0, text.endsWith("\r\n", end) ? end - 2 : text.endsWith("\n", end) ? end - 1 : end)
       const file = path.join(directory, fileName())
-      // 确保输出目录存在
-      yield* fs.ensureDir(directory).pipe(Effect.orDie)
-      // 写入完整文本
-      yield* fs.writeFileString(file, text).pipe(Effect.orDie)
-      // 提示已展示的行范围（无保留行时显示 "0 lines"）
-      const shown = kept.length > 0 ? `lines 1-${kept.length}` : "0 lines"
-      // 截断提示文本
-      const marker = `[showing ${shown} of ${lines.length}; full output saved to ${file}]`
-      // 截断后的内容块
+      const failure = yield* fs.ensureDir(directory).pipe(
+        Effect.andThen(fs.writeFileString(file, text)),
+        Effect.as(undefined),
+        Effect.catch((error) =>
+          Effect.logWarning("failed to save full tool output", { file, cause: error }).pipe(Effect.as(describe(error))),
+        ),
+      )
+      // Counted before the final line break is stripped, so a blank last line still counts.
+      const shownLines = countLines(text.slice(0, end))
+      const lastLineCut =
+        shownLines > 0 &&
+        shown.length < text.length &&
+        !text.startsWith("\n", shown.length) &&
+        !text.startsWith("\r\n", shown.length)
+      const range = shownLines === 0 ? "0 lines" : `lines 1-${shownLines}`
+      const marker = `[showing ${range} of ${totalLines}${lastLineCut ? " (last line cut)" : ""}; ${
+        failure === undefined ? `full output saved to ${file}` : `full output could not be saved: ${failure}`
+      }]`
       const bounded: Tool.Content[] = []
-      // 仍可分配给文本块的字符预算
-      let remaining = kept.join("\n").length
-      // 是否已遇到文本块
-      let seenText = false
-      // 是否已插入过提示
+      let remaining = shown.length
+      let separator = false
       let marked = false
       // 按预算裁剪各文本块
       for (const item of content) {
@@ -159,11 +160,9 @@ const layer = Layer.effect(
           bounded.push(item)
           continue
         }
-        // 首块之外的文本块之间按 1 字符预算扣除
-        if (seenText && remaining > 0) remaining--
-        seenText = true
-        // 整块仍在预算内则整块保留
-        if (remaining >= item.text.length) {
+        if (separator && remaining > 0) remaining--
+        separator = item.text !== "" && !item.text.endsWith("\n")
+        if (!marked && remaining >= item.text.length) {
           bounded.push(item)
           remaining -= item.text.length
           continue
@@ -182,7 +181,7 @@ const layer = Layer.effect(
       return {
         ...result,
         content: bounded,
-        metadata: { ...result.metadata, truncated: true, outputPath: file },
+        metadata: { ...result.metadata, truncated: true, ...(failure === undefined && { outputPath: file }) },
       }
     })
 
@@ -235,3 +234,41 @@ export const node = makeLocationNode({
   layer,
   deps: [FSUtil.node, Global.node, cleanupNode],
 })
+
+/** How many lines `text` has, not counting an empty one after a final line break. Counts without splitting. */
+function countLines(text: string) {
+  if (text === "") return 0
+  let count = 1
+  for (let index = text.indexOf("\n"); index !== -1 && index < text.length - 1; index = text.indexOf("\n", index + 1))
+    count++
+  return count
+}
+
+/** Where the line after the first `count` lines starts, or the end of `text`. */
+function afterLines(text: string, count: number) {
+  let index = 0
+  for (let line = 0; line < count; line++) {
+    const next = text.indexOf("\n", index)
+    if (next === -1) return text.length
+    index = next + 1
+  }
+  return index
+}
+
+const encoder = new TextEncoder()
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+
+/** The longest start of `text` that fits in `budget` UTF-8 bytes without splitting a character, emoji included. */
+function byteBoundary(text: string, budget: number) {
+  // encodeInto only encodes what fits in the buffer, and stops at a whole code point.
+  const index = encoder.encodeInto(text, new Uint8Array(Math.max(0, budget))).read
+  if (index === text.length || index === 0) return index
+  const before = text.charCodeAt(index - 1)
+  const after = text.charCodeAt(index)
+  // Two ASCII characters always have a boundary between them, except the two halves of \r\n.
+  if (before < 0x80 && after < 0x80) return before === 13 && after === 10 ? index - 1 : index
+  // Otherwise back off to the start of the grapheme the cut is in. A line break always ends one, so segmenting from the
+  // start of the line keeps flag pairs and long emoji sequences exact; one code point past the cut gives the context.
+  const start = text.lastIndexOf("\n", index - 1) + 1
+  return start + (graphemes.segment(text.slice(start, index + 2)).containing(index - start)?.index ?? index - start)
+}

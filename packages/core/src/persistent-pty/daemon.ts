@@ -1,8 +1,6 @@
 // 引入 Node 的子进程模块（spawn：派生守护进程）
 import { spawn } from "node:child_process"
-// 引入文件系统 Promise API：mkdir（建目录）、readFile（读文件）、rename（重命名）
-import { mkdir, readFile, rename } from "node:fs/promises"
-// 引入 Node 的 net 模块（Unix socket 通信）
+import { readFile } from "node:fs/promises"
 import net from "node:net"
 // 引入 Node 的 path 模块（路径拼接与解析）
 import path from "node:path"
@@ -10,55 +8,61 @@ import path from "node:path"
 import { Cause, Data, Duration, Effect, Schema, Semaphore } from "effect"
 // 引入持久化 PTY 的交接（Handoff）类型（仅类型引用）
 import type { Handoff } from "@opencode/schema/persistent-pty"
-// 引入会话 ID schema（终端归属的会话）
-import { Session } from "@opencode/schema/session"
 
-// 守护进程协议版本号（客户端与守护进程两端必须一致）
-const ProtocolVersion = 7
-// 单帧最大字节数：8MB（超出即视为协议错误）
+const ProtocolVersion = 8
 const MaxFrameBytes = 8 * 1024 * 1024
 
 // 终端生命周期（lifecycle）schema：运行中 / 已退出（带退出码）/ 失败（带消息）
 const Lifecycle = Schema.Union([
   // 运行中
   Schema.Struct({ status: Schema.Literal("running") }),
-  // 已退出：exit_code 可为 null（被信号杀死等）
-  Schema.Struct({ status: Schema.Literal("exited"), exit_code: Schema.NullOr(Schema.Number) }),
-  // 失败：附错误消息
+  Schema.Struct({
+    status: Schema.Literal("exited"),
+    exit_code: Schema.NullOr(Schema.Number),
+    signal: Schema.optional(Schema.NullOr(Schema.String)),
+  }),
   Schema.Struct({ status: Schema.Literal("failed"), message: Schema.String }),
 ])
 
-// 线路格式（wire format）的终端信息 schema：客户端与守护进程间传输的终端状态
-export const WireTerminal = Schema.Struct({
-  // 终端数字 ID
-  id: Schema.Number,
-  // 终端进程 PID（可为 null）
-  pid: Schema.NullOr(Schema.Number),
-  // 终端标题
+const PtyInfo = Schema.Struct({
   title: Schema.String,
-  // 用户自定义标题（可选）
-  user_title: Schema.optional(Schema.NullOr(Schema.String)),
-  // 前台进程名称（可为 null）
+  user_title: Schema.NullOr(Schema.String),
   foreground_process: Schema.NullOr(Schema.String),
-  // 归属的会话 ID
-  group_id: Session.ID,
-  // 启动命令及参数
-  command: Schema.Array(Schema.String),
-  // 工作目录
-  cwd: Schema.String,
-  // 终端列数
   cols: Schema.Number,
   // 终端行数
   rows: Schema.Number,
-  // 生命周期状态
+})
+
+export const Metadata = Schema.Record(Schema.String, Schema.Unknown)
+export type Metadata = typeof Metadata.Type
+
+const PipeInfo = Schema.Struct({
+  output_path: Schema.String,
+  output_lines: Schema.Number,
+  output_error: Schema.optional(Schema.NullOr(Schema.String)),
+  metadata: Metadata,
+})
+
+export const ProcessInfo = Schema.Struct({
+  id: Schema.Number,
+  mode: Schema.Literals(["pty", "pipe"]),
+  pid: Schema.NullOr(Schema.Number),
+  command: Schema.Array(Schema.String),
+  cwd: Schema.String,
+  group_id: Schema.String,
   lifecycle: Lifecycle,
   // 输出缓冲区的头部偏移
   output_head: Schema.Number,
   // 输出缓冲区的尾部偏移
   output_tail: Schema.Number,
+  started_at: Schema.Number,
+  exited_at: Schema.optional(Schema.NullOr(Schema.Number)),
+  pty: Schema.optional(Schema.NullOr(PtyInfo)),
+  pipe: Schema.optional(Schema.NullOr(PipeInfo)),
 })
-// WireTerminal 的 TypeScript 类型
-export type WireTerminal = typeof WireTerminal.Type
+export type ProcessInfo = typeof ProcessInfo.Type
+
+export type Signal = "SIGTERM" | "SIGINT" | "SIGKILL"
 
 // 注册信息 schema：守护进程写入 service.json 的自我描述
 const Registration = Schema.Struct({
@@ -72,8 +76,7 @@ const Registration = Schema.Struct({
   socket: Schema.String,
   // 通信令牌（token）
   token: Schema.String,
-  // 支持的特性列表（可选，老版本没有）
-  features: Schema.optional(Schema.Array(Schema.String)),
+  features: Schema.Array(Schema.String),
 })
 // Registration 的 TypeScript 类型
 type Registration = typeof Registration.Type
@@ -86,13 +89,11 @@ export const WireResponse = Schema.Union([
     instance_id: Schema.String,
     pid: Schema.Number,
     protocol: Schema.Number,
-    features: Schema.optional(Schema.Array(Schema.String)),
+    features: Schema.Array(Schema.String),
   }),
-  // created：终端创建成功
-  Schema.Struct({ type: Schema.Literal("created"), terminal: WireTerminal }),
-  // terminals：终端列表
-  Schema.Struct({ type: Schema.Literal("terminals"), terminals: Schema.Array(WireTerminal) }),
-  // ok：通用成功应答
+  Schema.Struct({ type: Schema.Literal("created"), process: ProcessInfo }),
+  Schema.Struct({ type: Schema.Literal("processes"), processes: Schema.Array(ProcessInfo) }),
+  Schema.Struct({ type: Schema.Literal("process"), process: ProcessInfo }),
   Schema.Struct({ type: Schema.Literal("ok") }),
   // owned：属主（ownership）握手成功
   Schema.Struct({ type: Schema.Literal("owned") }),
@@ -101,7 +102,7 @@ export const WireResponse = Schema.Union([
   // snapshot：终端快照（文本 + 检查点 + 光标位置）
   Schema.Struct({
     type: Schema.Literal("snapshot"),
-    terminal: WireTerminal,
+    process: ProcessInfo,
     text: Schema.String,
     checkpoint_base64: Schema.String,
     cursor_x: Schema.Number,
@@ -110,7 +111,7 @@ export const WireResponse = Schema.Union([
   // rows：按行输出的屏幕内容
   Schema.Struct({
     type: Schema.Literal("rows"),
-    terminal: WireTerminal,
+    process: ProcessInfo,
     lines: Schema.Array(Schema.String),
     cursor_x: Schema.Number,
     cursor_y: Schema.Number,
@@ -118,7 +119,7 @@ export const WireResponse = Schema.Union([
   // attached：订阅成功，带角色、世代、偏移与重放数据
   Schema.Struct({
     type: Schema.Literal("attached"),
-    terminal: WireTerminal,
+    process: ProcessInfo,
     role: Schema.Literals(["controller", "observer"]),
     generation: Schema.Number,
     requested_offset: Schema.Number,
@@ -139,7 +140,12 @@ export const WireResponse = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("exited"),
     exit_code: Schema.NullOr(Schema.Number),
+    signal: Schema.optional(Schema.NullOr(Schema.String)),
     final_offset: Schema.Number,
+    // Pipe processes only.
+    output_lines: Schema.optional(Schema.Number),
+    output_error: Schema.optional(Schema.NullOr(Schema.String)),
+    exited_at: Schema.Number,
   }),
   // controller_changed：控制者变更
   Schema.Struct({
@@ -156,6 +162,7 @@ export const WireResponse = Schema.Union([
 ])
 // WireResponse 的 TypeScript 类型
 export type WireResponse = typeof WireResponse.Type
+export type Exited = Extract<WireResponse, { type: "exited" }>
 
 // 附件角色类型：controller（控制者，可写入）或 observer（观察者，只读）
 export type Role = "controller" | "observer"
@@ -193,7 +200,7 @@ export type SubscribeInput = {
 
 // 终端附件（attachment）：订阅成功后返回的句柄，含重放数据与激活/分离操作
 export type DaemonAttachment = {
-  readonly terminal: WireTerminal
+  readonly terminal: ProcessInfo
   readonly role: Role
   readonly generation: number
   // 重放数据：请求偏移、可用偏移、结束偏移、是否截断、数据本体
@@ -210,9 +217,13 @@ export type DaemonAttachment = {
   readonly detach: () => void
 }
 
-// 守护进程通信错误：按类别（连接/应答/注册/协议/派生）区分，附消息与可选 PID
+/**
+ * `connect`, `spawn`, `registration` and `protocol` mean the daemon could not be reached or started and the
+ * request never ran. `response` means the request was sent but its reply was lost. `request` is the daemon's
+ * own `error` reply.
+ */
 export class DaemonError extends Data.TaggedError("PersistentPty.DaemonError")<{
-  readonly kind: "connect" | "response" | "registration" | "protocol" | "spawn"
+  readonly kind: "connect" | "response" | "registration" | "protocol" | "spawn" | "request"
   readonly message: string
   readonly pid?: number
 }> {}
@@ -221,13 +232,11 @@ export class DaemonError extends Data.TaggedError("PersistentPty.DaemonError")<{
 export interface DaemonTransport {
   readonly request: (value: object, start?: boolean) => Effect.Effect<WireResponse, DaemonError>
   readonly requestIfRunning: (value: object) => Effect.Effect<WireResponse | undefined, DaemonError>
-  readonly supports: (feature: string) => Effect.Effect<boolean, DaemonError>
+  /** Waits on its own connection, with no timeout, until the pipe process exits. Never starts the daemon. */
+  readonly wait: (id: number) => Effect.Effect<Exited, DaemonError>
   readonly shutdown: Effect.Effect<WireResponse | undefined, DaemonError>
   readonly handoff: Effect.Effect<Handoff | null, DaemonError>
-  readonly subscribe: (
-    id: number,
-    input: SubscribeInput,
-  ) => Effect.Effect<DaemonAttachment, DaemonError>
+  readonly subscribe: (id: number, input: SubscribeInput) => Effect.Effect<DaemonAttachment, DaemonError>
 }
 
 // 构建守护进程传输层的 Effect 生成器：管理发现、派生、认领、请求与订阅
@@ -248,7 +257,8 @@ export const makeDaemonTransport = Effect.fn("PersistentPty.makeDaemonTransport"
   let owner: Awaited<ReturnType<typeof openOwner>> | undefined
   // 作用域是否已关闭
   let closed = false
-  // 注册作用域终结器（finalizer）：标记关闭并销毁属主连接
+  // Set once a daemon we spawned turned out to speak another protocol.
+  let incompatible: DaemonError | undefined
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => {
       // 标记作用域已关闭
@@ -324,9 +334,7 @@ export const makeDaemonTransport = Effect.fn("PersistentPty.makeDaemonTransport"
       response.protocol !== ProtocolVersion
     )
       return yield* Effect.fail(new DaemonError({ kind: "protocol", message: "opencode-pty registration mismatch" }))
-    // Daemons older than the features list omit it; trust the live daemon's answer over the file.
-    // 以存活进程的应答为准补齐特性列表（老版本注册文件中没有 features 字段）
-    return { ...decoded, features: response.features ?? [] }
+    return decoded
   })
 
   // spawnDaemon：派生新的 opencode-pty 守护进程子进程，并轮询等待其就绪
@@ -337,13 +345,11 @@ export const makeDaemonTransport = Effect.fn("PersistentPty.makeDaemonTransport"
     const child = yield* Effect.tryPromise({
       try: () =>
         new Promise<ReturnType<typeof spawn>>((resolve, reject) => {
-          // 派生进程：daemon 子命令 + 运行时目录与实例名参数
-          const child = spawn(
-            executable,
-            ["daemon", "--runtime-dir", root, "--name", id],
-            { detached: true, windowsHide: true, stdio: "ignore" },
-          )
-          // 派生成功后解除引用（unref）让父进程可独立退出，并完成 Promise
+          const child = spawn(executable, ["daemon", "--runtime-dir", root, "--name", id], {
+            detached: true,
+            windowsHide: true,
+            stdio: "ignore",
+          })
           child.once("spawn", () => {
             child.unref()
             resolve(child)
@@ -365,6 +371,11 @@ export const makeDaemonTransport = Effect.fn("PersistentPty.makeDaemonTransport"
         const found = yield* discover().pipe(
           Effect.map((value) => ({ value })),
           Effect.catch((error) => {
+            // The binary we just started speaks another protocol: waiting longer cannot help.
+            if (error.kind === "protocol" && error.pid !== undefined && error.pid === child.pid) {
+              incompatible = error
+              return Effect.fail(error)
+            }
             last = error
             return Effect.succeed(undefined)
           }),
@@ -391,13 +402,13 @@ export const makeDaemonTransport = Effect.fn("PersistentPty.makeDaemonTransport"
     )
   })
 
-  // An unreachable daemon can still hold this directory's lock, so retry once in a fresh directory.
-  // start：启动守护进程；失败时放弃当前目录并换一个全新目录重试一次
+  // An unreachable daemon, or one left by another release, can still hold this directory's lock, so retry once in a
+  // fresh directory. A binary that cannot be spawned, or that speaks another protocol, fails the same way again.
   const start = () =>
     spawnDaemon().pipe(
       Effect.catch((error) =>
         Effect.gen(function* () {
-          // 记录警告日志：说明为什么换目录
+          if (error.kind === "spawn" || error === incompatible) return yield* Effect.fail(error)
           yield* Effect.logWarning("Starting opencode-pty in a fresh runtime directory", { cause: error.message })
           // 放弃当前运行时目录（换新 ID）
           abandon()
@@ -433,7 +444,8 @@ export const makeDaemonTransport = Effect.fn("PersistentPty.makeDaemonTransport"
         // 尝试发现现有守护进程；不可达且允许启动时转而启动
         const found = yield* discover().pipe(
           Effect.catch((error) => {
-            if (shouldStart && error.kind === "connect") return start()
+            // Starting the same incompatible binary again would only fail again.
+            if (shouldStart && error.kind === "connect") return incompatible ? Effect.fail(incompatible) : start()
             return Effect.fail(error)
           }),
         )
@@ -492,12 +504,14 @@ export const makeDaemonTransport = Effect.fn("PersistentPty.makeDaemonTransport"
       Effect.catch((error) => (error.kind === "connect" ? Effect.succeed(undefined) : Effect.fail(error))),
     )
 
-  // supports：查询守护进程是否支持某个特性（只连接不启动）
-  const supports = Effect.fn("PersistentPty.daemon.supports")(function* (feature: string) {
-    // 连接现有守护进程
-    const current = yield* connect(false)
-    // 特性列表包含该特性则 true，缺省 false
-    return current.features?.includes(feature) ?? false
+  const wait = Effect.fn("PersistentPty.daemon.wait")(function* (processID: number) {
+    const attempt = withRegistration(false, (current) =>
+      Effect.tryPromise({
+        try: (signal) => waitPromise(current, processID, signal),
+        catch: (cause) => (cause instanceof DaemonError ? cause : failure("connect", cause)),
+      }),
+    )
+    return yield* attempt.pipe(Effect.catch((error) => (error.kind === "registration" ? attempt : Effect.fail(error))))
   })
 
   // shutdown：请求守护进程退出，并轮询确认其真正停止
@@ -559,12 +573,7 @@ export const makeDaemonTransport = Effect.fn("PersistentPty.makeDaemonTransport"
     }),
   )
 
-  // subscribe：订阅某终端的输出流并返回附件句柄；注册失效时自动重试一次
-  const subscribe = Effect.fn("PersistentPty.daemon.subscribe")(function* (
-    terminalID: number,
-    input: SubscribeInput,
-  ) {
-    // 单次订阅尝试（基于当前注册信息建立专属连接）
+  const subscribe = Effect.fn("PersistentPty.daemon.subscribe")(function* (terminalID: number, input: SubscribeInput) {
     const attempt = withRegistration(false, (current) =>
       Effect.tryPromise({
         try: () => subscribePromise(current, terminalID, input),
@@ -586,18 +595,12 @@ export const makeDaemonTransport = Effect.fn("PersistentPty.makeDaemonTransport"
       // 交接票据已过期则失败
       if (inherited.expiresAt <= Date.now())
         return yield* Effect.fail(new DaemonError({ kind: "registration", message: "PTY restart handoff expired" }))
-      // Older releases put the daemon directory outside the root; its directory name is still the ID.
-      // 用交接目录名作为实例 ID（兼容把目录放在根目录之外的旧版本）
       id = path.basename(inherited.directory)
       // 在交接目录中发现守护进程
       found = yield* discover(inherited.directory)
       // 实例 ID 与票据不符说明守护进程已被更换，交接失效
       if (found.instance_id !== inherited.instanceID)
         return yield* Effect.fail(new DaemonError({ kind: "registration", message: "PTY restart daemon changed" }))
-      // 旧目录不在规范位置时，把注册文件迁移到根目录下的标准位置
-      if (path.resolve(inherited.directory) !== path.resolve(root, id))
-        yield* migrate(inherited.directory, path.join(root, id))
-      // 用交接票据认领所有权
       yield* claim(found, inherited.ticket)
     }).pipe(
       // 交接失败的处理：记录警告并尽力关闭旧守护进程
@@ -618,26 +621,7 @@ export const makeDaemonTransport = Effect.fn("PersistentPty.makeDaemonTransport"
     )
   }
 
-  // 返回传输层实现对象（满足 DaemonTransport 接口）
-  return { request, requestIfRunning, supports, shutdown, handoff, subscribe } satisfies DaemonTransport
-})
-
-// Older releases kept registrations in purgeable temp directories. Renaming keeps the lock file's
-// inode, so the still-running daemon keeps holding its lock in the new location.
-// migrate：把注册文件迁移到新目录；rename 保留锁文件的 inode，运行中的守护进程在新位置依然持有锁
-const migrate = Effect.fn("PersistentPty.daemon.migrate")(function* (directory: string, target: string) {
-  // 创建目标目录并迁移锁文件与注册文件（失败转为 registration 错误）
-  yield* Effect.tryPromise({
-    try: async () => {
-      // 创建目标目录（0700 权限）
-      await mkdir(target, { recursive: true, mode: 0o700 })
-      // 迁移锁文件（保持 inode，守护进程仍持有锁）
-      await rename(path.join(directory, "service.lock"), path.join(target, "service.lock"))
-      // 迁移注册文件
-      await rename(path.join(directory, "service.json"), path.join(target, "service.json"))
-    },
-    catch: (cause) => failure("registration", cause),
-  })
+  return { request, requestIfRunning, wait, shutdown, handoff, subscribe } satisfies DaemonTransport
 })
 
 // openOwner：打开到守护进程的"属主"长连接，完成 own 握手后返回连接与请求函数
@@ -750,7 +734,7 @@ const oneShot = Effect.fn("PersistentPty.daemon.oneShot")(function* (registratio
         // 解码应答（失败转为 protocol 错误）
         const response = yield* Effect.try({
           try: () => decode(first),
-          catch: (cause) => failure("protocol", cause),
+          catch: (cause) => failure("response", cause),
         })
         // 错误应答转为对应类别的失败
         if (response.type === "error") return yield* Effect.fail(responseError(response.message))
@@ -877,7 +861,7 @@ async function subscribePromise(
     let activated = false
     // 返回附件对象：终端状态、角色、世代、重放数据与激活/分离操作
     return {
-      terminal: response.terminal,
+      terminal: response.process,
       role: response.role,
       generation: response.generation,
       // 重放数据：把 base64 解码为字节
@@ -914,7 +898,29 @@ async function subscribePromise(
   }
 }
 
-// encode：把值编码为"4 字节大端长度前缀 + JSON 载荷"的帧
+async function waitPromise(registration: Registration, id: number, signal: AbortSignal): Promise<Exited> {
+  const socket = net.createConnection({ path: registration.socket })
+  const abort = () => socket.destroy()
+  signal.addEventListener("abort", abort, { once: true })
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve)
+      socket.once("error", reject)
+    })
+    socket.write(encode({ token: registration.token, request: { op: "wait", id } }))
+    const frame = await decoder(socket).next()
+    // The connection was open, so a missing reply means the daemon went away while the process ran.
+    if (frame.done) throw failure("connect", "opencode-pty closed before the process exited")
+    const response = decode(frame.value)
+    if (response.type === "error") throw responseError(response.message)
+    if (response.type !== "exited") throw failure("response", `unexpected opencode-pty response: ${response.type}`)
+    return response
+  } finally {
+    signal.removeEventListener("abort", abort)
+    socket.destroy()
+  }
+}
+
 function encode(value: unknown) {
   // 序列化为 JSON 字节
   const payload = Buffer.from(JSON.stringify(value))
@@ -968,7 +974,7 @@ function decode(payload: Uint8Array) {
 
 // responseError：把错误应答映射为 DaemonError（"authentication failed" 视为注册错误，其余为协议错误）
 function responseError(message: string) {
-  return new DaemonError({ kind: message === "authentication failed" ? "registration" : "protocol", message })
+  return new DaemonError({ kind: message === "authentication failed" ? "registration" : "request", message })
 }
 
 // failure：把任意错误原因包装为指定类别的 DaemonError（保留原始消息）

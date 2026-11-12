@@ -502,12 +502,9 @@ export const Plugin = {
                 metadata: { sessionID: context.sessionID, path: stem, model: ref },
                 // 重启恢复信息
                 recovery: { kind: "image", sessionID: context.sessionID, path: stem, model: ref },
-                // 任务执行体
+                background: true,
                 run,
               })
-              // 把任务转入后台运行
-              yield* jobs.background(id)
-              // 挂上完成通知（后台 Fiber）
               yield* notifyWhenDone({ sessionID: context.sessionID, id, notificationID, file: stem })
               // 立即返回：任务 ID、保存基名、模型与说明文本
               return {
@@ -523,10 +520,7 @@ export const Plugin = {
                 ].join("\n"),
                 metadata: { path: stem, model: ref, jobID: id },
               }
-            }).pipe(
-              // 整体失败映射为工具失败
-              Effect.mapError(toolFailure("Unable to generate image")),
-            ),
+            }).pipe(Effect.mapError(toolFailure("Unable to generate image"))),
         })
       })
       // 注册出错则直接中断

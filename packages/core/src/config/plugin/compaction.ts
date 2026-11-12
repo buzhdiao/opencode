@@ -24,15 +24,11 @@ export const Plugin = define({
     const config = yield* Config.Service
     // 获取会话压缩服务。
     const compaction = yield* SessionCompaction.Service
-    // 获取旗标解析器。
-    const flags = yield* Flag.resolver
-    // 观察配置：更新时触发压缩服务重载。
+    const flags = yield* Flag.Service
     const loaded = yield* ConfigEntryObserver.observe(config, ctx.event, compaction.reload())
     // 把压缩配置写入编辑器。
     yield* compaction.transform((editor) => {
-      // 先按旗标配置是否后台压缩（precompute）。
-      editor.configure({ precompute: flags(loaded.entries).background_compaction.enabled })
-      // 遍历每个配置条目。
+      editor.configure({ precompute: flags.resolve(loaded.entries).background_compaction.enabled })
       for (const entry of loaded.entries) {
         // 只处理带 compaction 设置的文档。
         if (entry.type !== "document" || !entry.info.compaction) continue

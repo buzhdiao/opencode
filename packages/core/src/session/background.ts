@@ -12,10 +12,34 @@ import type { SessionSchema } from "./schema.js"
 
 // 查询接口：按会话 ID 查询会话摘要（含父会话 ID），可能不存在
 export type Lookup = {
-  readonly get: (sessionID: SessionSchema.ID) => Effect.Effect<{ readonly parentID?: SessionSchema.ID } | undefined>
+  readonly get: (
+    sessionID: SessionSchema.ID,
+  ) => Effect.Effect<
+    { readonly parentID?: SessionSchema.ID; readonly agent?: string; readonly title?: string } | undefined
+  >
 }
 
-// 列表过滤条件：会话 ID、任务种类、状态、是否包含后代会话
+export type OutstandingItem =
+  | {
+      readonly kind: "shell"
+      readonly sessionID: SessionSchema.ID
+      readonly shellID: string
+      readonly command: string
+    }
+  | {
+      readonly kind: "image"
+      readonly sessionID: SessionSchema.ID
+      readonly model: string
+      readonly path: string
+    }
+  | {
+      readonly kind: "subagent"
+      readonly sessionID: SessionSchema.ID
+      readonly childSessionID: SessionSchema.ID
+      readonly agent: string
+      readonly description: string
+    }
+
 export type ListFilter = {
   readonly sessionID?: SessionSchema.ID
   readonly kind?: Kind
@@ -27,12 +51,17 @@ export type ListFilter = {
  * Background jobs still running for a Session or any of its descendants. A child's own
  * background shell counts even after the child reported to its parent: its notice wakes
  * the child again, so the child's work is not finished.
+ *
+ * `active` adds executions that hold a claim right now, such as a subagent mid-turn
+ * whose Job record already settled. Only descendants are added, and a child already
+ * represented by a running background job is not repeated.
  */
 // 找出某会话及其所有后代仍在运行的后台任务；子会话自己的后台 shell 也算——它的完成通知会再次唤醒子会话，因此子会话的工作尚未结束
 export const outstanding = Effect.fnUntraced(function* (
-  jobs: Pick<Job.Interface, "runningBackground">,
+  jobs: Pick<Job.Interface, "runningBackground"> & { readonly get?: Job.Interface["get"] },
   store: Lookup,
   sessionID: SessionSchema.ID,
+  active?: ReadonlySet<SessionSchema.ID>,
 ) {
   // 父子关系缓存：会话 ID -> 父会话 ID（null 表示已查询过且无父）
   const parents = new Map<SessionSchema.ID, SessionSchema.ID | null>()
@@ -40,9 +69,7 @@ export const outstanding = Effect.fnUntraced(function* (
   const owned = yield* Effect.filter(yield* jobs.runningBackground, (recovery) =>
     descends(store, parents, recovery.kind === "subagent" ? recovery.parentSessionID : recovery.sessionID, sessionID),
   )
-  // 把内部恢复记录映射为简洁的对外结构（shell / image / subagent 三种）
-  return owned.map((recovery) => {
-    // shell 任务：附带 shellID 与命令
+  const items: OutstandingItem[] = owned.map((recovery) => {
     if (recovery.kind === "shell")
       return {
         kind: "shell" as const,
@@ -62,6 +89,25 @@ export const outstanding = Effect.fnUntraced(function* (
       description: recovery.description,
     }
   })
+  if (!active || active.size === 0) return items
+  const children = new Set(items.flatMap((item) => (item.kind === "subagent" ? [item.childSessionID] : [])))
+  for (const activeID of active) {
+    if (activeID === sessionID || children.has(activeID)) continue
+    // A cancelled child may still be draining while it cleans up.
+    const tracked = jobs.get ? yield* jobs.get(activeID) : undefined
+    if (tracked?.status === "cancelled") continue
+    if (!(yield* descends(store, parents, activeID, sessionID))) continue
+    const info = yield* store.get(activeID)
+    if (!info?.parentID) continue
+    items.push({
+      kind: "subagent",
+      sessionID: info.parentID,
+      childSessionID: activeID,
+      agent: info.agent ?? "subagent",
+      description: info.title ?? "Subagent",
+    })
+  }
+  return items
 })
 
 /** Active and unconsumed background jobs matching the requested Session, kind, status, and descendant scope. */

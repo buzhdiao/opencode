@@ -11,9 +11,7 @@ import type { Provider } from "@opencode/schema/provider"
 import type { Session } from "@opencode/schema/session"
 // 引入预热配置 schema
 import { ConfigWarming } from "@opencode/schema/config/warming"
-// 引入 Effect 原语：Clock（时钟）、Duration、Option、Schema、Scope（作用域）、Stream
-import { Clock, Duration, Effect, Option, Schema, Scope, Stream } from "effect"
-// 引入配置服务
+import { Cause, Clock, Data, Deferred, Duration, Effect, FiberMap, Option, Schema, Stream } from "effect"
 import { Config } from "../config.js"
 // 引入模型解析函数（读取模型的缓存设置）
 import { resolveModel } from "./optimize.js"
@@ -25,13 +23,29 @@ const decodeWarming = Schema.decodeUnknownOption(ConfigWarming.Warming)
 const defaults = {
   // 保活请求使用的固定提示词
   prompt: "This is a keep-alive request. Do not perform any work or use tools. Reply with exactly: OK",
-  // 默认间隔 4 分钟
-  interval: Duration.minutes(4),
-  // 默认持续 30 分钟
+  interval: "auto" as "auto" | Duration.Duration,
   duration: Duration.minutes(30),
 }
 
-// 定义会话预热插件：定期向空闲会话发送保活请求以维持提示词缓存
+/** `ttl` is how long the provider keeps a cache entry after the request that last sent it. */
+type Settings = typeof defaults & { interval: Duration.Duration; ttl: Duration.Duration }
+
+/** Whether a session is warmed after a request, and why not. */
+type Decision = Data.TaggedEnum<{
+  Warm: { readonly settings: Settings }
+  /** Neither the top-level `warming` nor the model's `cache.warming` turns it on. */
+  Off: {}
+  /** `"auto"` timing on a cache that lasts longer than `duration`, so no ping is needed before the window closes. */
+  CacheOutlivesWindow: {}
+  /** An explicit interval that isn't positive and shorter than a finite `duration`. */
+  InvalidInterval: { readonly interval: Duration.Duration; readonly duration: Duration.Duration }
+}>
+const Decision = Data.taggedEnum<Decision>()
+
+// The interval for "auto" when the model has no cache.ttl, a little under the five minutes most explicit caches last.
+const fallbackInterval = Duration.minutes(4)
+const fallbackTTL = Duration.minutes(5)
+
 export const Plugin = define({
   // 插件唯一标识
   id: "opencode.warming",
@@ -40,8 +54,7 @@ export const Plugin = define({
     // 获取配置服务
     const config = yield* Config.Service
     // A model's or provider's `cache.warming` overrides the top-level `warming`.
-    // 读取预热设置：模型/提供方的 cache.warming 优先于顶层 warming 配置
-    const loadSettings = Effect.fn("WarmingPlugin.loadSettings")(function* (event: SessionHooks["context"]) {
+    const decide = Effect.fn("WarmingPlugin.decide")(function* (event: SessionHooks["context"]) {
       // Warming must never fail the request it hooks, so an unreadable catalog falls back to the top-level setting.
       // 预热绝不能使其挂钩的请求失败：模型目录不可读时回退到顶层设置
       const cache = (yield* resolveModel(ctx, event).pipe(Effect.orElseSucceed(() => undefined)))?.settings?.cache
@@ -54,8 +67,7 @@ export const Plugin = define({
         })
       // 读取顶层 warming 配置
       const global = Config.latest(yield* config.entries(), "warming")
-      // 两级配置都未启用则不预热
-      if (!(local ?? global)) return
+      if (!(local ?? global)) return Decision.Off()
       // The keep-alive prompt is only set at the top level; a model's setting changes timing.
       // 保活提示词只在顶层设置；模型级设置只调整时间参数
       const settings = {
@@ -66,186 +78,170 @@ export const Plugin = define({
         // 再覆盖模型级对象配置
         ...(typeof local === "object" ? local : {}),
       }
-      // 间隔为 "auto" 时按缓存 TTL 推算
-      const interval = settings.interval === "auto" ? autoInterval(cache?.ttl) : settings.interval
-      // "auto" 在没有 cache.ttl 的模型上不预热
-      // "auto" doesn't warm a model without a cache.ttl.
-      if (interval === undefined) return
-      // 读取持续时长
       const { duration } = settings
-      // 校验：时长有限、间隔为正、间隔短于时长
+      const ttl = parseTTL(cache?.ttl)
+      // "auto" pings at 90% of the cache's lifetime, so it lands before the cache expires.
+      const interval =
+        settings.interval === "auto" ? (ttl ? Duration.times(ttl, 0.9) : fallbackInterval) : settings.interval
+      // A cache that outlives the window, such as "1h" with the 30-minute default, needs no keep-alive.
+      if (
+        settings.interval === "auto" &&
+        Duration.isFinite(duration) &&
+        Duration.isGreaterThanOrEqualTo(interval, duration)
+      )
+        return Decision.CacheOutlivesWindow()
       const valid =
         Duration.isFinite(duration) &&
         Duration.isGreaterThan(interval, Duration.zero) &&
         Duration.isLessThan(interval, duration)
-      // 校验通过则返回最终设置
-      if (valid) return { ...settings, interval }
-      // 校验失败记录警告并不预热
-      yield* Effect.logWarning("warming interval must be positive and shorter than a finite duration", {
-        interval,
-        duration,
-      })
+      // Without a cache.ttl, an explicit interval longer than five minutes implies a cache that lasts at least that long.
+      if (valid)
+        return Decision.Warm({
+          settings: { ...settings, interval, ttl: ttl ?? Duration.max(fallbackTTL, interval) },
+        })
+      return Decision.InvalidInterval({ interval, duration })
     })
 
-    // 获取当前作用域：后台预热循环托管于此
-    const scope = yield* Scope.Scope
-    // 会话预热状态表：会话 ID -> 上次保活时间/过期时间/设置
-    const sessions = new Map<Session.ID, { last: number; expires: number; settings: typeof defaults }>()
-    // A ping during a model request would compete with the request it keeps warm, which stalls single-slot local models.
-    // A request counts from its context hook, because `session.step.started` waits for the first response chunk.
-    // 正在请求的会话集合：预热 ping 会与被保活的请求争抢资源，卡死单槽位本地模型；从 context 钩子开始计数，
-    // 因为 session.step.started 要等第一个响应块
-    const requesting = new Set<Session.ID>()
-    // A turn always ends with an execution event, so a step that ends without its own event can't stay in flight.
-    // 订阅执行事件：一轮总以执行事件收尾，未收到自身结束事件的步骤不可能仍在进行
+    // Each warmed session's loop. A real request replaces it, and closing the plugin interrupts them all.
+    const loops = yield* FiberMap.make<Session.ID>()
+    // A ping during a model request would compete with it, which stalls single-slot local models. A request runs from
+    // its context or compaction hook, because `session.step.started` waits for the first response chunk, until an end
+    // event completes and removes its entry.
+    const running = new Map<Session.ID, Deferred.Deferred<void>>()
+    // Sessions already told their cache outlives the window; the check runs on every request.
+    const outlived = new Set<Session.ID>()
+
+    // The interval counts from when the latest request or ping was sent, since that is when the cache's lifetime starts.
+    const warm = Effect.fn("WarmingPlugin.warm")(function* (sessionID: Session.ID, settings: Settings, sent: number) {
+      const expires = sent + Duration.toMillis(settings.duration)
+      while (true) {
+        const due = Math.min(sent + Duration.toMillis(settings.interval), expires)
+        yield* Effect.sleep(Duration.millis(due - (yield* Clock.currentTimeMillis)))
+        if ((yield* Clock.currentTimeMillis) >= expires) return
+        const request = running.get(sessionID)
+        if (request) {
+          // Ping as soon as the request ends, unless it outlasted the cache: then a ping would only write a new one,
+          // so the next real request starts warming again.
+          const remaining = sent + Duration.toMillis(settings.ttl) - (yield* Clock.currentTimeMillis)
+          const ended = yield* Deferred.await(request).pipe(
+            Effect.timeoutOption(Duration.millis(Math.max(0, remaining))),
+          )
+          if (Option.isNone(ended)) return
+        }
+
+        sent = yield* Clock.currentTimeMillis
+        yield* Effect.logInfo("warming session", { sessionID })
+        const result = yield* ctx.session
+          .generate({ sessionID, prompt: settings.prompt })
+          .pipe(
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.failCause(cause)
+                : Effect.logWarning("failed to warm session", { sessionID, cause }).pipe(Effect.as(undefined)),
+            ),
+          )
+        // A ping that wrote more than it read rebuilt the cache instead of keeping it, so later pings would keep
+        // paying for that. Providers that report no cache usage never count as a miss.
+        if (result && result.tokens.cache.read < result.tokens.cache.write)
+          return yield* Effect.logInfo("stopped warming session after a cache miss", {
+            sessionID,
+            read: result.tokens.cache.read,
+            write: result.tokens.cache.write,
+          })
+      }
+    })
+
+    const hook = (tracked: boolean) => (event: SessionHooks["context"]) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session.get({ sessionID: event.sessionID }).pipe(Effect.orDie)
+        if (session.parentID) return
+        if (tracked && !running.has(event.sessionID)) running.set(event.sessionID, yield* Deferred.make<void>())
+        const stop = FiberMap.remove(loops, event.sessionID)
+        yield* Decision.$match(yield* decide(event), {
+          Warm: ({ settings }) =>
+            Effect.gen(function* () {
+              // Our own ping runs these hooks too. Once generate exposes request metadata, tag it instead.
+              if (text(event) === settings.prompt) return
+              outlived.delete(event.sessionID)
+              if (!(yield* FiberMap.has(loops, event.sessionID)))
+                yield* Effect.logInfo("scheduled session warming", {
+                  sessionID: event.sessionID,
+                  interval: settings.interval,
+                })
+              // Replacing the loop restarts the interval and the window, and cancels a ping in flight.
+              yield* FiberMap.run(
+                loops,
+                event.sessionID,
+                warm(event.sessionID, settings, yield* Clock.currentTimeMillis),
+              )
+            }),
+          Off: () => stop,
+          InvalidInterval: (decision) =>
+            Effect.logWarning("warming interval must be positive and shorter than a finite duration", {
+              interval: decision.interval,
+              duration: decision.duration,
+            }).pipe(Effect.andThen(stop)),
+          CacheOutlivesWindow: () =>
+            Effect.gen(function* () {
+              yield* stop
+              if (outlived.has(event.sessionID)) return
+              outlived.add(event.sessionID)
+              yield* Effect.logInfo("not warming: the prompt cache outlives the warming window", {
+                sessionID: event.sessionID,
+                model: event.model,
+              })
+            }),
+        })
+      })
+    yield* ctx.session.hook("context", hook(true))
+    yield* ctx.session.hook("compaction", hook(true))
+    // Generate requests report no end, so they don't count as running.
+    yield* ctx.session.hook("generate", hook(false))
+
+    // A turn always ends with an execution event and a compaction with its own, so a request that ends without its
+    // own event can't stay running past them.
     yield* ctx.event
       .subscribe({
         types: [
           "session.step.streamed",
           "session.step.failed",
+          "session.compaction.ended",
+          "session.compaction.failed",
           "session.execution.succeeded",
           "session.execution.failed",
           "session.execution.interrupted",
+          "session.deleted",
         ],
       })
       .pipe(
         // 对每个事件更新会话状态
         Stream.runForEach((event) =>
           Effect.gen(function* () {
-            // 从"请求中"集合移除该会话
-            requesting.delete(event.data.sessionID)
-            // Count the next interval from the end of the response, not from when a long request started.
-            // 下一个间隔从响应结束起算，而不是从长请求开始起算
-            const current = sessions.get(event.data.sessionID)
-            // 更新该会话的 last 时间戳
-            if (current) current.last = yield* Clock.currentTimeMillis
+            const sessionID = event.data.sessionID
+            const request = running.get(sessionID)
+            running.delete(sessionID)
+            if (request) yield* Deferred.succeed(request, undefined)
+            if (event.type !== "session.deleted") return
+            outlived.delete(sessionID)
+            yield* FiberMap.remove(loops, sessionID)
           }),
         ),
         // 后台分支立即启动，托管于当前作用域
         Effect.forkScoped({ startImmediately: true }),
       )
-    // 预热循环：按设置间隔对会话发保活请求
-    const loop: (sessionID: Session.ID) => Effect.Effect<void> = Effect.fn("WarmingPlugin.loop")(
-      function* (sessionID) {
-        // 读取会话状态
-        const current = sessions.get(sessionID)
-        // 状态已被移除则结束循环
-        if (!current) return
-
-        // 当前时间
-        const now = yield* Clock.currentTimeMillis
-        // 下次触发时间：上次保活 + 间隔，且不超过过期时间
-        const next = Math.min(current.last + Duration.toMillis(current.settings.interval), current.expires)
-        // 还没到时间：睡到下次触发后递归
-        if (now < next) {
-          yield* Effect.sleep(Duration.millis(next - now))
-          return yield* loop(sessionID)
-        }
-        // 已过有效期：移除状态并结束循环
-        if (now >= current.expires) {
-          sessions.delete(sessionID)
-          return
-        }
-        // 会话正被真实请求占用：稍后重试，避免争抢
-        if (requesting.has(sessionID)) {
-          yield* Effect.sleep(current.settings.interval)
-          return yield* loop(sessionID)
-        }
-
-        // 记录本次保活前的 last 值
-        const last = current.last
-        // 记录预热日志
-        yield* Effect.logInfo("warming session", { sessionID, last })
-        // 发送保活请求；失败仅记警告
-        yield* ctx.session
-          .generate({ sessionID, prompt: current.settings.prompt })
-          .pipe(Effect.catchCause((cause) => Effect.logWarning("failed to warm session", { sessionID, cause })))
-        // 保活完成后更新 last：仅当状态未被并发改动（仍是同一对象且 last 未变）
-        const latest = sessions.get(sessionID)
-        if (latest === current && latest.last === last) latest.last = yield* Clock.currentTimeMillis
-        // 继续下一轮
-        return yield* loop(sessionID)
-      },
-    )
-
-    // 会话钩子：登记会话预热（刷新或新建）
-    const hook = (event: SessionHooks["context"]) =>
-      Effect.gen(function* () {
-        // 获取会话（获取失败直接中止）
-        const session = yield* ctx.session.get({ sessionID: event.sessionID }).pipe(Effect.orDie)
-        // 子会话不单独预热，跟随父会话
-        if (session.parentID) return
-
-        // 现有预热状态
-        const active = sessions.get(event.sessionID)
-        // 读取最终设置
-        const settings = yield* loadSettings(event)
-        // 设置不可用：移除预热并退出
-        if (!settings) {
-          sessions.delete(event.sessionID)
-          return
-        }
-
-        // Once generate exposes request metadata to context hooks, tag warm requests instead of matching the prompt.
-        // 待 generate 向 context 钩子暴露请求元数据后，应改为打标记而非匹配提示词
-        const message = event.messages.at(-1)
-        // 检测最后一条用户消息是否是保活提示词（旧或新设置）
-        if (
-          message?.role === "user" &&
-          message.content.length === 1 &&
-          message.content[0]?.type === "text" &&
-          (message.content[0].text === active?.settings.prompt || message.content[0].text === settings.prompt)
-        ) {
-          // 是保活请求：仅同步设置，不重置计时
-          if (active) active.settings = settings
-          return
-        }
-
-        // 当前时间
-        const now = yield* Clock.currentTimeMillis
-        // 有效期毫秒数
-        const duration = Duration.toMillis(settings.duration)
-        // 已有预热状态：刷新计时与设置
-        if (active) {
-          active.last = now
-          active.expires = now + duration
-          active.settings = settings
-          return
-        }
-        // 新建预热状态
-        sessions.set(event.sessionID, { last: now, expires: now + duration, settings })
-        // 记录排期日志
-        yield* Effect.logInfo("scheduled session warming", {
-          sessionID: event.sessionID,
-          interval: settings.interval,
-          expires: now + duration,
-        })
-        // 在当前作用域内启动预热循环，失败仅记错误
-        yield* loop(event.sessionID).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logError("session warming loop failed", { sessionID: event.sessionID, cause }),
-          ),
-          Effect.forkIn(scope),
-        )
-      })
-    // context 钩子：先标记"请求中"再执行登记逻辑
-    yield* ctx.session.hook("context", (event) =>
-      Effect.sync(() => requesting.add(event.sessionID)).pipe(Effect.andThen(hook(event))),
-    )
-    // 压缩与生成阶段同样触发登记
-    yield* ctx.session.hook("compaction", hook)
-    yield* ctx.session.hook("generate", hook)
   }),
 })
 
-// 时间单位到毫秒的换算表
+function text(event: SessionHooks["context"]) {
+  const message = event.messages.at(-1)
+  if (message?.role !== "user" || message.content.length !== 1) return
+  const part = message.content[0]
+  return part?.type === "text" ? part.text : undefined
+}
+
 const units = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }
 
-/** 90% of a cache TTL such as "5m", so the ping lands before the cache expires. */
-// 按缓存 TTL（如 "5m"）的 90% 推算预热间隔，保证 ping 落在缓存过期之前
-function autoInterval(ttl: Provider.CacheTTL | undefined) {
-  // 匹配"数字 + 单位"格式
+function parseTTL(ttl: Provider.CacheTTL | undefined) {
   const match = ttl?.match(/^([\d.]+)(ms|s|m|h|d)$/)
-  // 命中则返回数值 x 单位毫秒 x 0.9 的时长
-  if (match) return Duration.millis(Number(match[1]) * units[match[2] as keyof typeof units] * 0.9)
+  if (match) return Duration.millis(Number(match[1]) * units[match[2] as keyof typeof units])
 }

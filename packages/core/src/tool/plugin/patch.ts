@@ -31,7 +31,7 @@ import { Patch } from "@opencode/util/patch"
 import { Permission } from "../../permission.js"
 // 导入工具描述文本（patch.txt）
 import DESCRIPTION from "../patch.txt"
-// 导入文件差异计算函数
+import GRAMMAR from "../patch-grammar.txt"
 import { fileDiff } from "./file-diff.js"
 
 // 工具名
@@ -142,6 +142,7 @@ export const Plugin = {
           description: DESCRIPTION,
           // 输入/输出 Schema
           input: Input,
+          freeform: { type: "lark", grammar: GRAMMAR },
           output: Output,
           // 执行体
           execute: (input, context) => {

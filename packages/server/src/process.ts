@@ -37,7 +37,7 @@ import { isAllowedCorsOrigin } from "./cors"
 import { authorizedRequest, unauthorizedResponse } from "./middleware/authorization"
 // 引入"去除父级 Span"的追踪工具
 import { withoutParentSpan } from "./request-tracing"
-// 引入路由构建函数
+import { RequestSite } from "./request-site"
 import { createRoutes } from "./routes"
 // 引入服务器信息（连接 URL 等）服务
 import { ServerInfo } from "./server-info"
@@ -126,7 +126,7 @@ export const start = Effect.fn("ServerProcess.start")(function* <E, R>(
     .serve(
       // transform 存在则先包装应用
       (transform ? transform(app) : app).pipe(
-        // 启用响应压缩（compression）
+        RequestSite.middleware(options),
         HttpMiddleware.compression(),
         // 启用 CORS：按选项中的白名单判断来源，预检结果缓存 24 小时
         HttpMiddleware.cors({ allowedOrigins: (origin) => isAllowedCorsOrigin(origin, options), maxAge: 86_400 }),

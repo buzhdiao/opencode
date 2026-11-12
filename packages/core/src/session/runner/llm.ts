@@ -66,7 +66,7 @@ import { StepFailedError } from "../error.js"
 import { SessionRunnerRetry } from "./retry.js"
 // 单步执行（流式请求+工具 fiber）。
 import { SessionStep } from "./step.js"
-// 工具输出截断/落盘。
+import { PersistentPty } from "../../persistent-pty/index.js"
 import { ToolOutput } from "../../tool-output.js"
 // 插件系统。
 import { Plugin } from "../../plugin.js"
@@ -75,11 +75,6 @@ import { PluginHooks } from "../../plugin/hooks.js"
 // 达到步数上限时注入的提示词。
 import { MAX_STEPS_PROMPT } from "./max-steps.js"
 
-// 流被中断后追加的合成用户消息：让模型“从断点继续、不要重复已输出内容”。
-const CONTINUE_AFTER_INCOMPLETE_STREAM =
-  "The previous response was interrupted. Continue from where you left off without repeating completed content."
-
-// 命中输出 token 上限（finish=length）后追加的合成消息：指示拆小步骤，而非道歉复述。
 const CONTINUE_AFTER_OUTPUT_LIMIT =
   "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces."
 
@@ -115,6 +110,7 @@ const layer = Layer.effect(
     const title = yield* SessionTitle.Service
     // 单步执行器。
     const steps = yield* SessionStep.make
+    const pty = yield* PersistentPty.Service
     // Title generation starts once input is visible and must not delay model execution.
     // 标题生成从“输入可见”就开始，且绝不能阻塞模型执行：用 FiberMap 按
     // sessionID 去重地后台并发（同一会话最多一个标题生成 fiber）。
@@ -219,7 +215,10 @@ const layer = Layer.effect(
                     yield* plugins.awaitActivation
                     // 选定 agent/model/tools。
                     const selected = yield* context.select(sessionID)
-                    const model = yield* context.resolveModel(selected.session)
+                    const model = yield* context.resolveModel(selected.session, {
+                      kind: "compaction",
+                      agent: selected.agent.id,
+                    })
                     // Preview updates without admitting them after the already-delivered compaction marker.
                     // preview 只读地取当前历史（不晋升新输入），供压缩请求使用。
                     const history = yield* SessionHistory.preview(db, sessionID, selected.instructions, model.ref)
@@ -274,7 +273,9 @@ const layer = Layer.effect(
                 // 插件可以借此继续喂输入（例如等待后台命令完成再继续）。
                 yield* restore(
                   SessionBackground.outstanding(jobs, store, sessionID).pipe(
-                    Effect.flatMap((background) => hooks.trigger("session", "experimental.idle", { sessionID, background })),
+                    Effect.flatMap((background) =>
+                      hooks.trigger("session", "experimental.idle", { sessionID, background }),
+                    ),
                   ),
                 )
                 // 钩子后如果收件箱又有了输入 → 继续循环处理。
@@ -316,8 +317,7 @@ const layer = Layer.effect(
       while (true) {
         const next = yield* advanceToStep()
         if (next._tag !== "Ready") return next
-        // runStep 返回“是否需要继续”（例如还有未完成的工具调用需要下一轮喂回）。
-        continuing = yield* runStep(next.context, step)
+        continuing = yield* runStep(next.context, step, input.interruption)
         stepped = true
         // 步号 +1。
         step++
@@ -341,9 +341,11 @@ const layer = Layer.effect(
     })
 
     /** Owns logical Step policy; each attempt owns its streaming, tools, and durable settlement. */
-    // runStep：跑一个“逻辑步骤”（一次模型请求及其工具执行），内部自带
-    // 重试/续流/溢出恢复循环；每次 attempt（见 step.ts）负责流、工具与落库。
-    const runStep = Effect.fn("SessionRunner.runStep")(function* (first: SessionContext.Loaded, step: number) {
+    const runStep = Effect.fn("SessionRunner.runStep")(function* (
+      first: SessionContext.Loaded,
+      step: number,
+      interruption: DrainInput["interruption"],
+    ) {
       const sessionID = first.session.id
       // 本逻辑步骤的助手消息 ID；重试/续流共用同一条，换内容时才换 ID。
       let assistantMessageID = SessionMessage.ID.create()
@@ -355,6 +357,7 @@ const layer = Layer.effect(
       let recoverOverflow = true
       // 是否允许“传输层整体重试（读前重试）”。
       let recoverContinuation = true
+      let retryAttempt: number | undefined
       while (true) {
         // Reuse boundary preparation once; retries refresh context without delivering more input.
         // 首轮复用外部传进来的 prepared 上下文；重试时重新准备（但不晋升新输入）。
@@ -418,6 +421,8 @@ const layer = Layer.effect(
         // steps.attempt：真正发请求、流式解析、调度工具 fiber（详见 step.ts）。
         const outcome = yield* steps.attempt({
           isLocationClosed: lifecycle.isClosed,
+          interruption,
+          handoffPrepared: pty.handoffPrepared,
           sessionID,
           assistantMessageID,
           agent: loaded.agent.id,
@@ -428,7 +433,7 @@ const layer = Layer.effect(
             // 工具调用可能在重载期间到达：先等插件激活，再做权限检查（读到最新 agent）。
             executeTool: (call) => plugins.awaitActivation.pipe(Effect.andThen(prepared.executeTool(call))),
           },
-          // 重试决策：综合错误分类、钩子意见与默认可重试性。
+          retryAttempt,
           retry: (cause, error, proposed) =>
             retry.decide({
               cause,
@@ -448,7 +453,7 @@ const layer = Layer.effect(
               : Effect.succeed(false),
           ),
         })
-        // 按结果分类处理：$match 对可辨识联合做穷尽匹配。
+        retryAttempt = undefined
         const completed = yield* SessionStep.Outcome.$match(outcome, {
           // Completed：一步正常完成。
           Completed: Effect.fnUntraced(function* (outcome) {
@@ -460,23 +465,14 @@ const layer = Layer.effect(
               )
             return outcome.needsContinuation
           }),
-          // Retry：请求层面失败且未输出 → 按决策等待后整体重试。
-          Retry: (outcome) =>
-            retry.wait({
-              decision: outcome.decision,
-              error: outcome.error,
-              assistantMessageID,
-            }),
-          // Continue：流中途断掉且已有部分输出 → 等待后发合成消息让模型续写。
-          Continue: Effect.fnUntraced(function* (outcome) {
+          Retry: Effect.fnUntraced(function* (outcome) {
+            retryAttempt = outcome.decision.attempt
             yield* retry.wait({
               decision: outcome.decision,
               error: outcome.error,
               assistantMessageID,
             })
-            yield* bus.publish(SessionEvent.Synthetic, { sessionID, text: CONTINUE_AFTER_INCOMPLETE_STREAM })
-            // 续写内容进入新的助手消息。
-            assistantMessageID = SessionMessage.ID.create()
+            if (outcome.freshAssistant) assistantMessageID = SessionMessage.ID.create()
           }),
           // OutputLimit：命中输出 token 上限 → 检查是否连续两次仍被截断。
           OutputLimit: Effect.fn("SessionRunner.continueOutputLimit")(function* (outcome) {
@@ -620,6 +616,7 @@ export const node = makeLocationNode({
     Job.node,
     SessionTitle.node,
     Snapshot.node,
+    PersistentPty.node,
     ToolOutput.node,
     Database.node,
   ],

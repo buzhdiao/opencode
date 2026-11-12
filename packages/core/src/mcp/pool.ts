@@ -1,9 +1,7 @@
 // 将本模块以命名空间 McpPool 整体再导出（barrel 模式）
 export * as McpPool from "./pool.js"
 
-// 仅引入类型：MCP SDK 的 OAuth 客户端提供者
-import type { OAuthClientProvider } from "@modelcontextprotocol/client"
-// 仅引入类型：MCP 服务器配置 schema
+import type { AuthProvider } from "@modelcontextprotocol/client"
 import type { Mcp } from "@opencode/schema/mcp"
 // 引入跨平台生成器节点（全局层依赖）
 import { CrossSpawnSpawner } from "@opencode/util/cross-spawn-spawner"
@@ -41,8 +39,7 @@ export interface Input extends McpConnection.Input {
 export interface Selection {
   // 本连接区别于同一服务器其他连接的键
   readonly key: string
-  // 打开连接所用的 OAuth 提供者
-  readonly authProvider: Effect.Effect<OAuthClientProvider | undefined>
+  readonly authProvider: Effect.Effect<AuthProvider | undefined>
 }
 
 // 池服务接口
@@ -77,12 +74,11 @@ export const key = (input: {
   readonly credential?: string
   // 客户端标识
   readonly clientInfo?: { readonly name: string; readonly version: string }
+  readonly mcpEvents?: boolean
 }) => {
   // 局部简写
   const config = input.config
-  // 远近/本地共有的键片段：协议、超时、客户端信息
-  const common = [config.protocol, config.timeout ?? null, input.clientInfo ?? null]
-  // 远程服务器键
+  const common = [config.protocol, config.timeout ?? null, input.clientInfo ?? null, input.mcpEvents === true]
   if (config.type === "remote")
     return JSON.stringify([
       // 类型标记
@@ -135,9 +131,7 @@ function fingerprint(secret: string | Record<string, string> | undefined) {
 // registered right now, never through the one that opened the connection.
 // Holder：一个持有共享连接的 Location；池只通过当前登记的持有者触达各方
 interface Holder {
-  // 该持有者的 OAuth 提供者
-  readonly authProvider: Effect.Effect<OAuthClientProvider | undefined>
-  // 该持有者的交互创建处理器
+  readonly authProvider: Effect.Effect<AuthProvider | undefined>
   readonly elicitation: McpClient.ElicitationHandler["create"]
   // 连接关闭回调
   readonly closed: (reason: string) => void
@@ -192,9 +186,7 @@ export const layer = Layer.effect(
     const unfixed = new Set<string>()
 
     // Takes only data from the Location that opens it: the connection outlives that Location's claim.
-    // open：创建一个新槽位；只取打开方 Location 的数据（连接比其占用更长寿）
-    const open = (key: string, input: Pick<Input, "name" | "config" | "directory" | "clientInfo">) => {
-      // 组装槽位与其底层共享连接
+    const open = (key: string, input: Pick<Input, "name" | "config" | "directory" | "clientInfo" | "mcpEvents">) => {
       const slot: Slot = {
         // 持有者集合
         holders: new Set(),
@@ -216,6 +208,7 @@ export const layer = Layer.effect(
           shared: true,
           // 客户端标识
           clientInfo: input.clientInfo,
+          mcpEvents: input.mcpEvents,
           // Every holder of a key presents the same credential, so any of them can build the provider.
           // OAuth 提供者：同键持有者凭证一致，任取一个持有者构建
           authProvider: Effect.suspend(() => slot.holders.values().next().value?.authProvider ?? Effect.undefined),
@@ -377,8 +370,13 @@ export const layer = Layer.effect(
       // 取现有槽位或新开一个
       const slot =
         slots.get(key) ??
-        open(key, { name: input.name, config: input.config, directory: input.directory, clientInfo: input.clientInfo })
-      // 注册持有者（释放时自动放手）
+        open(key, {
+          name: input.name,
+          config: input.config,
+          directory: input.directory,
+          clientInfo: input.clientInfo,
+          mcpEvents: input.mcpEvents,
+        })
       yield* Effect.acquireRelease(
         Effect.sync(() => slot.holders.add(holder)),
         () => release(key, slot, holder),

@@ -15,7 +15,8 @@ import { Instance } from "../instance/service.js"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 // 导入会话事件定义
 import { SessionEvent } from "./event.js"
-// 导入运行协调器（会话级单执行体协调）
+import { SessionInbox } from "./inbox.js"
+import { SubagentReport } from "./execution/subagent-report.js"
 import { SessionRunCoordinator } from "./run-coordinator.js"
 // 导入会话运行器
 import { SessionRunner } from "./runner/index.js"
@@ -25,8 +26,6 @@ import { SessionSchema } from "./schema.js"
 import { SessionStore } from "./store.js"
 // 导入错误转换辅助（内部错误 → 会话错误）
 import { toSessionError } from "./to-session-error.js"
-// 导入会话收件箱模块
-import { SessionInbox } from "./inbox.js"
 
 // 服务接口：管理本进程拥有的会话执行
 export interface Interface {
@@ -88,6 +87,7 @@ export const layer = Layer.effect(
     const instances = yield* Instance.Service
     const bus = yield* Bus.Service
     const jobs = yield* Job.Service
+    const inbox = yield* SessionInbox.Service
     const db = (yield* Database.Service).db
     // 发布生命周期事件时记录发布失败的日志（非纯中断的失败才记录）
     const reportLifecycle = <A>(sessionID: SessionSchema.ID, effect: Effect.Effect<A>) =>
@@ -110,11 +110,23 @@ export const layer = Layer.effect(
     const claimOnCommit = (sessionID: SessionSchema.ID) => ({
       commit: () => store.claim(sessionID),
     })
-    // 提交时钩子：释放会话的执行声明
-    const releaseOnCommit = (sessionID: SessionSchema.ID) => ({
-      commit: () => store.release(sessionID),
+    // The report coordinator is built first so the run coordinator's hooks can use it, while its
+    // wake and draining dependencies bind late to the coordinator the hooks belong to.
+    const holder: {
+      coordinator?: SessionRunCoordinator.Coordinator<SessionSchema.ID, SessionRunner.RunError, InterruptReason>
+    } = {}
+    const subagentReport = SubagentReport.make({
+      store,
+      jobs,
+      inbox,
+      wake: (sessionID) =>
+        Effect.suspend(() => (holder.coordinator ? holder.coordinator.wake(sessionID) : Effect.void)),
+      draining: Effect.suspend<ReadonlySet<SessionSchema.ID>, never, never>(() =>
+        holder.coordinator ? holder.coordinator.draining : Effect.succeed(new Set<SessionSchema.ID>()),
+      ),
     })
-    // 排水循环：运行会话直至完成；Moved/Reloaded 结果携带续延（continuation）继续排水
+    // Why a Session's execution is being interrupted, read from the coordinator once it exists.
+    let interruption: (sessionID: SessionSchema.ID) => InterruptReason | undefined = () => undefined
     const drain = Effect.fnUntraced(function* (
       sessionID: SessionSchema.ID,
       force: boolean,
@@ -127,7 +139,14 @@ export const layer = Layer.effect(
       if (!session) return yield* Effect.die(new Error(`Session not found: ${sessionID}`))
       // 在会话对应实例的作用域内用运行器排水
       const result = yield* SessionRunner.Service.use((runner) =>
-        runner.drain({ sessionID, force, continuation, promotable, stepped }),
+        runner.drain({
+          sessionID,
+          force,
+          continuation,
+          promotable,
+          stepped,
+          interruption: () => interruption(sessionID),
+        }),
       ).pipe(
         instances.provide(session),
         // 非纯中断的失败记录错误日志
@@ -150,7 +169,17 @@ export const layer = Layer.effect(
       started: (sessionID) =>
         reportLifecycle(
           sessionID,
-          bus.publish(SessionEvent.Execution.Started, { sessionID }, claimOnCommit(sessionID)),
+          Effect.gen(function* () {
+            // Bind before the started publication yields to SQLite so a cancel arriving during
+            // that window still matches this generation.
+            const before = yield* jobs.currentGeneration(sessionID)
+            const event = yield* bus.publish(SessionEvent.Execution.Started, { sessionID }, claimOnCommit(sessionID))
+            const bound = before?.running ? before : yield* jobs.currentGeneration(sessionID)
+            subagentReport.started(sessionID, {
+              startedSeq: event.durable.seq,
+              boundGeneration: bound?.running ? bound.generation : undefined,
+            })
+          }),
         ),
       // 排水回调：直接调用 drain（无续延）
       drain: (sessionID, force, promotable) => drain(sessionID, force, undefined, promotable),
@@ -162,36 +191,27 @@ export const layer = Layer.effect(
           Effect.gen(function* () {
             // 把出口映射为终结结果
             const outcome = terminal(exit, reason)
-            // 成功：发布 Succeeded 事件并释放声明
-            if (outcome.type === "succeeded") {
-              yield* bus.publish(SessionEvent.Execution.Succeeded, { sessionID }, releaseOnCommit(sessionID))
+            if (outcome.type === "interrupted" && outcome.reason === "shutdown") {
+              subagentReport.clear(sessionID)
+              // Shutdown keeps the claim and the running Job row for restart continuity.
+              yield* bus.publish(SessionEvent.Execution.Interrupted, { sessionID, reason: "shutdown" })
               return
             }
-            // 被中断：用户停止需取消关联任务并释放声明；shutdown 保留声明以备重启恢复
-            if (outcome.type === "interrupted") {
-              // Deliberate stops release the claim; shutdown keeps it for restart continuity.
-              if (outcome.reason !== "shutdown") yield* jobs.cancel(sessionID)
-              yield* bus.publish(
-                SessionEvent.Execution.Interrupted,
-                { sessionID, reason: outcome.reason },
-                outcome.reason === "shutdown" ? undefined : releaseOnCommit(sessionID),
-              )
-              return
-            }
-            // 失败：发布 Failed 事件（带错误详情）并释放声明
-            yield* bus.publish(
-              SessionEvent.Execution.Failed,
-              {
-                sessionID,
-                error: outcome.error,
-              },
-              releaseOnCommit(sessionID),
+            // Claim the Job generation before cancelling it so the settlement commit owns its outbox row.
+            const settlement = yield* subagentReport.prepare(sessionID, outcome)
+            if (outcome.type === "interrupted") yield* jobs.cancel(sessionID)
+            yield* publishTerminal(bus, sessionID, outcome, settlement.commit)
+            // Post-commit delivery is best effort: a retained outbox marker is recovered on the
+            // next restart, and a delivery defect must not fail the settled hook.
+            yield* settlement.deliver.pipe(
+              Effect.ignoreCause({ log: "Error", message: "Subagent report delivery failed" }),
             )
           }),
         ),
     })
+    holder.coordinator = coordinator
 
-    // 返回服务实现：大部分能力直接透传协调器
+    interruption = coordinator.interruption
     return Service.of({
       active: coordinator.active,
       isActive: coordinator.isActive,
@@ -225,11 +245,24 @@ export const layer = Layer.effect(
   }),
 )
 
-// 创建全局依赖注入节点：声明服务、层实现及依赖
+/** Publishes the terminal event with the settlement's atomic commit. */
+function publishTerminal(
+  bus: Bus.Interface,
+  sessionID: SessionSchema.ID,
+  outcome: ReturnType<typeof terminal>,
+  commit: (seq: number) => Effect.Effect<void>,
+) {
+  if (outcome.type === "succeeded") return bus.publish(SessionEvent.Execution.Succeeded, { sessionID }, { commit })
+  if (outcome.type === "interrupted") {
+    return bus.publish(SessionEvent.Execution.Interrupted, { sessionID, reason: outcome.reason }, { commit })
+  }
+  return bus.publish(SessionEvent.Execution.Failed, { sessionID, error: outcome.error }, { commit })
+}
+
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [SessionStore.node, Instance.node, Bus.node, Database.node, Job.node],
+  deps: [SessionStore.node, Instance.node, Bus.node, Database.node, Job.node, SessionInbox.node],
 })
 
 /** Low-level compatibility layer for callers that only need durable Session recording. */

@@ -11,11 +11,11 @@ import { Model } from "@opencode/schema/model"
 import { Provider } from "@opencode/schema/provider"
 // effect：Context 依赖容器、Effect 运行时、Layer 层、Schema 编解码
 import { Context, Effect, Layer, Schema } from "effect"
-// 代理（Agent）服务：读取代理默认模型
+import type { SessionRequestKind } from "@opencode/plugin/effect/session"
 import { Agent } from "../../agent.js"
 // 模型解析器：把模型条目解析为可用的语言模型
 import { ModelResolver } from "../../model-resolver.js"
-// 会话 Schema：Info/ID 类型
+import { PluginHooks } from "../../plugin/hooks.js"
 import { SessionSchema } from "../schema.js"
 
 // 会话未选择模型且无法推导默认模型时抛出的错误
@@ -58,6 +58,7 @@ export interface Interface {
   readonly resolve: (
     session: SessionSchema.Info,
     available: () => Effect.Effect<ReadonlyArray<Model.Info>>,
+    request: { readonly kind: SessionRequestKind; readonly agent: Agent.ID },
   ) => Effect.Effect<Resolved, Error>
 }
 
@@ -100,43 +101,55 @@ const layer = Layer.effect(
     // 获取模型解析器与代理服务
     const resolver = yield* ModelResolver.Service
     const agents = yield* Agent.Service
-    return Service.of({
-      resolve: Effect.fn("SessionRunnerModel.resolve")(function* (session, available) {
-        // Location plugins populate and filter the catalog asynchronously during layer startup.
-        // 位置插件在层启动期间异步填充并过滤目录
-        // 会话未显式选模型时：按代理默认模型 → 全局默认的顺序解析
-        if (!session.model) {
-          // 读取代理默认模型（可能为空）
-          const agent = (yield* agents.select(session.agent)).info?.model
-          // 在可用目录中找代理默认的模型条目
-          const preferred =
-            agent &&
-            (yield* available()).find((model) => model.providerID === agent.providerID && model.id === agent.id)
-          // 有候选则按其变体解析，否则走解析器的默认解析
-          const resolved = preferred
-            ? yield* resolver.resolveModel(preferred, agent.variant)
-            : yield* resolver.resolve()
-          // 解析成功则返回
-          if (resolved) return resolved
-          // 仍无模型可用则报「未选择模型」
-          return yield* new ModelNotSelectedError({ sessionID: session.id })
-        }
-        // 会话显式选了模型：在可用目录中查找匹配条目
-        const selected = (yield* available()).find(
-          (model) => model.providerID === session.model?.providerID && model.id === session.model.id,
+    const hooks = yield* PluginHooks.Service
+    // Location plugins populate and filter the catalog asynchronously during layer startup.
+    const select = Effect.fn("SessionRunnerModel.select")(function* (
+      session: SessionSchema.Info,
+      available: () => Effect.Effect<ReadonlyArray<Model.Info>>,
+    ) {
+      const find = (ref: Model.Ref) =>
+        available().pipe(
+          Effect.map((models) => models.find((model) => model.providerID === ref.providerID && model.id === ref.id)),
         )
-        // 目录中不存在则报「模型不可用」
-        if (!selected)
-          return yield* new ModelUnavailableError({
-            providerID: session.model.providerID,
-            modelID: session.model.id,
-          })
-        // 按会话选定的变体解析模型
-        return yield* resolver.resolveModel(selected, session.model.variant)
+      if (session.model) {
+        const info = yield* find(session.model)
+        if (info) return { info, variant: session.model.variant }
+        return yield* new ModelUnavailableError({ providerID: session.model.providerID, modelID: session.model.id })
+      }
+      const agent = (yield* agents.select(session.agent)).info?.model
+      const preferred = agent && (yield* find(agent))
+      if (preferred) return { info: preferred, variant: agent.variant }
+      const info = yield* resolver.fallback()
+      if (info) return { info, variant: undefined }
+      return yield* new ModelNotSelectedError({ sessionID: session.id })
+    })
+    return Service.of({
+      resolve: Effect.fn("SessionRunnerModel.resolve")(function* (session, available, request) {
+        const selected = yield* select(session, available)
+        const ref = Model.Ref.make({
+          providerID: selected.info.providerID,
+          id: selected.info.id,
+          ...(selected.variant === undefined ? {} : { variant: selected.variant }),
+        })
+        const model = (yield* hooks.trigger("session", "experimental.model.resolve", {
+          sessionID: session.id,
+          agent: request.agent,
+          kind: request.kind,
+          model: ref,
+        })).model
+        if (model.providerID === ref.providerID && model.id === ref.id && model.variant === ref.variant)
+          return yield* resolver.resolveModel(selected.info, selected.variant)
+        // Same provider only: the model may be hidden from the picker, and its credentials and hooks stay the selection's.
+        const resolved = model.providerID === ref.providerID ? yield* resolver.resolve(model) : undefined
+        if (resolved) return resolved
+        return yield* new ModelUnavailableError({ providerID: model.providerID, modelID: model.id })
       }),
     })
   }),
 )
 
-// 导出位置节点：服务层依赖 ModelResolver 与 Agent 节点
-export const node = makeLocationNode({ service: Service, layer, deps: [ModelResolver.node, Agent.node] })
+export const node = makeLocationNode({
+  service: Service,
+  layer,
+  deps: [ModelResolver.node, Agent.node, PluginHooks.node],
+})

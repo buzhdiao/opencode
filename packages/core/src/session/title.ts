@@ -89,9 +89,8 @@ export const layer = Layer.effect(
       readonly text: string
       readonly model: SessionRunnerModel.Resolved
     }) {
-      // 收集流式文本增量
-      const chunks: string[] = []
-      // 流失败标志
+      const chunks: Array<{ id: string; text: string }> = []
+      const commentary = new Set<string>()
       let failed = false
       // 累计的用量记录（有结果才发布）
       let usage: SessionUsage.Recorded | undefined
@@ -115,12 +114,16 @@ export const layer = Layer.effect(
       })
       // 准备阶段已被拦截并给出结果：直接返回该结果
       if (prepared.event.result !== undefined) return prepared.event.result
-      // 流式调用模型：收集文本、累计各步用量；失败标记而不中断
+      const metadataKey = prepared.request.model.route.providerMetadataKey ?? prepared.request.model.provider
       yield* llm.stream(prepared.request, prepared.options).pipe(
         Stream.runForEach((event) => {
-          // 文本增量事件：追加到 chunks
-          if (LLMEvent.is.textDelta(event)) chunks.push(event.text)
-          // 步骤结束事件：记录该步用量并累计
+          // Responses can classify a text block only when it ends; filter after the stream completes.
+          if (LLMEvent.is.textStart(event) || LLMEvent.is.textDelta(event) || LLMEvent.is.textEnd(event)) {
+            const phase = event.providerMetadata?.[metadataKey]?.phase
+            if (phase === "commentary") commentary.add(event.id)
+            if (phase === "final_answer" || phase === null) commentary.delete(event.id)
+          }
+          if (LLMEvent.is.textDelta(event)) chunks.push({ id: event.id, text: event.text })
           if (LLMEvent.is.stepFinish(event)) {
             const step = SessionUsage.record(event.usage, input.model.cost)
             usage = usage ? SessionUsage.add(usage, step) : step
@@ -143,6 +146,8 @@ export const layer = Layer.effect(
       if (failed) return
       // 合并文本后取第一条非空行作为标题
       return chunks
+        .filter((chunk) => !commentary.has(chunk.id))
+        .map((chunk) => chunk.text)
         .join("")
         .split("\n")
         .map((line) => line.trim())

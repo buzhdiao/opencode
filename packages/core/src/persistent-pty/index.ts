@@ -35,18 +35,20 @@ import { ShellSelect } from "../shell/select.js"
 import {
   makeDaemonTransport,
   type DaemonAttachment,
+  type DaemonError,
   type DaemonTransport,
+  type Exited,
+  type Metadata,
+  type ProcessInfo,
   type Role,
+  type Signal,
   type SubscribeInput,
   type WireResponse,
-  type WireTerminal,
 } from "./daemon.js"
 // 引入按运行时解析 PTY 二进制路径的函数（Bun/Node/workerd 各有实现）
 import { resolveBinary } from "#persistent-pty-binary"
 
-// 再导出守护进程模块的角色与流事件类型
-export type { Role, StreamEvent } from "./daemon.js"
-// 再导出交接（Handoff）类型
+export type { Metadata, Role, Signal, StreamEvent } from "./daemon.js"
 export { Handoff } from "@opencode/schema/persistent-pty"
 // 再导出当前运行时是否支持持久化 PTY 的标记
 export { available } from "#persistent-pty-binary"
@@ -78,26 +80,73 @@ export type Attachment = {
   readonly detach: () => void
 }
 
-// 不可用错误：当前运行时或守护进程不可用
+/** The daemon could not be reached or started; the request never ran. */
 export class UnavailableError extends Schema.TaggedError<UnavailableError>()("PersistentPty.UnavailableError", {
   message: Schema.String,
 }) {}
 
-// 未找到错误：指定 ID 的持久化终端不存在
+/** The daemon rejected the request, or its reply was lost after it was sent, so it may have run. */
+export class RequestError extends Schema.TaggedError<RequestError>()("PersistentPty.RequestError", {
+  message: Schema.String,
+}) {}
+
 export class NotFoundError extends Schema.TaggedError<NotFoundError>()("PersistentPty.NotFoundError", {
   ptyID: Pty.ID,
 }) {}
 
-// 无效工作目录错误：创建终端时 cwd 不是目录
+export class ProcessNotFoundError extends Schema.TaggedError<ProcessNotFoundError>()(
+  "PersistentPty.ProcessNotFoundError",
+  { processID: Schema.Number },
+) {}
+
 export class InvalidCwdError extends Schema.TaggedError<InvalidCwdError>()("PersistentPty.InvalidCwdError", {
   cwd: Schema.String,
   message: Schema.String,
 }) {}
 
-// 特性不支持错误：守护进程版本过旧，缺少所需特性
-export class UnsupportedError extends Schema.TaggedError<UnsupportedError>()("PersistentPty.UnsupportedError", {
-  feature: Schema.String,
-}) {}
+/** A non-PTY process run by the daemon, its output written to `outputPath`. */
+export type PipeInfo = {
+  readonly id: number
+  readonly pid: number | undefined
+  readonly command: readonly string[]
+  readonly cwd: string
+  readonly groupID: string
+  readonly lifecycle:
+    | { readonly status: "running" }
+    | { readonly status: "exited"; readonly exitCode: number | undefined; readonly signal: string | undefined }
+    | { readonly status: "failed"; readonly message: string }
+  /** Bytes counted so far; the file can hold a little more. Pair only bytes up to here with `outputLines`. */
+  readonly outputTail: number
+  readonly outputLines: number
+  readonly outputPath: string
+  readonly outputError: string | undefined
+  readonly metadata: Metadata
+  readonly startedAt: number
+  readonly exitedAt: number | undefined
+}
+
+export type PipeExit = {
+  readonly exitCode: number | undefined
+  readonly signal: string | undefined
+  /** Runs past the file's size when `outputError` is set; use the file's real size instead. */
+  readonly finalOffset: number
+  readonly outputLines: number
+  readonly outputError: string | undefined
+  readonly exitedAt: number
+}
+
+export type CreatePipeInput = {
+  readonly program: string
+  readonly args: readonly string[]
+  /** Absolute. */
+  readonly cwd: string
+  /** The child's whole environment; the daemon's own is not inherited. */
+  readonly env: Readonly<Record<string, string>>
+  readonly groupID: string
+  /** Absolute; truncated on open, symlinks refused. */
+  readonly outputPath: string
+  readonly metadata: Metadata
+}
 
 // 服务接口：持久化终端的全部操作
 export interface Interface {
@@ -146,12 +195,7 @@ export interface Interface {
     rows: number,
     data: Uint8Array,
   ) => Effect.Effect<void, NotFoundError | UnavailableError>
-  // rename：重命名终端标题
-  readonly rename: (
-    id: Pty.ID,
-    title: string | null,
-  ) => Effect.Effect<Info, NotFoundError | UnsupportedError | UnavailableError>
-  // snapshot：获取终端屏幕快照
+  readonly rename: (id: Pty.ID, title: string | null) => Effect.Effect<Info, NotFoundError | UnavailableError>
   readonly snapshot: (id: Pty.ID) => Effect.Effect<Snapshot, NotFoundError | UnavailableError>
   // read：读取会话当前终端的屏幕行
   readonly read: (sessionID: Session.ID, lines?: number) => Effect.Effect<ReadResult | null, UnavailableError>
@@ -161,11 +205,26 @@ export interface Interface {
   readonly shutdown: () => Effect.Effect<void, UnavailableError>
   // handoff：申请重启交接票据
   readonly handoff: () => Effect.Effect<Handoff | null, UnavailableError>
-  // attach：订阅终端输出流
-  readonly attach: (
-    id: Pty.ID,
-    input: SubscribeInput,
-  ) => Effect.Effect<Attachment, NotFoundError | UnavailableError>
+  /**
+   * Whether a handoff to the next server is prepared and its ticket still valid: this server is being replaced, so
+   * the daemon's processes should be left running for the next one. A shutdown clears it.
+   */
+  readonly handoffPrepared: () => boolean
+  readonly attach: (id: Pty.ID, input: SubscribeInput) => Effect.Effect<Attachment, NotFoundError | UnavailableError>
+  /** Starts the daemon if needed. Fall back to another spawner only on `UnavailableError`. */
+  readonly createPipe: (input: CreatePipeInput) => Effect.Effect<PipeInfo, UnavailableError | RequestError>
+  /** Resolves when the process exits, on its own connection with no timeout; interrupting closes it. */
+  readonly waitPipe: (id: number) => Effect.Effect<PipeExit, UnavailableError | RequestError>
+  /** `ProcessNotFoundError` for an unknown id, a PTY, or when no daemon is running. */
+  readonly getPipe: (id: number) => Effect.Effect<PipeInfo, ProcessNotFoundError | UnavailableError>
+  /** Signals the process group without forgetting the process; `waitPipe` then reports the signal. */
+  readonly signalPipe: (id: number, signal: Signal) => Effect.Effect<void, UnavailableError | RequestError>
+  /** Replaces the stored metadata. */
+  readonly setPipeMetadata: (id: number, metadata: Metadata) => Effect.Effect<void, UnavailableError | RequestError>
+  /** Kills the process if it still runs and forgets it; the output file is left alone. */
+  readonly terminatePipe: (id: number) => Effect.Effect<void, UnavailableError | RequestError>
+  /** Never starts the daemon; empty when none is running. */
+  readonly listPipes: () => Effect.Effect<PipeInfo[], UnavailableError | RequestError>
 }
 
 // Effect 服务类：以 Context.Tag 标识为 "@opencode/PersistentPty"
@@ -206,26 +265,22 @@ const makeLayer = (options: Options = {}) =>
 
       // list：列出持久化终端（可按会话过滤）；守护进程未运行时返回空数组
       const list = Effect.fn("PersistentPty.list")(function* (sessionID?: Session.ID) {
-        // 向守护进程请求终端列表（未运行则得到 undefined）
-        const response = yield* optionalRequest(daemon, { op: "list" })
-        // 守护进程未运行：返回空列表
+        const response = yield* optionalRequest(daemon, { op: "list", mode: "pty" })
         if (!response) return []
-        // 应答类型不符则报错
-        if (response.type !== "terminals") return yield* unexpected(response)
-        // 转换为 Info 并按会话 ID 过滤
-        return response.terminals
+        if (response.type !== "processes") return yield* unexpected(response)
+        return response.processes
           .map(toInfo)
           .filter((terminal) => sessionID === undefined || terminal.sessionID === sessionID)
       })
 
       // get：按 ID 获取单个终端信息
       const get = Effect.fn("PersistentPty.get")(function* (id: Pty.ID) {
-        // 从列表中查找目标终端
-        const found = (yield* list()).find((terminal) => terminal.id === id)
-        // 不存在则抛出未找到错误
-        if (!found) return yield* new NotFoundError({ ptyID: id })
-        // 返回找到的终端
-        return found
+        // Any ID that is not one of ours names no terminal; every other method looks the terminal up here first.
+        const parsed = parseID(id)
+        const found =
+          parsed === undefined ? undefined : yield* lookup(daemon, parsed).pipe(Effect.mapError(unavailable))
+        if (found?.mode !== "pty") return yield* new NotFoundError({ ptyID: id })
+        return toInfo(found)
       })
 
       // create：在会话中创建新的持久化终端
@@ -249,7 +304,7 @@ const makeLayer = (options: Options = {}) =>
         const response = yield* request(
           daemon,
           {
-            op: "create",
+            op: "create_pty",
             program: input.command ?? ShellSelect.environment(global.bin),
             args: input.args,
             cwd,
@@ -263,9 +318,7 @@ const makeLayer = (options: Options = {}) =>
         )
         // 应答类型必须是 created
         if (response.type !== "created") return yield* unexpected(response)
-        // 转换终端信息
-        const terminal = toInfo(response.terminal)
-        // 发布"终端已添加"事件
+        const terminal = toInfo(response.process)
         yield* bus.publish(Added, { sessionID, terminal })
         // 返回新终端信息
         return terminal
@@ -295,9 +348,9 @@ const makeLayer = (options: Options = {}) =>
         ),
       )
 
-      // resize：调整终端尺寸；更新会话选中状态
-      const resize = Effect.fn("PersistentPty.resize")((id: Pty.ID, cols: number, rows: number, attachmentID?: string) =>
-        command(id, "resize", { attachment_id: attachmentID ?? null, cols, rows }, true),
+      const resize = Effect.fn("PersistentPty.resize")(
+        (id: Pty.ID, cols: number, rows: number, attachmentID?: string) =>
+          command(id, "resize", { attachment_id: attachmentID ?? null, cols, rows }, true),
       )
 
       // control：控制器（controller）专用的尺寸调整（必须携带附件 ID）
@@ -321,11 +374,6 @@ const makeLayer = (options: Options = {}) =>
       const rename = Effect.fn("PersistentPty.rename")(function* (id: Pty.ID, title: string | null) {
         // 先确认终端存在
         const terminal = yield* get(id)
-        // Daemons without the feature drop the connection on unknown requests.
-        // 守护进程不支持 rename 特性时（旧版本会直接断连）先探测，避免误伤
-        if (!(yield* daemon.supports("rename").pipe(Effect.mapError(unavailable))))
-          return yield* new UnsupportedError({ feature: "rename" })
-        // 发送重命名请求
         const response = yield* request(daemon, { op: "rename", id: fromID(id), title })
         // 应答必须是 ok
         if (response.type !== "ok") return yield* unexpected(response)
@@ -347,7 +395,7 @@ const makeLayer = (options: Options = {}) =>
         if (response.type !== "snapshot") return yield* unexpected(response)
         // 组装快照结果（base64 检查点解码为字节）
         return {
-          info: toInfo(response.terminal),
+          info: toInfo(response.process),
           text: response.text,
           checkpoint: Buffer.from(response.checkpoint_base64, "base64"),
           cursor: { x: response.cursor_x, y: response.cursor_y },
@@ -376,9 +424,7 @@ const makeLayer = (options: Options = {}) =>
         const response = yield* request(daemon, { op: "read_rows", id: fromID(id), rows: lines })
         // 应答类型必须是 rows
         if (response.type !== "rows") return yield* unexpected(response)
-        // 转换终端信息
-        const info = toInfo(response.terminal)
-        // 组装读取结果：屏幕文本（按行拼接）与尺寸/光标
+        const info = toInfo(response.process)
         return {
           ptyID: info.id,
           title: info.title,
@@ -408,9 +454,11 @@ const makeLayer = (options: Options = {}) =>
         return undefined
       })
 
-      // shutdown：关闭守护进程并清空会话选中映射
+      // When the prepared handoff's ticket expires; 0 when none is prepared.
+      let handoffExpiresAt = 0
+
       const shutdown = Effect.fn("PersistentPty.shutdown")(function* () {
-        // 请求关闭（守护进程未运行则得到 undefined）
+        handoffExpiresAt = 0
         const response = yield* daemon.shutdown.pipe(Effect.mapError(unavailable))
         // 清空会话选中映射
         current.clear()
@@ -420,8 +468,11 @@ const makeLayer = (options: Options = {}) =>
         if (response.type !== "ok") return yield* unexpected(response)
       })
 
-      // handoff：获取交接票据（服务重启时转移终端所有权）
-      const handoff = Effect.fn("PersistentPty.handoff")(() => daemon.handoff.pipe(Effect.mapError(unavailable)))
+      const handoff = Effect.fn("PersistentPty.handoff")(function* () {
+        const prepared = yield* daemon.handoff.pipe(Effect.mapError(unavailable))
+        if (prepared) handoffExpiresAt = prepared.expiresAt
+        return prepared
+      })
 
       // removeVisibleExit：移除"已退出但界面仍可见"的终端（后台执行，按 ID 去重）
       const removeVisibleExit = (id: Pty.ID) => {
@@ -502,11 +553,10 @@ const makeLayer = (options: Options = {}) =>
             },
           })
           .pipe(Effect.mapError(unavailable))
-        // 控制者附件会更新会话的当前终端映射
-        if (attachment.role === "controller") current.set(attachment.terminal.group_id, id)
-        // 组装上层附件对象
+        const info = toInfo(attachment.terminal)
+        if (attachment.role === "controller") current.set(info.sessionID, id)
         return {
-          info: toInfo(attachment.terminal),
+          info,
           role: attachment.role,
           generation: attachment.generation,
           replay: attachment.replay,
@@ -515,7 +565,61 @@ const makeLayer = (options: Options = {}) =>
         }
       })
 
-      // 用上述实现组装服务实例
+      const createPipe = Effect.fn("PersistentPty.createPipe")(function* (input: CreatePipeInput) {
+        const response = yield* daemon
+          .request(
+            {
+              op: "create_pipe",
+              program: input.program,
+              args: input.args,
+              cwd: input.cwd,
+              env: input.env,
+              group_id: input.groupID,
+              output_path: input.outputPath,
+              metadata: input.metadata,
+            },
+            true,
+          )
+          .pipe(Effect.mapError(pipeError))
+        if (response.type !== "created") return yield* unexpectedPipe(response)
+        return toPipeInfo(response.process)
+      })
+
+      const waitPipe = Effect.fn("PersistentPty.waitPipe")(function* (id: number) {
+        return toPipeExit(yield* daemon.wait(id).pipe(Effect.mapError(pipeError)))
+      })
+
+      const getPipe = Effect.fn("PersistentPty.getPipe")(function* (id: number) {
+        const found = yield* lookup(daemon, id).pipe(Effect.mapError(unavailable))
+        if (found?.mode !== "pipe") return yield* new ProcessNotFoundError({ processID: id })
+        return toPipeInfo(found)
+      })
+
+      const pipeCommand = (value: object) =>
+        Effect.gen(function* () {
+          const response = yield* daemon.request(value).pipe(Effect.mapError(pipeError))
+          if (response.type !== "ok") return yield* unexpectedPipe(response)
+        })
+
+      const signalPipe = Effect.fn("PersistentPty.signalPipe")((id: number, signal: Signal) =>
+        pipeCommand({ op: "signal", id, signal }),
+      )
+
+      const setPipeMetadata = Effect.fn("PersistentPty.setPipeMetadata")((id: number, metadata: Metadata) =>
+        pipeCommand({ op: "set_metadata", id, metadata }),
+      )
+
+      const terminatePipe = Effect.fn("PersistentPty.terminatePipe")((id: number) =>
+        pipeCommand({ op: "terminate", id }),
+      )
+
+      const listPipes = Effect.fn("PersistentPty.listPipes")(function* () {
+        const response = yield* daemon.requestIfRunning({ op: "list", mode: "pipe" }).pipe(Effect.mapError(pipeError))
+        if (!response) return []
+        if (response.type !== "processes") return yield* unexpectedPipe(response)
+        return response.processes.map(toPipeInfo)
+      })
+
       return Service.of({
         list,
         get,
@@ -530,14 +634,22 @@ const makeLayer = (options: Options = {}) =>
         remove,
         shutdown,
         handoff,
+        handoffPrepared: () => Date.now() < handoffExpiresAt,
         attach,
+        createPipe,
+        waitPipe,
+        getPipe,
+        signalPipe,
+        setPipeMetadata,
+        terminatePipe,
+        listPipes,
       })
     }),
   )
 
 // 默认服务层（无自定义选项）
 export const layer = makeLayer()
-// configured：按选项构建全局单例节点（依赖 Bus 与 Global 节点）
+export const layerWith = (options: Options) => makeLayer(options)
 export const configured = (options?: Options) =>
   makeGlobalNode({
     service: Service,
@@ -555,7 +667,21 @@ const request = (daemon: DaemonTransport, value: object, start = false) =>
 const optionalRequest = (daemon: DaemonTransport, value: object) =>
   daemon.requestIfRunning(value).pipe(Effect.mapError(unavailable))
 
-// unexpected：构造"意外应答类型"的失败 Effect
+// `get` fails only for an unknown id, and no running daemon has no processes.
+const lookup = (daemon: DaemonTransport, id: number) =>
+  daemon.requestIfRunning({ op: "get", id }).pipe(
+    Effect.catchIf(
+      (error) => error.kind === "request",
+      () => Effect.succeed(undefined),
+    ),
+    Effect.flatMap((response) => {
+      if (!response) return Effect.succeed(undefined)
+      if (response.type !== "process")
+        return Effect.fail(new Error(`unexpected opencode-pty response: ${response.type}`))
+      return Effect.succeed(response.process)
+    }),
+  )
+
 const unexpected = (response: WireResponse) =>
   Effect.fail(new UnavailableError({ message: `unexpected opencode-pty response: ${response.type}` }))
 
@@ -563,18 +689,24 @@ const unexpected = (response: WireResponse) =>
 const unavailable = (error: unknown) =>
   new UnavailableError({ message: error instanceof Error ? error.message : String(error) })
 
-// toInfo：把守护进程的终端描述（WireTerminal）转换为上层 Info
-function toInfo(value: WireTerminal): Info {
-  // 取生命周期状态
+// Only a failure before the request was sent is safe to retry somewhere else.
+const pipeError = (error: DaemonError) =>
+  error.kind === "request" || error.kind === "response"
+    ? new RequestError({ message: error.message })
+    : new UnavailableError({ message: error.message })
+
+const unexpectedPipe = (response: WireResponse) =>
+  Effect.fail(new RequestError({ message: `unexpected opencode-pty response: ${response.type}` }))
+
+function toInfo(value: ProcessInfo): Info {
+  if (!value.pty) throw new Error(`opencode-pty process ${value.id} is not a terminal`)
   const status = value.lifecycle.status
   // 构造 Info：基础字段 + 持久化终端专有字段
   return {
     ...Pty.Info.make({
       // 对外的终端 ID
       id: toID(value.id),
-      // 终端标题
-      title: value.title,
-      // 命令本体（第一个元素）
+      title: value.pty.title,
       command: value.command[0] || "",
       // 参数（其余元素）
       args: value.command.slice(1),
@@ -584,35 +716,66 @@ function toInfo(value: WireTerminal): Info {
       status: status === "running" ? "running" : "exited",
       // PID（缺失时用 0 占位）
       pid: value.pid ?? 0,
-      // 已退出时带上退出码（null 视为 undefined）
-      ...(status === "exited" ? { exitCode: value.lifecycle.exit_code ?? undefined } : {}),
+      ...(value.lifecycle.status === "exited" ? { exitCode: value.lifecycle.exit_code ?? undefined } : {}),
     }),
-    // 归属会话 ID
-    sessionID: value.group_id,
-    // 用户自定义标题（缺省 null）
-    userTitle: value.user_title ?? null,
-    // 前台进程名称
-    foregroundProcess: value.foreground_process,
-    // 终端尺寸
-    size: { cols: value.cols, rows: value.rows },
-    // 输出缓冲区的头尾偏移
+    // Terminals are always created with a session ID as their group.
+    sessionID: Session.ID.make(value.group_id),
+    userTitle: value.pty.user_title,
+    foregroundProcess: value.pty.foreground_process,
+    size: { cols: value.pty.cols, rows: value.pty.rows },
     output: { head: value.output_head, tail: value.output_tail },
   }
 }
 
-// toID：把数字终端 ID 转换为对外的 Pty.ID 字符串（加固定前缀）
+function toPipeInfo(value: ProcessInfo): PipeInfo {
+  if (!value.pipe) throw new Error(`opencode-pty process ${value.id} is not a pipe process`)
+  return {
+    id: value.id,
+    pid: value.pid ?? undefined,
+    command: value.command,
+    cwd: value.cwd,
+    groupID: value.group_id,
+    lifecycle:
+      value.lifecycle.status === "exited"
+        ? {
+            status: "exited",
+            exitCode: value.lifecycle.exit_code ?? undefined,
+            signal: value.lifecycle.signal ?? undefined,
+          }
+        : value.lifecycle,
+    outputTail: value.output_tail,
+    outputLines: value.pipe.output_lines,
+    outputPath: value.pipe.output_path,
+    outputError: value.pipe.output_error ?? undefined,
+    metadata: value.pipe.metadata,
+    startedAt: value.started_at,
+    exitedAt: value.exited_at ?? undefined,
+  }
+}
+
+function toPipeExit(value: Exited): PipeExit {
+  return {
+    exitCode: value.exit_code ?? undefined,
+    signal: value.signal ?? undefined,
+    finalOffset: value.final_offset,
+    outputLines: value.output_lines ?? 0,
+    outputError: value.output_error ?? undefined,
+    exitedAt: value.exited_at,
+  }
+}
+
 function toID(value: number) {
   return Pty.ID.make(`pty_persistent_${value}`)
 }
 
-// fromID：把 Pty.ID 解析回数字终端 ID（校验前缀与数值合法性）
-function fromID(value: Pty.ID) {
-  // 前缀不符则非法
-  if (!value.startsWith("pty_persistent_")) throw new Error(`invalid persistent PTY ID: ${value}`)
-  // 截取数字部分解析
+function parseID(value: Pty.ID) {
+  if (!value.startsWith("pty_persistent_")) return undefined
   const parsed = Number(value.slice("pty_persistent_".length))
-  // 必须是安全正整数
-  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`invalid persistent PTY ID: ${value}`)
-  // 返回数字 ID
+  return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : undefined
+}
+
+function fromID(value: Pty.ID) {
+  const parsed = parseID(value)
+  if (parsed === undefined) throw new Error(`invalid persistent PTY ID: ${value}`)
   return parsed
 }

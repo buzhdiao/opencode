@@ -29,10 +29,7 @@ import { Global } from "@opencode/util/global"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 // 导入 Effect 原语：Clock（时钟）、Context、Effect、Layer、Option（可选值）、Schema（校验/编解码）
 import { Clock, Context, Effect, Layer, Option, Schema } from "effect"
-// 以下为内部依赖：应用元数据、事件总线、配置、特性开关、键值存储、位置、MIME 嗅探、会话、状态
-import { App } from "./app.js"
 import { Bus } from "./bus.js"
-import { Config } from "./config.js"
 import { Flag } from "./flag.js"
 import { KV } from "./kv.js"
 import { Location } from "./location.js"
@@ -268,12 +265,11 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     // 依赖注入：事件总线、配置、全局服务、KV、位置、会话、特性开关
     const bus = yield* Bus.Service
-    const config = yield* Config.Service
+    const flags = yield* Flag.Service
     const global = yield* Global.Service
     const kv = yield* KV.Service
     const location = yield* Location.Service
     const sessions = yield* Session.Service
-    const flags = yield* Flag.resolver
 
     // 工件存储根目录：<数据目录>/artifacts
     const rootDir = path.join(global.data, "artifacts")
@@ -344,11 +340,7 @@ const layer = Layer.effect(
       notify: State.changes(snapshotProviders, () => bus.publish(Event.Updated, {}).pipe(Effect.asVoid)),
     })
 
-    // 查询工件功能是否启用（读配置并由特性开关解析）
-    const isEnabled = Effect.fn("Artifact.enabled")(function* () {
-      const entries = yield* config.entries()
-      return flags(entries).artifacts.enabled
-    })
+    const isEnabled = Effect.fn("Artifact.enabled")(() => flags.enabled("artifacts"))
 
     // 守卫：未启用时直接失败（DisabledError）
     const requireEnabled = () =>
@@ -577,7 +569,7 @@ const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [App.node, Bus.node, Config.node, Global.node, KV.node, Location.node, Session.node],
+  deps: [Bus.node, Flag.node, Global.node, KV.node, Location.node, Session.node],
 })
 
 // 把字符串文件表统一编码为 UTF-8 字节表

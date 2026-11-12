@@ -1,4 +1,4 @@
-// 从 effect 库导入所需原语：时长、Effect、相等判断、Fiber 管理、作用域、信号量、Stream
+import { isDeepStrictEqual } from "node:util"
 import { Duration, Effect, Equal, FiberHandle, Option, Schema, Scope, Semaphore, Stream } from "effect"
 // 导入集成 OAuth 方式注册类型（仅类型）
 import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect/integration"
@@ -32,7 +32,7 @@ import { SkillFile } from "../../config/plugin/skill-file.js"
 import { ConsoleAccess } from "../../console-access.js"
 // 导入凭据模块
 import { Credential } from "../../credential.js"
-// 导入指令发现服务
+import { Flag } from "../../flag.js"
 import { InstructionDiscovery } from "../../instruction-discovery.js"
 // 导入集成模块
 import { Integration } from "../../integration.js"
@@ -50,7 +50,7 @@ import { Skill } from "../../skill.js"
 import { SkillDiscovery } from "../../skill/discovery.js"
 // 导入网页搜索模块
 import { WebSearch } from "../../websearch.js"
-// 导入提供商刷新辅助工具
+import { OpencodeWatches } from "./opencode-watches.js"
 import { ProviderRefresh } from "./refresh.js"
 
 // Console OAuth 设备码流程的客户端 ID
@@ -92,26 +92,25 @@ const InvalidGrant = Schema.Struct({ error: Schema.Literal("invalid_grant") })
 // Console's 401 when the session behind the access token was revoked or expired.
 // Console 的 401：访问令牌背后的会话已被吊销或过期
 const Unauthorized = Schema.Struct({ _tag: Schema.Literal("Unauthorized") })
-// The workspace Library: instructions arrive whole, skills as versions whose files download separately.
-// 工作区 Library：指令整体下发，技能按版本列出、文件另行下载
-const Library = Schema.Struct({
-  instructions: Schema.Array(Schema.Struct({ id: Schema.String, content: Schema.String })).pipe(Schema.optional),
-  skills: Schema.Array(Schema.Struct({ slug: Schema.String, version: Schema.String })).pipe(Schema.optional),
+// The workspace's instructions arrive whole, its skills as versions whose files download separately.
+const ConsoleInstructions = Schema.Struct({
+  instructions: Schema.Array(Schema.Struct({ id: Schema.String, content: Schema.String })),
 })
-// `library` decodes where it's used, so a malformed one can't fail the config and drop its policies.
-// Console 配置 Schema；library 字段留到使用处解码，避免畸形 library 拖垮整份配置（连带策略）
-const ConsoleConfig = Schema.Struct({
-  ...ConfigIntegration.Remote.fields,
-  library: Schema.Unknown.pipe(Schema.optional),
+/** The `GET /api/v2/config` response header Console sends while the caller has workspace instructions and skills. */
+const listsHeader = "x-opencode-instructions-skills"
+const ConsoleSkills = Schema.Struct({
+  skills: Schema.Array(Schema.Struct({ slug: Schema.String, version: Schema.String })),
 })
 // 技能下载包 Schema：slug + 文件列表
 const SkillBundle = Schema.Struct({
   slug: Schema.String,
   files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
 })
-// Library 技能条目：技能信息 + 文件内容映射
-type LibrarySkill = { readonly skill: Skill.Info; readonly files: Record<string, string> }
-// 已登出的提示文案
+type ConsoleSkill = { readonly skill: Skill.Info; readonly files: Record<string, string> }
+type ConsoleConfig = NonNullable<Effect.Success<ReturnType<typeof fetchConfig>>> & {
+  readonly instructions: (typeof ConsoleInstructions.Type)["instructions"]
+  readonly skills: (typeof ConsoleSkills.Type)["skills"]
+}
 const signedOutMessage = "Reconnect OpenCode Console to continue"
 // 需要重新 SSO 登录的提示文案
 const ssoMessage = (organization: string | undefined) =>
@@ -250,6 +249,7 @@ export const OpencodePlugin = define<
   | HttpClient.HttpClient
   | Bus.Service
   | Config.Service
+  | Flag.Service
   | InstructionDiscovery.Service
   | SharedCache.Service
   | Skill.Service
@@ -269,7 +269,7 @@ export const OpencodePlugin = define<
     const http = HttpClient.mapRequest(client, HttpClientRequest.setHeader("User-Agent", App.useragent(ctx.app)))
     // 获取配置服务实例
     const config = yield* Config.Service
-    // 获取指令发现服务实例
+    const flags = yield* Flag.Service
     const discovery = yield* InstructionDiscovery.Service
     // 获取技能服务实例
     const skills = yield* Skill.Service
@@ -277,31 +277,20 @@ export const OpencodePlugin = define<
     const cache = yield* SharedCache.Service
     // 获取当前作用域
     const scope = yield* Scope.Scope
-    // 读取 Console 访问选项（如轮询开关）
-    const settings = yield* ConsoleAccess.Options
-    // 信号量：串行化快照的应用
     const loading = Semaphore.makeUnsafe(1)
     // 活跃连接类型别名
     type ActiveConnection = Effect.Success<ReturnType<typeof ctx.integration.connection.active>>
     // snapshot：当前应用的快照状态
     let snapshot: {
       // The Console's regular OpenCode config, merged as an integration config layer.
-      // Console 下发的 OpenCode 配置（作为集成配置层合并）
-      remote: typeof ConsoleConfig.Type | undefined
-      // 来源连接
+      remote: ConsoleConfig | undefined
       connection: ActiveConnection
       // 组织名
       organization: string | undefined
-      // Fingerprint of an API key, so a key replaced in place counts as a new sign-in.
-      // API key 的指纹：原地换 key 也算新的登录
-      access: string | undefined
-    } = { remote: undefined, connection: undefined, organization: undefined, access: undefined }
-    // Console 下发的指令文件列表
+    } = { remote: undefined, connection: undefined, organization: undefined }
     let instructions: InstructionDiscovery.File[] = []
     // Tagged with the account and workspace they were downloaded for, so a switch hides them right away.
-    // Library 技能：记录下载时所属的账号与工作区，切换连接后立即隐藏
-    let librarySkills: { owner: string; items: LibrarySkill[] } = { owner: "", items: [] }
-    // owner：由连接键 + 组织名拼出的归属标识
+    let consoleSkills: { owner: string; items: ConsoleSkill[] } = { owner: "", items: [] }
     const owner = (from: typeof snapshot) =>
       `${IntegrationConnection.key(from.connection) ?? ""}:${from.organization ?? ""}`
     // A newer config's skill download replaces one still in flight.
@@ -312,25 +301,15 @@ export const OpencodePlugin = define<
     let reported: IntegrationConnection.Status | undefined
     // explainers：已注册的响应解释钩子（连接变化时重建）
     let explainers: Effect.Success<ReturnType<typeof ctx.session.hook>>[] = []
+    const watches = yield* OpencodeWatches.make(ctx, http)
 
     // Every project signed in to the same workspace shares one fetch, reused while it is younger than `maxAge`.
-    // A failed load reports only its connection: what it falls back to depends on the snapshot, which is read under
-    // `loading` when the outcome is applied.
-    // load：拉取 Console 配置（同工作区的项目共享一次请求，maxAge 内复用）
-    const load = Effect.fn("OpencodePlugin.load")(function* (
-      // 缓存有效期，默认 1 分钟
-      maxAge: Duration.Input = Duration.minutes(1),
-    ): Effect.fn.Return<
-      // 成功：返回新快照；失败：只报告连接（回退取决于应用时的 snapshot）
-      | { readonly _tag: "Loaded"; readonly next: typeof snapshot }
-      | { readonly _tag: "Failed"; readonly connection: ActiveConnection }
-    > {
-      // 读取当前活跃连接
+    const load = Effect.fn("OpencodePlugin.load")(function* (maxAge: Duration.Input = Duration.minutes(1)) {
       const connection = yield* ctx.integration.connection.active("opencode")
       // 未连接：清空上报状态并返回空快照
       if (!connection) {
         reported = undefined
-        return { _tag: "Loaded", next: { remote: undefined, connection, organization: undefined, access: undefined } }
+        return { remote: undefined, connection, organization: undefined }
       }
       // status：上报连接状态并记录到 reported
       const status = (status: IntegrationConnection.Status | undefined) => {
@@ -342,13 +321,17 @@ export const OpencodePlugin = define<
         Effect.flatMap((credential) => {
           // 无凭据或外部凭据：视为未登录
           if (!credential || credential.type === "external")
-            return Effect.succeed({ remote: undefined, connection, organization: undefined, access: undefined })
-          // 经共享缓存请求 Console 配置
+            return Effect.succeed({ remote: undefined, connection, organization: undefined })
+          const workspace = workspaceKey(connection, credential)
+          // Each list has its own cache entry, so a failing or malformed one keeps its last copy, or none, and never
+          // holds back the config and its policies. `SharedCache` already logs the failure.
+          const list = <A>(name: string, load: Effect.Effect<ReadonlyArray<A>, unknown>) =>
+            cache
+              .get({ key: `opencode-console-${name}:${workspace}`, interval: maxAge, load })
+              .pipe(Effect.orElseSucceed((): ReadonlyArray<A> => []))
           return cache
             .get({
-              // 缓存键：按服务器/连接/组织/key 指纹区分
-              key: `opencode-console:${workspaceKey(connection, credential)}`,
-              // 有效期
+              key: `opencode-console:${workspace}`,
               interval: maxAge,
               // A sign-in error is Console's answer for this sign-in, so it is shared like a config rather than
               // replaced by the last config, as a network failure is.
@@ -366,19 +349,36 @@ export const OpencodePlugin = define<
               Effect.flatMap((result) =>
                 "failed" in result ? Effect.fail(result.failed) : Effect.succeed(result.remote),
               ),
-              // 组装新快照
+              Effect.flatMap((remote) =>
+                remote?.lists
+                  ? Effect.all(
+                      {
+                        instructions: list(
+                          "instructions",
+                          fetchList(http, credential, "/api/v2/instructions", ConsoleInstructions).pipe(
+                            Effect.map((body) => body?.instructions ?? []),
+                          ),
+                        ),
+                        skills: list(
+                          "skills",
+                          fetchList(http, credential, "/api/v2/skills", ConsoleSkills).pipe(
+                            Effect.map((body) => body?.skills ?? []),
+                          ),
+                        ),
+                      },
+                      { concurrency: 2 },
+                    ).pipe(Effect.map((lists): ConsoleConfig => ({ ...remote, ...lists })))
+                  : Effect.succeed(remote && { ...remote, instructions: [], skills: [] }),
+              ),
               Effect.map((remote) => ({
                 remote,
                 connection,
                 organization: organizationName(credential),
-                access: accessFingerprint(credential),
               })),
             )
         }),
         // 成功时清除之前上报的错误状态
         Effect.tap(() => status(undefined)),
-        Effect.map((next) => ({ _tag: "Loaded" as const, next })),
-        // 失败：上报连接状态并记警告日志
         Effect.catch((cause) =>
           Effect.gen(function* () {
             // Only well-formed Console errors change the connection status; anything else may be transient.
@@ -386,18 +386,15 @@ export const OpencodePlugin = define<
             const next = connectionStatus(cause)
             if (next) yield* status(next)
             yield* Effect.logWarning("failed to load OpenCode provider config", { cause })
-            return { _tag: "Failed" as const, connection }
+            // A load that fails for the connection already in place keeps its last config: dropping it
+            // would lift organization policy while personal credentials keep working.
+            return IntegrationConnection.key(connection) === IntegrationConnection.key(snapshot.connection)
+              ? { remote: snapshot.remote, connection, organization: snapshot.organization }
+              : { remote: undefined, connection, organization: undefined }
           }),
         ),
       )
     })
-    // A load that fails for the connection already in place keeps its last config: dropping it would lift
-    // organization policy while personal credentials keep working.
-    // fallback：加载失败时的回退快照——同一连接保留旧配置（否则会先于凭据失效解除组织策略），不同连接给空快照
-    const fallback = (connection: ActiveConnection): typeof snapshot =>
-      IntegrationConnection.key(connection) === IntegrationConnection.key(snapshot.connection)
-        ? { ...snapshot, connection }
-        : { remote: undefined, connection, organization: undefined, access: undefined }
     // The Console document as config layered it. Its providers apply at this plugin's position in the provider chain,
     // while the rest of the document merges through config.
     // integrated：Console 文档作为配置层合并后的引用；其提供商在本插件的位置生效，其余通过 config 合并
@@ -429,42 +426,59 @@ export const OpencodePlugin = define<
               : next.connection,
           // 组织名
           organization: next.organization,
-          // `make` keeps only the standard config keys, so `library` stays here.
-          // make 只保留标准配置键，library 因此留在这里单独处理
+          // `make` keeps only the standard config keys, so instructions and skills stay here.
           info: next.remote,
         })
       // 登记文档
       yield* integrate(document)
-      // Managed `integration.use: deny` makes config layer a policies-only copy, which withholds the Library too.
-      // 同步 Library：被策略拒绝时（文档只剩策略副本）Library 也不可用
-      yield* syncLibrary(next, document !== undefined && (!config.integration || integrated === document))
+      // Managed `integration.use: deny` makes config layer a policies-only copy, which withholds instructions,
+      // skills and event watches too. Config keeps the document it holds when handed a deep-equal one, so compare by
+      // content.
+      const allowed = document !== undefined && (!config.integration || isDeepStrictEqual(integrated, document))
+      yield* syncInstructionsAndSkills(next, allowed)
+      const watching = allowed && next.remote?.watches === true && (yield* flags.enabled("console_watches"))
+      yield* syncWatches(watching ? next.connection : undefined)
     })
-    // syncLibrary：按快照更新指令文件并后台下载技能
-    const syncLibrary = (next: typeof snapshot, allowed: boolean) => {
-      // 允许时才解码 library 字段
-      const library = allowed
-        ? Option.getOrUndefined(Schema.decodeUnknownOption(Library)(next.remote?.library))
-        : undefined
-      // 生成指令发现文件列表
-      instructions = (library?.instructions ?? []).map(
+    // Watching starts when the console_watches flag is on and the Console's config says the workspace has event watches,
+    // and stops when either no longer holds.
+    const syncWatches = Effect.fnUntraced(
+      function* (connection: ActiveConnection) {
+        const credential = connection && (yield* ctx.integration.connection.resolve(connection))
+        if (!connection || !credential || credential.type === "external") return yield* watches.sync(undefined)
+        yield* watches.sync({
+          key: workspaceKey(connection, credential),
+          server: yield* normalizeServer(ConsoleAccess.server(credential)),
+          headers: ctx.integration.connection
+            .resolve(connection)
+            .pipe(
+              Effect.flatMap((current) =>
+                current && current.type !== "external"
+                  ? Effect.succeed(ConsoleAccess.headers(current))
+                  : Effect.fail(new Error("OpenCode Console is not connected")),
+              ),
+            ),
+        })
+      },
+      Effect.catch((cause) => Effect.logWarning("failed to start Console event watches", { cause })),
+    )
+    const syncInstructionsAndSkills = (next: typeof snapshot, allowed: boolean) => {
+      const remote = allowed ? next.remote : undefined
+      instructions = (remote?.instructions ?? []).map(
         (item) =>
           new InstructionDiscovery.File({ path: `OpenCode Console instruction ${item.id}`, content: item.content }),
       )
-      // 不允许时清空技能归属，使其立即隐藏
-      if (!allowed) librarySkills = { owner: "", items: [] }
+      if (!allowed) consoleSkills = { owner: "", items: [] }
       // Skills download in the background, so startup and config changes never wait on them. The current ones stay
       // until the download replaces them.
       // 技能在后台下载，启动与配置变更都不等待；当前技能保留到新下载替换为止
       return FiberHandle.run(
         skillDownload,
-        loadSkills(next.connection, library?.skills ?? []).pipe(
+        loadSkills(next.connection, remote?.skills ?? []).pipe(
           Effect.flatMap((loaded) => {
             // A failed load keeps the skills already shown.
             // 下载失败时保留现有技能
             if (!loaded) return Effect.void
-            // 记录新技能与其归属
-            librarySkills = { owner: owner(next), items: loaded }
-            // 触发技能目录重载
+            consoleSkills = { owner: owner(next), items: loaded }
             return skills.reload()
           }),
         ),
@@ -596,11 +610,7 @@ export const OpencodePlugin = define<
       editor.method.update({ integrationID: "opencode", method: { type: "key", label: "API key (service account)" } })
     })
 
-    // 首次加载并应用快照
-    const initial = yield* load()
-    // 成功用新快照，失败按回退规则
-    snapshot = initial._tag === "Loaded" ? initial.next : fallback(initial.connection)
-    // 发布配置与 Library
+    snapshot = yield* load()
     yield* publish(snapshot)
     // 提供商目录变换：把 Console 文档中的提供商合并进来
     yield* ctx.provider.transform((providers) => {
@@ -662,10 +672,8 @@ export const OpencodePlugin = define<
     yield* discovery.transform((editor) => instructions.forEach((file) => editor.add(file)))
     // 技能目录变换：仅当技能归属与当前快照一致时注册
     yield* skills.transform((editor) => {
-      // 归属不符（连接/组织已切换）则不注册
-      if (librarySkills.owner !== owner(snapshot)) return
-      // 注册每个技能及其文件
-      librarySkills.items.forEach((item) => editor.add(item.skill, item.files))
+      if (consoleSkills.owner !== owner(snapshot)) return
+      consoleSkills.items.forEach((item) => editor.add(item.skill, item.files))
     })
 
     // apply：应用新快照并重建受影响的目录
@@ -682,36 +690,15 @@ export const OpencodePlugin = define<
         { concurrency: 5, discard: true },
       )
     })
+    const refresh = () => loading.withPermit(load().pipe(Effect.andThen(apply)))
     // Annotated: `apply` re-registers the hooks that call `check`, which would otherwise make inference circular.
-    // Loads run outside `loading`, so a slow one never holds up another check. `wait` bounds the load: one still
-    // running carries on in `SharedCache`, retries included, for the next check, while the current snapshot stays.
-    // check：按需拉取 Console 配置并应用差异；加载在信号量外执行，wait 限制等待时长（未完成的加载留在 SharedCache 中继续）
-    const check = (maxAge?: Duration.Input, wait?: Duration.Input): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        // 执行加载；有 wait 时限时等待
-        const outcome =
-          wait === undefined
-            ? yield* load(maxAge)
-            : Option.getOrUndefined(yield* load(maxAge).pipe(Effect.timeoutOption(wait)))
-        // 超时未完成则本次跳过
-        if (!outcome) return
-        // 在信号量保护下应用结果
-        yield* loading.withPermit(
-          Effect.gen(function* () {
-            // A switch while this load ran makes it stale; the switch's own check applies the new connection.
-            // 加载期间发生切换则本次结果过期，由切换自身的 check 应用新连接
-            const loaded = outcome._tag === "Loaded" ? outcome.next.connection : outcome.connection
-            // 读取当前活跃连接
-            const active = yield* ctx.integration.connection.active("opencode")
-            // 连接不一致时丢弃
-            if (IntegrationConnection.key(loaded) !== IntegrationConnection.key(active)) return
-            // 计算应应用的快照（失败时回退）
-            const next = outcome._tag === "Loaded" ? outcome.next : fallback(outcome.connection)
-            // 与当前不同才应用
-            if (!Equal.equals(snapshot, next)) yield* apply(next)
-          }),
-        )
-      })
+    const check = (maxAge?: Duration.Input): Effect.Effect<void> =>
+      loading.withPermit(
+        Effect.gen(function* () {
+          const next = yield* load(maxAge)
+          if (!Equal.equals(snapshot, next)) yield* apply(next)
+        }),
+      )
 
     // Console inference rejects a missing SSO sign-in with a generic 401/403. Re-check the Console config, which
     // reports the reason, and replace the response with instructions when the connection needs the user.
@@ -753,31 +740,19 @@ export const OpencodePlugin = define<
     })
     // 启动时挂一次钩子
     yield* guard(snapshot)
-    // A prompt after the machine slept or the host suspended refreshes stale Console config, and the MCP gateway
-    // tokens it carries, before the turn's tool calls run. An unreachable Console delays the prompt by at most
-    // 3 seconds; the turn then runs on the config it has.
-    // prompt 钩子：机器休眠后第一条提示先刷新过期的 Console 配置（最多等 3 秒，连不上就按现有配置跑）
-    yield* ctx.session.hook("prompt", () => check(Duration.minutes(1), Duration.seconds(3)))
 
     // Console config can change independently of local credential activity, so re-fetch
     // periodically and only rebuild the catalog and search providers when the snapshot differs.
-    // Only while connected: a signed-out location runs no timer and no credential lookups. Hosts that suspend
-    // between prompts turn the timer off with the `console.poll` server option and rely on the prompt hook.
-    // polling：周期轮询 Fiber（仅连接中且允许轮询时运行）
+    // Only while connected: a signed-out location runs no timer and no credential lookups.
     const polling = yield* FiberHandle.make<void, never>()
     // poll：按开关启停轮询循环
     const poll = Effect.fnUntraced(function* () {
-      // 未连接或服务端关闭轮询时清掉定时器
-      if (!snapshot.connection || !settings.poll) return yield* FiberHandle.clear(polling)
-      // 每 1 分钟 check 一次，已在跑则不重复
+      if (!snapshot.connection) return yield* FiberHandle.clear(polling)
       yield* FiberHandle.run(polling, Effect.sleep(Duration.minutes(1)).pipe(Effect.andThen(check()), Effect.forever), {
         onlyIfMissing: true,
       })
     })
-    // A switch applies only a changed snapshot, so one a prompt already applied doesn't reload MCP servers mid-turn.
-    // 凭据切换时 check 一次并调整轮询；只应用有变化的快照，避免提示中途重载 MCP
-    yield* ProviderRefresh.onSwitch("opencode", check().pipe(Effect.andThen(poll())))
-    // 启动时根据当前状态启停轮询
+    yield* ProviderRefresh.onSwitch("opencode", refresh().pipe(Effect.andThen(poll())))
     yield* poll()
   }),
 })
@@ -814,15 +789,47 @@ function fetchConfig(http: HttpClient.HttpClient, value: Credential.Key | Creden
                 url: yield* ssoUrl(ConsoleAccess.server(value), body.value.connectionId),
               })
           }
-          // 其余要求 2xx 并取 JSON 体
+          const watches = response.headers[OpencodeWatches.header] !== undefined
+          const lists = response.headers[listsHeader] !== undefined
           const body = yield* HttpClientResponse.filterStatusOk(response).pipe(Effect.flatMap((ok) => ok.json))
-          // 按 Console 配置 Schema 解码
-          return yield* Schema.decodeUnknownEffect(ConsoleConfig)(body)
+          return { ...(yield* Schema.decodeUnknownEffect(ConfigIntegration.Remote)(body)), watches, lists }
         }),
       ),
       Effect.scoped,
-      // A transient failure, which `SharedCache` retries.
-      // 5 秒超时属暂时性失败，交给 SharedCache 重试
+      // A Console that accepts the connection but never answers would otherwise hold the load, including the one at
+      // startup, indefinitely. A timeout is a transient failure, which `SharedCache` retries.
+      Effect.timeout(Duration.seconds(5)),
+    )
+}
+
+// A 404 (none in the workspace) or a 403 other than SSO (the sign-in may not read them) is an empty list. Any other
+// error, including a malformed body, fails so the caller keeps the last list.
+function fetchList<A>(
+  http: HttpClient.HttpClient,
+  value: Credential.Key | Credential.OAuth,
+  path: string,
+  schema: Schema.Decoder<A>,
+) {
+  return HttpClient.withScope(http)
+    .execute(
+      HttpClientRequest.get(`${ConsoleAccess.server(value)}${path}`).pipe(
+        HttpClientRequest.acceptJson,
+        HttpClientRequest.setHeaders(ConsoleAccess.headers(value)),
+      ),
+    )
+    .pipe(
+      Effect.flatMap((response) =>
+        Effect.gen(function* () {
+          if (response.status === 404) return undefined
+          if (
+            response.status === 403 &&
+            Option.isNone(yield* HttpClientResponse.schemaBodyJson(SsoRequired)(response).pipe(Effect.option))
+          )
+            return undefined
+          return yield* HttpClientResponse.schemaBodyJson(schema)(yield* HttpClientResponse.filterStatusOk(response))
+        }),
+      ),
+      Effect.scoped,
       Effect.timeout(Duration.seconds(5)),
     )
 }
@@ -870,16 +877,9 @@ function workspaceKey(
     ConsoleAccess.server(credential),
     IntegrationConnection.key(connection),
     credential.metadata?.orgID,
-    accessFingerprint(credential),
   ])
 }
 
-// accessFingerprint：API key 的指纹（OAuth 凭据没有）
-function accessFingerprint(credential: Credential.Key | Credential.OAuth) {
-  return credential.type === "key" ? SharedCache.fingerprint(credential.key) : undefined
-}
-
-// organizationName：从凭据元数据读组织名
 function organizationName(credential: Credential.Value) {
   return typeof credential.metadata?.orgName === "string" ? credential.metadata.orgName : undefined
 }
@@ -977,7 +977,7 @@ function downloadSkill(http: HttpClient.HttpClient, server: string, slug: string
     // 请求技能包（30 秒超时，手动跟随重定向）
     const bundle = yield* follow(
       http,
-      HttpClientRequest.get(`${server}/api/v2/library/skills/${encodeURIComponent(slug)}`).pipe(
+      HttpClientRequest.get(`${server}/api/v2/skills/${encodeURIComponent(slug)}`).pipe(
         HttpClientRequest.acceptJson,
         HttpClientRequest.setHeaders(headers),
       ),
@@ -1002,7 +1002,7 @@ function downloadSkill(http: HttpClient.HttpClient, server: string, slug: string
       files: Object.fromEntries(
         bundle.files.filter((file) => file.path !== "SKILL.md").map((file) => [file.path, file.content]),
       ),
-    } satisfies LibrarySkill
+    } satisfies ConsoleSkill
   })
 }
 

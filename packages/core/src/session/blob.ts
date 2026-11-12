@@ -13,11 +13,6 @@ import { map } from "effect/Array"
 import type { Attachment, FileAttachment } from "@opencode/schema/prompt"
 // 导入工具内容类型
 import type { Tool } from "@opencode/schema/tool"
-// 导入 App 服务（应用信息，如构建渠道）
-import { App } from "../app.js"
-// 导入配置服务
-import { Config } from "../config.js"
-// 导入数据库批量操作辅助
 import { DatabaseBatch } from "../database/batch.js"
 // 导入数据库接口类型
 import type { Database } from "../database/database.js"
@@ -370,28 +365,19 @@ type Pending = Map<string, typeof BlobTable.$inferInsert>
 // 助手消息内容单元类型
 type AssistantPart = SessionMessage.Assistant["content"][number]
 
-/** Reads the `media_blob` flag from the Config in scope on every call; without one, it is off. */
-// 每次调用时从作用域内的 Config 读取 media_blob 开关；无 Config 时视为关闭
+/** Reads the `media_blob` flag from the Flag.Service in scope on every call; without one, it is off. */
 export const enabled = Effect.gen(function* () {
-  // 可选地获取配置服务（可能不存在）
-  const config = yield* Effect.serviceOption(Config.Service)
-  // 无配置：关闭
-  if (Option.isNone(config)) return false
-  // 按功能开关判断
-  return yield* Flag.enabled("media_blob")
+  const flag = yield* Effect.serviceOption(Flag.Service)
+  if (Option.isNone(flag)) return false
+  return yield* flag.value.enabled("media_blob")
 })
 
 /**
- * {@link enabled} as `session`'s location configures it, where its media is written, for the build channel in `app`
- * (location services don't carry it). Off when that location can't boot or load its config, which surfaces as
- * defects too, so a broken location never fails the caller.
+ * {@link Flag.enabled} for `media_blob` as `session`'s location configures it, where its media is written. Off when
+ * that location can't boot or load its config, which surfaces as defects too, so a broken location never fails the caller.
  */
-// 按 session 所属 Location 的配置判断开关（其媒体将写入该处）；Location 启动失败或配置加载失败时视为关闭并记日志，绝不让调用方失败
-export const enabledFor = (instances: Instance.Interface, app: App.Info, session: SessionSchema.Info) =>
-  enabled.pipe(
-    // 提供应用元数据（构建渠道）
-    Effect.provideService(App.Metadata, app),
-    // 提供会话对应的实例作用域
+export const enabledFor = (instances: Instance.Interface, session: SessionSchema.Info): Effect.Effect<boolean> =>
+  Flag.enabled("media_blob").pipe(
     instances.provide(session),
     // 捕获失败原因
     Effect.catchCause((cause) =>

@@ -12,6 +12,8 @@ export interface Coordinator<Key, E, Reason = never> {
   /** Snapshots keys with an execution owned by this coordinator. */
   // 快照当前有执行占用的 key 集合
   readonly active: Effect.Effect<ReadonlySet<Key>>
+  /** Snapshots keys genuinely draining: owned and not stopping. Settlement windows are excluded. */
+  readonly draining: Effect.Effect<ReadonlySet<Key>>
   /** Checks ownership for one key, including cleanup and terminal settlement. */
   // 检查某个 key 是否仍被占用（含清理与终态结算阶段）
   readonly isActive: (key: Key) => Effect.Effect<boolean>
@@ -30,6 +32,8 @@ export interface Coordinator<Key, E, Reason = never> {
   // 中断执行并清掉门铃；空闲时是空操作。中断被接受即返回，不等待清理完成：
   // 执行 Fiber 会自行完成终结器与 settled 钩子。返回是否确有执行被中断
   readonly interrupt: (key: Key, reason?: Reason) => Effect.Effect<boolean>
+  /** Why the key's execution is being stopped, once `interrupt` stopped it; undefined for teardown or when running. */
+  readonly interruption: (key: Key) => Reason | undefined
   /** Resolves once no execution is active for the key. Returns immediately when already idle and never starts work. */
   // 等待 key 空闲；本就空闲时立即返回，绝不主动启动工作
   readonly awaitIdle: (key: Key) => Effect.Effect<void>
@@ -236,6 +240,25 @@ export const make = <Key, E, Reason = never>(options: {
         return Deferred.await(execution.done).pipe(Effect.ignoreCause, Effect.andThen(awaitIdle(key)))
       })
 
-    // 组装协调器接口
-    return { active: Effect.sync(() => new Set(executions.keys())), isActive, run, wake, interrupt, awaitIdle }
+    const interruption = (key: Key) => executions.get(key)?.interruptionReason
+
+    const draining = Effect.sync(
+      () =>
+        new Set(
+          [...executions.entries()].flatMap(([key, execution]) =>
+            execution.owner !== undefined && !execution.stopping ? [key] : [],
+          ),
+        ),
+    )
+
+    return {
+      active: Effect.sync(() => new Set(executions.keys())),
+      draining,
+      isActive,
+      run,
+      wake,
+      interrupt,
+      interruption,
+      awaitIdle,
+    }
   })

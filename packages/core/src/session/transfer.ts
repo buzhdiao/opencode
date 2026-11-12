@@ -80,9 +80,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Se
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    // 取应用元数据（版本等）
-    const app = yield* App.Metadata
-    // 取事件总线服务
+    const app = yield* App.Service
     const bus = yield* Bus.Service
     // 取数据库句柄
     const { db } = yield* Database.Service
@@ -160,7 +158,7 @@ const layer = Layer.effect(
         // 仅当确有媒体需要搬移，且目标位置启用了 blob 存储时才落 blob
         const media =
           split.some((row) => row.moved) &&
-          (yield* SessionBlob.enabledFor(instances, app, {
+          (yield* SessionBlob.enabledFor(instances, {
             ...input.data.info,
             projectID: project.id,
             location: input.location,

@@ -41,7 +41,7 @@ import { SessionTransfer } from "@opencode/core/session/transfer"
 import { InstructionEntry } from "@opencode/core/session/instruction-entry"
 // shell 选择。
 import { ShellSelect } from "@opencode/core/shell/select"
-// 作业系统与 KV 存储。
+import { Shell } from "@opencode/core/shell"
 import { Job } from "@opencode/core/job"
 import { KV } from "@opencode/core/kv"
 // MCP 客户端。
@@ -56,8 +56,6 @@ import { LocationServiceMap } from "@opencode/core/location-service-map"
 import { LocationActivity } from "@opencode/core/location-activity"
 // 模型目录（models.dev）与控制台访问。
 import { ModelsDev } from "@opencode/core/models-dev"
-import { ConsoleAccess } from "@opencode/core/console-access"
-// 会话重启与调度。
 import { SessionRestart } from "@opencode/core/session/execution/restart"
 import { Schedule } from "@opencode/core/schedule"
 // 插件更新与 SDK 插件。
@@ -93,11 +91,17 @@ import type { ServerOptions } from "./options"
 
 // 应用级服务节点全集：这些服务在“宿主图”里只有一份，被所有请求共享。
 const applicationServiceNodes = [
+  App.node,
   Global.node,
   FSUtil.node,
   Database.node,
   KV.node,
   Bus.node,
+  // Before the jobs and sessions, so they are released after them: a shutdown's interrupted shell calls and jobs
+  // still reach the daemon to stop their commands, and a command being created never falls back to spawning.
+  PersistentPty.node,
+  // Daemon-run shell commands belong to the server, so a Location closing never takes them down.
+  Shell.daemonNode,
   EventLogger.node,
   httpClient,
   Job.node,
@@ -112,7 +116,6 @@ const applicationServiceNodes = [
   PluginUpdate.node,
   PermissionSaved.node,
   PtyTicket.node,
-  PersistentPty.node,
   Credential.node,
   WellKnown.node,
   ServerPairing.node,
@@ -178,9 +181,6 @@ function makeRoutes<AuthError, AuthServices>(
     ModelsDev.node.replace(ModelsDev.configured(options.models)),
     // fetch 层（测试/代理可替换）。
     httpFetch.replace(fetchLayer(options.fetch)),
-    // 控制台访问凭据。
-    ConsoleAccess.node.replace(ConsoleAccess.configured(options.console)),
-    // 文件监听开关。
     Watcher.node.replace(Watcher.configured({ enabled: options.fs?.filewatcher })),
     FileWatch.node.replace(FileWatch.configured({ enabled: options.fs?.filewatcher })),
     // 文件搜索实现。

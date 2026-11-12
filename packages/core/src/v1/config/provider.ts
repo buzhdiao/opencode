@@ -69,12 +69,9 @@ export const Model = Schema.Struct({
   // 上下文限制
   limit: Schema.optional(
     Schema.Struct({
-      // 上下文窗口大小
-      context: Schema.Finite,
-      // 输入上限（可选）
+      context: Schema.optional(Schema.Finite),
       input: Schema.optional(Schema.Finite),
-      // 输出上限
-      output: Schema.Finite,
+      output: Schema.optional(Schema.Finite),
     }),
   ),
   // 支持的输入/输出模态

@@ -12,9 +12,6 @@ import { Model } from "@opencode/schema/model"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 // 导入 HttpTimeout 模式与 ProviderPackage 类型（AI SDK 侧定义）
 import { HttpTimeout, type ProviderPackage } from "@opencode/ai/effect"
-// 导入 isRecord：判断是否为普通对象记录
-import { isRecord } from "@opencode/util/record"
-// 导入 Npm：npm 安装接口（动态安装提供商包）
 import { Npm } from "@opencode/util/npm"
 // 仅导入 DeepMutable 类型工具
 import type { DeepMutable } from "./schema.js"
@@ -37,42 +34,12 @@ import { freeze } from "immer"
 // 导入 AISDKNative：原生 AI SDK 提供商识别与重写
 import { AISDKNative } from "./aisdk-native.js"
 
-// 导出 ID：供应商 ID 校验器
+export { AISDK_PREFIX, aisdk, isAISDK, mergeHeaders, mergeOverlay, packageName } from "./aisdk-native.js"
+
 export const ID = Provider.ID
 // 导出 ID 类型别名
 export type ID = typeof ID.Type
 
-// AISDK 前缀常量：标记来自社区 AI SDK 的包
-export const AISDK_PREFIX = "aisdk:"
-// isAISDK：判断值是否以 "aisdk:" 开头
-export const isAISDK = (value: string | undefined): value is string => value?.startsWith(AISDK_PREFIX) ?? false
-// aisdk：给包名补上 aisdk: 前缀（已有则原样返回）
-export const aisdk = (value: string) => (isAISDK(value) ? value : `${AISDK_PREFIX}${value}`)
-// packageName：解析真实包名（去掉 aisdk: 前缀、迁移旧 npm scope）——重载声明
-export function packageName(value: string): string
-// packageName：undefined 输入返回 undefined 的重载声明
-export function packageName(value: undefined): undefined
-// packageName：可空输入的重载声明
-export function packageName(value: string | undefined): string | undefined
-// packageName 的实现
-export function packageName(value: string | undefined) {
-  // Native provider entrypoints can persist in user configuration across the npm scope migration.
-  // 旧 npm scope（@opencode-ai/ai/...）可能残留在用户配置中，迁移到新 scope（@opencode/）
-  if (value?.startsWith("@opencode-ai/ai/")) return value.replace("@opencode-ai/", "@opencode/")
-  // undefined 或非 aisdk 前缀的原样返回
-  if (value === undefined || !isAISDK(value)) return value
-  // 去掉 aisdk: 前缀返回
-  return value.slice(AISDK_PREFIX.length)
-}
-
-// Json：任意 JSON 值的类型
-type Json = Schema.Schema.Type<typeof Schema.Json>
-// JsonRecord：字符串到 JSON 值的记录模式
-const JsonRecord = Schema.Record(Schema.String, Schema.Json)
-// decodeJsonRecord：同步校验 JSON 记录
-const decodeJsonRecord = Schema.decodeUnknownSync(JsonRecord)
-
-// LoadError：提供商包加载失败（附包名与原因）
 export class LoadError extends Schema.TaggedError<LoadError>()("Provider.LoadError", {
   // 包名
   package: Schema.String,
@@ -94,7 +61,7 @@ const builtins = new Map<string, () => Promise<unknown>>([
   ["@opencode/ai/providers/alibaba/responses", () => import("@opencode/ai/providers/alibaba/responses")],
   // 阿里云 images 入口点
   ["@opencode/ai/providers/alibaba/images", () => import("@opencode/ai/providers/alibaba/images")],
-  // Amazon Bedrock 默认入口点
+  ["@opencode/ai/providers/alibaba/embeddings", () => import("@opencode/ai/providers/alibaba/embeddings")],
   ["@opencode/ai/providers/amazon-bedrock", () => import("@opencode/ai/providers/amazon-bedrock")],
   // Amazon Bedrock mantle 入口点
   ["@opencode/ai/providers/amazon-bedrock/mantle", () => import("@opencode/ai/providers/amazon-bedrock/mantle")],
@@ -125,7 +92,7 @@ const builtins = new Map<string, () => Promise<unknown>>([
   ["@opencode/ai/providers/azure/responses", () => import("@opencode/ai/providers/azure/responses")],
   // Azure images 入口点
   ["@opencode/ai/providers/azure/images", () => import("@opencode/ai/providers/azure/images")],
-  // Azure messages 入口点
+  ["@opencode/ai/providers/azure/embeddings", () => import("@opencode/ai/providers/azure/embeddings")],
   ["@opencode/ai/providers/azure/messages", () => import("@opencode/ai/providers/azure/messages")],
   // Baseten 默认入口点
   ["@opencode/ai/providers/baseten", () => import("@opencode/ai/providers/baseten")],
@@ -156,25 +123,25 @@ const builtins = new Map<string, () => Promise<unknown>>([
   ["@opencode/ai/providers/cohere", () => import("@opencode/ai/providers/cohere")],
   // Cohere chat 入口点
   ["@opencode/ai/providers/cohere/chat", () => import("@opencode/ai/providers/cohere/chat")],
-  // DeepInfra 默认入口点
+  ["@opencode/ai/providers/cohere/embeddings", () => import("@opencode/ai/providers/cohere/embeddings")],
   ["@opencode/ai/providers/deepinfra", () => import("@opencode/ai/providers/deepinfra")],
-  // DeepSeek 默认入口点
+  ["@opencode/ai/providers/deepinfra/embeddings", () => import("@opencode/ai/providers/deepinfra/embeddings")],
   ["@opencode/ai/providers/deepseek", () => import("@opencode/ai/providers/deepseek")],
   // DigitalOcean 默认入口点
   ["@opencode/ai/providers/digitalocean", () => import("@opencode/ai/providers/digitalocean")],
   // DigitalOcean 决策入口点
   ["@opencode/ai/providers/digitalocean/decisions", () => import("@opencode/ai/providers/digitalocean/decisions")],
-  // DigitalOcean 图像入口点
+  ["@opencode/ai/providers/digitalocean/embeddings", () => import("@opencode/ai/providers/digitalocean/embeddings")],
   ["@opencode/ai/providers/digitalocean/images", () => import("@opencode/ai/providers/digitalocean/images")],
   // DigitalOcean responses 入口点
   ["@opencode/ai/providers/digitalocean/responses", () => import("@opencode/ai/providers/digitalocean/responses")],
   // Fireworks 默认入口点
   ["@opencode/ai/providers/fireworks", () => import("@opencode/ai/providers/fireworks")],
-  // Google 默认入口点
+  ["@opencode/ai/providers/fireworks/embeddings", () => import("@opencode/ai/providers/fireworks/embeddings")],
   ["@opencode/ai/providers/google", () => import("@opencode/ai/providers/google")],
-  // Google interactions 入口点
+  ["@opencode/ai/providers/google/decisions", () => import("@opencode/ai/providers/google/decisions")],
   ["@opencode/ai/providers/google/interactions", () => import("@opencode/ai/providers/google/interactions")],
-  // Google 图像入口点
+  ["@opencode/ai/providers/google/embeddings", () => import("@opencode/ai/providers/google/embeddings")],
   ["@opencode/ai/providers/google/images", () => import("@opencode/ai/providers/google/images")],
   // Google Vertex 默认入口点
   ["@opencode/ai/providers/google-vertex", () => import("@opencode/ai/providers/google-vertex")],
@@ -193,7 +160,7 @@ const builtins = new Map<string, () => Promise<unknown>>([
   ["@opencode/ai/providers/google-vertex/mistral", () => import("@opencode/ai/providers/google-vertex/mistral")],
   // Google Vertex responses 入口点
   ["@opencode/ai/providers/google-vertex/responses", () => import("@opencode/ai/providers/google-vertex/responses")],
-  // Google Vertex 图像入口点
+  ["@opencode/ai/providers/google-vertex/embeddings", () => import("@opencode/ai/providers/google-vertex/embeddings")],
   ["@opencode/ai/providers/google-vertex/images", () => import("@opencode/ai/providers/google-vertex/images")],
   // Google Vertex 独立 messages 包入口点
   ["@opencode/ai/providers/google-vertex-messages", () => import("@opencode/ai/providers/google-vertex-messages")],
@@ -237,7 +204,7 @@ const builtins = new Map<string, () => Promise<unknown>>([
   ["@opencode/ai/providers/openai/responses", () => import("@opencode/ai/providers/openai/responses")],
   // OpenAI 图像入口点
   ["@opencode/ai/providers/openai/images", () => import("@opencode/ai/providers/openai/images")],
-  // OpenAI 兼容默认入口点
+  ["@opencode/ai/providers/openai/embeddings", () => import("@opencode/ai/providers/openai/embeddings")],
   ["@opencode/ai/providers/openai-compatible", () => import("@opencode/ai/providers/openai-compatible")],
   // OpenAI 兼容 responses 入口点
   [
@@ -248,6 +215,14 @@ const builtins = new Map<string, () => Promise<unknown>>([
   ["@opencode/ai/providers/openai-compatible/images", () => import("@opencode/ai/providers/openai-compatible/images")],
   // OpenAI 兼容独立 responses 包入口点
   [
+    "@opencode/ai/providers/openai-compatible/decisions",
+    () => import("@opencode/ai/providers/openai-compatible/decisions"),
+  ],
+  [
+    "@opencode/ai/providers/openai-compatible/embeddings",
+    () => import("@opencode/ai/providers/openai-compatible/embeddings"),
+  ],
+  [
     "@opencode/ai/providers/openai-compatible-responses",
     () => import("@opencode/ai/providers/openai-compatible-responses"),
   ],
@@ -257,7 +232,7 @@ const builtins = new Map<string, () => Promise<unknown>>([
   ["@opencode/ai/providers/openrouter", () => import("@opencode/ai/providers/openrouter")],
   // OpenRouter 决策入口点
   ["@opencode/ai/providers/openrouter/decisions", () => import("@opencode/ai/providers/openrouter/decisions")],
-  // OpenRouter 图像入口点
+  ["@opencode/ai/providers/openrouter/embeddings", () => import("@opencode/ai/providers/openrouter/embeddings")],
   ["@opencode/ai/providers/openrouter/images", () => import("@opencode/ai/providers/openrouter/images")],
   // OpenRouter responses 入口点
   ["@opencode/ai/providers/openrouter/responses", () => import("@opencode/ai/providers/openrouter/responses")],
@@ -290,7 +265,10 @@ const builtins = new Map<string, () => Promise<unknown>>([
   ],
   // Vercel AI Gateway 图像入口点
   ["@opencode/ai/providers/vercel-ai-gateway/images", () => import("@opencode/ai/providers/vercel-ai-gateway/images")],
-  // xAI 默认入口点
+  [
+    "@opencode/ai/providers/vercel-ai-gateway/embeddings",
+    () => import("@opencode/ai/providers/vercel-ai-gateway/embeddings"),
+  ],
   ["@opencode/ai/providers/xai", () => import("@opencode/ai/providers/xai")],
   // xAI 图像入口点
   ["@opencode/ai/providers/xai/images", () => import("@opencode/ai/providers/xai/images")],
@@ -319,9 +297,7 @@ export const builtinPackages: ReadonlySet<string> = new Set(builtins.keys())
 
 // loadPackage：按说明符加载提供商包——内置表、运行时解析、必要时 npm 安装
 export const loadPackage = Effect.fn("Provider.loadPackage")(function* (input: string, npm?: Npm.Interface) {
-  // 解析真实包名（去前缀、迁移 scope）
-  const specifier = packageName(input)
-  // 先查内置表
+  const specifier = AISDKNative.packageName(input)
   const builtin = builtins.get(specifier)
   // 内置存在则直接导入
   if (builtin) return yield* importPackage(specifier, specifier, builtin)
@@ -433,74 +409,6 @@ export function encoding(settings: Readonly<Record<string, unknown>>) {
   return Option.getOrUndefined(decodeEncoding(settings.encoding))
 }
 
-// mergeOverlay：把覆盖层合并到底层（浅层按键覆盖、深层递归合并）；结果校验为 JSON
-export function mergeOverlay(
-  // 底层记录（可选）
-  base: Readonly<Record<string, unknown>> | undefined,
-  // 覆盖层记录（可选）
-  overlay: Readonly<Record<string, unknown>> | undefined,
-  // 返回 JSON 记录（可选）
-): Record<string, Json> | undefined {
-  // 无底层时直接用覆盖层的浅拷贝
-  if (base === undefined) return overlay && decodeJsonRecord({ ...overlay })
-  // 无覆盖层时返回底层浅拷贝
-  if (overlay === undefined) return decodeJsonRecord({ ...base })
-  // 两侧都有时递归合并
-  return decodeJsonRecord(mergeRecord(base, overlay))
-}
-
-// mergeRecord：递归合并两条记录——对象键递归，其余以覆盖层为准
-function mergeRecord(
-  // 底层记录
-  base: Readonly<Record<string, unknown>>,
-  // 覆盖层记录
-  overlay: Readonly<Record<string, unknown>>,
-  // 返回合并记录
-): Record<string, unknown> {
-  // 对两侧键的并集逐键计算
-  return Object.fromEntries(
-    new Set([...Object.keys(base), ...Object.keys(overlay)]).values().map((key): [string, unknown] => {
-      // 底层的值
-      const left = base[key]
-      // 覆盖层的值
-      const right = overlay[key]
-      // 覆盖层没有该键时保留底层值
-      if (right === undefined) return [key, left]
-      // 两侧都是普通对象时递归合并
-      if (isRecord(left) && isRecord(right)) return [key, mergeRecord(left, right)]
-      // 否则以覆盖层为准
-      return [key, right]
-    }),
-  )
-}
-
-// mergeHeaders：合并请求头（后者覆盖前者），键统一转小写去重
-export function mergeHeaders(
-  // 底层请求头（可选）
-  base: Readonly<Record<string, string>> | undefined,
-  // 覆盖层请求头（可选）
-  overlay: Readonly<Record<string, string>> | undefined,
-) {
-  // 无底层时返回覆盖层浅拷贝
-  if (base === undefined) return overlay && { ...overlay }
-  // 无覆盖层时返回底层浅拷贝
-  if (overlay === undefined) return { ...base }
-  // 两侧条目放入以小写键为键的 Map（后写覆盖前写），再转回对象
-  return Object.fromEntries(
-    [...Object.entries(base), ...Object.entries(overlay)]
-      // 归并进 Map，键小写化
-      .reduce((result, entry) => {
-        // 以小写键写入
-        result.set(entry[0].toLowerCase(), entry)
-        // 返回累加器
-        return result
-      }, new Map<string, [string, string]>())
-      // 取值序列
-      .values(),
-  )
-}
-
-// 导出 Request：请求选项定义
 export const Request = Provider.Request
 // 导出 Request 类型别名
 export type Request = Provider.Request
@@ -720,7 +628,7 @@ const layer = Layer.effect(
             record.provider.id = id
             // 用 AISDKNative 重写解析字段
             AISDKNative.rewrite(record.provider, {
-              // 包名
+              builtins: builtinPackages,
               specifier: record.provider.package,
               // 供应商 ID
               providerID: id,
@@ -765,7 +673,7 @@ const layer = Layer.effect(
               model.providerID = providerID
               // 用 AISDKNative 重写解析字段
               AISDKNative.rewrite(model, {
-                // 包名：模型自带优先，其次供应商
+                builtins: builtinPackages,
                 specifier: model.package ?? record.provider.package,
                 // 供应商 ID
                 providerID,

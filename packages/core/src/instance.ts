@@ -2,13 +2,14 @@
 import { Context, Effect, Layer } from "effect"
 // 以下引入构成实例（instance）图的各服务模块
 import { Agent } from "./agent.js"
+import { App } from "./app.js"
 import { Artifact } from "./artifact.js"
 import { AISDK } from "./aisdk.js"
 import { Model } from "./model.js"
 import { Provider } from "./provider.js"
 import { Command } from "./command.js"
 import { Config } from "./config.js"
-// 引入层节点（LayerNode）工具：组合、替换与编译依赖图
+import { Flag } from "./flag.js"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 // 引入位置图节点基础类型与全局共享标签
 import { Node } from "@opencode/util/effect/app-node"
@@ -68,13 +69,13 @@ export { Service, node, type Interface } from "./instance/service.js"
 // 实例图（graph）的全部节点：每个元素都是一个按目录装配的服务节点。
 // 列表顺序即依赖顺序——被依赖的服务在前；位置监听器最后启动（见文末注释）。
 const nodes = [
-  // 目录定位与目录生命周期
+  App.node,
   Location.node,
   LocationLifecycle.node,
   // 环境变量与配置发现
   Environment.node,
   Config.node,
-  // 代理（agent）、产物（artifact）与命令（command）
+  Flag.node,
   Agent.node,
   Artifact.node,
   Command.node,

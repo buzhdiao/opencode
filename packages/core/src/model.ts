@@ -59,7 +59,7 @@ export const mergeCapabilities = (config: Partial<Capabilities>, base: Capabilit
   return {
     // 工具（tools）支持：config 优先，否则用 fallback
     tools: config.tools ?? fallback.tools,
-    // 输入（input）媒体类型：config 优先，浅拷贝一份避免共享引用
+    freeform: (config.freeform ?? base?.freeform)?.slice(),
     input: [...(config.input ?? fallback.input)],
     // 输出（output）媒体类型：同上，浅拷贝
     output: [...(config.output ?? fallback.output)],
@@ -248,7 +248,7 @@ const layer = Layer.effect(
             const provider = input?.records.get(providerID)?.provider
             // 用 AISDKNative 重写模型的解析相关字段
             AISDKNative.rewrite(model, {
-              // 包名：模型自带优先，其次供应商自带
+              builtins: Provider.builtinPackages,
               specifier: model.package ?? provider?.package,
               // 供应商 ID
               providerID,

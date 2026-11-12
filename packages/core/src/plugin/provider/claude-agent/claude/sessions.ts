@@ -50,9 +50,6 @@ export interface Request {
   // OpenCode 原生的 fork 谱系，或提供 compaction/generate 快照的会话。
   // Native OpenCode fork lineage, or the session supplying a compaction/generate snapshot.
   readonly sourceID?: string
-  // 是否为压缩（compaction）请求
-  readonly compaction?: boolean
-  // 模型 ID
   readonly model: string
   // 努力等级（可选）
   readonly effort?: Options["effort"]
@@ -417,6 +414,14 @@ export function registry() {
             if (part.type !== "tool_use") continue
             // 反查 OpenCode 原始工具名；非我们的工具跳过
             const name = ToolNames.original(part.name, request.tools)
+            if (!name && part.name.startsWith(ToolNames.PREFIX)) {
+              // A tool removed after this process started is still on its tool server; answer here so the turn goes on.
+              live.pending.expect(part.id, part.name)
+              live.pending.resolve(part.id, {
+                mcp: { isError: true, content: [{ type: "text", text: "This tool is no longer available." }] },
+                replacement: undefined,
+              })
+            }
             if (!name) continue
             // 在待处理协调器中预登记该调用
             live.pending.expect(part.id, part.name)
@@ -588,10 +593,6 @@ export function registry() {
       const source = entries.get(sourceID)
       // 复制操作
       const copy = Effect.gen(function* () {
-        // 压缩会终结旧的主上下文；generate 只做只读快照。
-        // Compaction ends the old primary context. Generate only takes a read-only snapshot.
-        if (request.compaction && source) yield* stop(source)
-        // 源记录：优先内存，其次从存储读取
         const record = source?.record ?? (yield* records.get(sourceID))
         // 执行分支复制
         return yield* branch(entry, request, record)
@@ -606,10 +607,11 @@ export function registry() {
     const prepare = Effect.fn("ClaudeSessions.prepare")(function* (entry: Entry, request: Request) {
       // 先退役已退出或不兼容的进程：一旦续接其停靠的轮次，open() 不得替换它。
       // Retire an exited or incompatible process first: once we continue its parked turn, open() must not replace it.
+      // A launch change waits for a parked turn to end: stopping it makes Claude Code record the waiting tool calls as
+      // refused by the user. A step without tools (the step limit) still stops it, since the old process offers them.
       if (entry.process) {
-        // 需要重启：进程已结束，或启动指纹不匹配
-        const needsRestart = entry.process.session.ended || entry.process.launch !== launch(request)
-        // 需要则停止旧进程
+        const parked = entry.process.waiting && entry.process.session.running && request.tools.length > 0
+        const needsRestart = entry.process.session.ended || (entry.process.launch !== launch(request) && !parked)
         if (needsRestart) yield* stop(entry)
       }
 
@@ -677,7 +679,8 @@ export function registry() {
       if (collected.aborted) {
         // 被停止的 OpenCode 轮次需要全新的 Claude 轮次；addUser 只会“引导”旧轮次。
         // A stopped OpenCode turn needs a fresh Claude turn; addUser would only steer the old one.
-        yield* interrupt(entry)
+        // After a launch change it also needs a new process.
+        yield* live.launch === launch(request) ? interrupt(entry) : stop(entry)
         return { start, continuation: undefined }
       }
       // 返回起始位置与续接信息

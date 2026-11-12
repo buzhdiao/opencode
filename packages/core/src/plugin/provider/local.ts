@@ -22,6 +22,8 @@ import { Model } from "../../model.js"
 import type { PluginInternal } from "../internal.js"
 // 导入设置折叠辅助函数
 import { foldSettings } from "./configured.js"
+import { activeCredential } from "./credential-settings.js"
+import { ProviderRefresh } from "./refresh.js"
 
 // 本地模型描述：发现逻辑产出的统一形状
 export type LocalModel = {
@@ -37,6 +39,8 @@ export type LocalModel = {
   readonly vision?: boolean
   // 上下文长度（可选）
   readonly context?: number | null
+  /** Decision models answer typed questions through the host's System One endpoint (`/v1/systemone`). */
+  readonly type?: "chat" | "decision"
 }
 
 // 本地发现客户端类型：由 createClient 的返回值推导
@@ -92,14 +96,12 @@ export function createLocalProviderPlugin<Discovered>(input: {
             : input.origin)
         // source：当前生效的端点/凭据配置（随配置更新而变）
         const source = { current: configured(yield* config.entries(), input.providerID, defaultOrigin, suffix) }
-        // loaded：最近一次成功加载的模型列表与其序列化哈希
-        const loaded = { models: [] as readonly Discovered[], hash: "[]" }
+        const loaded = { models: [] as readonly Discovered[], connected: false, hash: "[]" }
 
         // 集成目录变换：尚未发现模型时先移除该集成占位
         yield* ctx.integration.transform((integrations) => {
-          // 没有模型就不注册集成
-          if (loaded.models.length === 0) return
-          // 移除该提供商对应的集成条目
+          // A key connection lives on the integration (env keys only exist while it does), so keep it then.
+          if (loaded.models.length === 0 || loaded.connected) return
           integrations.remove(input.providerID)
         })
 
@@ -125,8 +127,7 @@ export function createLocalProviderPlugin<Discovered>(input: {
               provider: input.providerID,
               apiKey: source.current.apiKey ?? "",
             }
-            // 本地提供商不属于任何集成
-            provider.integrationID = undefined
+            if (!loaded.connected) provider.integrationID = undefined
           })
           // 逐个写入发现的模型
           for (const item of loaded.models) {
@@ -148,6 +149,10 @@ export function createLocalProviderPlugin<Discovered>(input: {
               }
               // 上下文长度为正数时才写入限制
               if (typeof spec.context === "number" && spec.context > 0) model.limit.context = spec.context
+              if (spec.type !== "decision") return
+              model.type = "decision"
+              model.package = "@opencode/ai/providers/openai-compatible/decisions"
+              model.capabilities.output = ["decision"]
             })
           }
         })
@@ -161,27 +166,21 @@ export function createLocalProviderPlugin<Discovered>(input: {
           // 在信号量保护下执行，避免并发重复探测
           return yield* discoveryLock.withPermit(
             Effect.gen(function* () {
-              // 读取缓存
+              // A key saved with /connect or set in the integration's env var wins over config, as it does for requests.
+              const active = yield* activeCredential(ctx, input.providerID)
+              const connected = active.connection !== undefined
+              const apiKey = active.credential?.type === "key" ? active.credential.key : current.apiKey
               const cached = discovery.get(current.root)
-              // 缓存存在、凭据一致且未超过间隔时直接返回
-              if (
-                cached &&
-                cached.apiKey === current.apiKey &&
-                Date.now() - cached.checked < Duration.toMillis(interval)
-              )
-                return { source: current, models: cached.models }
-              // 先占位记录检查时间（探活开始），凭据一致时保留旧模型
+              if (cached && cached.apiKey === apiKey && Date.now() - cached.checked < Duration.toMillis(interval))
+                return { source: current, connected, models: cached.models }
               discovery.set(current.root, {
                 checked: Date.now(),
-                apiKey: current.apiKey,
-                models: cached && cached.apiKey === current.apiKey ? cached.models : undefined,
+                apiKey,
+                models: cached && cached.apiKey === apiKey ? cached.models : undefined,
               })
-              // 真正调用子插件的发现函数
-              const models = yield* input.discover(createClient(http, current.root, current.apiKey, current.endpoint))
-              // 成功后写入新缓存
-              discovery.set(current.root, { checked: Date.now(), apiKey: current.apiKey, models })
-              // 返回发现结果
-              return { source: current, models }
+              const models = yield* input.discover(createClient(http, current.root, apiKey, current.endpoint))
+              discovery.set(current.root, { checked: Date.now(), apiKey, models })
+              return { source: current, connected, models }
             }),
           )
         })
@@ -192,12 +191,11 @@ export function createLocalProviderPlugin<Discovered>(input: {
           const result = yield* discover()
           // 没有模型或配置已过期（source 已变化）时跳过
           if (!result?.models || result.source !== source.current) return
-          // 序列化模型列表作为指纹
-          const hash = JSON.stringify(result.models)
-          // 指纹未变则无需重载
+          const hash = JSON.stringify([result.connected, result.models])
           if (hash === loaded.hash) return
           // 更新已加载的模型与指纹
           loaded.models = result.models
+          loaded.connected = result.connected
           loaded.hash = hash
           // 重载集成与提供商目录
           yield* ctx.integration.reload()
@@ -207,7 +205,7 @@ export function createLocalProviderPlugin<Discovered>(input: {
         // Keep the last successful inventory through transient outages instead of flickering model availability.
         // 周期性刷新：失败被忽略，服务短暂不可用时不闪烁模型可用性
         yield* refresh().pipe(Effect.ignore, Effect.repeat(Schedule.spaced(interval)), Effect.forkScoped)
-        // reload：配置更新后重新计算端点/凭据
+        yield* ProviderRefresh.onSwitch(input.providerID, refresh().pipe(Effect.ignore))
         const reload = Effect.fn("LocalProviderPlugin.reload")(function* () {
           // 重新折叠配置得到新设置
           const next = configured(yield* config.entries(), input.providerID, defaultOrigin, suffix)
@@ -221,6 +219,7 @@ export function createLocalProviderPlugin<Discovered>(input: {
           // 切换到新配置并清空已加载模型
           source.current = next
           loaded.models = []
+          loaded.connected = false
           loaded.hash = "[]"
           // 重载目录后立即刷新一次
           yield* ctx.integration.reload()

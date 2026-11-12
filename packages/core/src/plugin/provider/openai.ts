@@ -16,7 +16,7 @@ import { Credential } from "../../credential.js"
 import { Integration } from "../../integration.js"
 // 导入 OAuth 回调页面渲染工具
 import { OauthCallbackPage } from "../../oauth/page.js"
-// 导入 Provider 服务与 ID 常量
+import { OauthRedirect } from "../../oauth/redirect.js"
 import { Provider } from "../../provider.js"
 // 导入会话亲和性工具（提示缓存路由）
 import { SessionAffinity } from "../../session/affinity.js"
@@ -161,6 +161,7 @@ const browser = (app: App.Info) =>
             Effect.flatMap((value) => exchange(value, redirect, pkce, app)),
             Effect.map((tokens) => credential(browserMethodID, tokens)),
           ),
+          submit: OauthRedirect.submit({ state, callback: code, received: (value) => value }),
         }
       }),
     // 刷新逻辑：用刷新令牌换新令牌

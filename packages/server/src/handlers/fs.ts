@@ -18,7 +18,7 @@ import { HttpApiBuilder } from "effect/http-api"
 import path from "path"
 // 引入本服务 API 定义
 import { Api } from "../api"
-// 引入 response 辅助：响应中附带 location 信息
+import { ContentHeaders } from "../content-headers"
 import { response } from "../location"
 
 // 导出 FileSystemHandler：注册 "server.fs" 分组处理器
@@ -42,8 +42,7 @@ export const FileSystemHandler = HttpApiBuilder.group(Api, "server.fs", (handler
                 (error) => new FileNotFoundError({ path: error.path, message: `File not found: ${error.path}` }),
               ),
             )
-          // 以支持缓存校验与 Range 分段的方式返回文件
-          return serveFile(ctx.request, file)
+          return serveFile(ctx.request, file, ContentHeaders.download({ path, mime: file.mime }))
         }),
       )
       // 处理 fs.list：列出目录内容
@@ -140,9 +139,11 @@ function decodeRequestPath(url: string) {
   })
 }
 
-// 辅助函数：把读取到的文件作为 HTTP 响应返回，支持 ETag/Last-Modified 缓存校验与 Range 分段下载
-function serveFile(request: HttpServerRequest.HttpServerRequest, file: FileSystem.File) {
-  // 构造弱验证器格式的 ETag：由文件大小（16 进制）与修改时间（16 进制）组合
+function serveFile(
+  request: HttpServerRequest.HttpServerRequest,
+  file: FileSystem.File,
+  content: ReturnType<typeof ContentHeaders.download>,
+) {
   const etag = `W/"${file.size.toString(16)}-${Option.match(file.mtime, {
     // 没有修改时间时用 "0"
     onNone: () => "0",
@@ -160,8 +161,8 @@ function serveFile(request: HttpServerRequest.HttpServerRequest, file: FileSyste
     // 仅在存在修改时间时附带 Last-Modified 头
     ...(lastModified === undefined ? {} : { "last-modified": lastModified }),
   }
-  // 若客户端缓存仍有效（If-None-Match/If-Modified-Since 命中），返回 304 Not Modified 空响应
-  if (isNotModified(request, etag, lastModified)) return HttpServerResponse.empty({ status: 304, headers: validators })
+  if (isNotModified(request, etag, lastModified))
+    return HttpServerResponse.empty({ status: 304, headers: { ...validators, ...content } })
 
   // 仅对 GET 请求解析 Range 请求头
   const rangeHeader = request.method === "GET" ? request.headers["range"] : undefined
@@ -190,11 +191,8 @@ function serveFile(request: HttpServerRequest.HttpServerRequest, file: FileSyste
     headers: {
       // 展开缓存校验头
       ...validators,
-      // 声明支持字节范围请求
+      ...content,
       "accept-ranges": "bytes",
-      // 使用文件的 MIME 类型
-      "content-type": file.mime,
-      // 有 Range 时附带 Content-Range 说明返回的字节区间
       ...(range === undefined ? {} : { "content-range": `bytes ${range.start}-${range.end}/${file.size}` }),
     },
   })

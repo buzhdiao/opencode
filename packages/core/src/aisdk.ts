@@ -515,8 +515,7 @@ function modelFromLanguage(info: RuntimeInfo, language: LanguageModelV3) {
       prepare: (input) => Effect.succeed(input.body),
       execute: () => Effect.succeed({ frames: Stream.empty }),
     },
-    // 默认参数：请求头、模型级 body、提供者设置
-    defaults: {
+    options: {
       headers: info.headers,
       http: projected.body === undefined ? undefined : { body: { ...projected.body } },
       providerOptions: projected.settings,
@@ -580,7 +579,6 @@ function providerOptionKey(packageName: string | undefined, providerID: Provider
   // Mantle 走 openai 兼容形态
   if (packageName === "@ai-sdk/amazon-bedrock/mantle") return "openai"
   if (packageName === "@ai-sdk/azure") return "azure"
-  if (packageName === "@ai-sdk/github-copilot") return "copilot"
   if (packageName === "@jerome-benoit/sap-ai-provider-v2") return "sap-ai"
   // openai-compatible 包用提供者 ID 的首段作为键（不同主机互不冲突）
   if (packageName === "@ai-sdk/openai-compatible") return providerID.split(".")[0]

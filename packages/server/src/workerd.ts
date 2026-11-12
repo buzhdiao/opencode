@@ -83,9 +83,6 @@ export interface Options {
   // 替换 OpenCode 自身 HTTP 请求所用的 fetch，例如经由 Service Binding 路由
   /** Replaces `globalThis.fetch` for OpenCode's own HTTP requests, e.g. to route them through a Service Binding. */
   readonly fetch?: ServerOptions["fetch"]
-  // Console 配置刷新。此处 poll 默认 false，让空闲的 Durable Object 可以休眠
-  /** Console config refresh. `poll` defaults to `false` here, so an idle Durable Object can hibernate. */
-  readonly console?: ServerOptions["console"]
 }
 
 // 为 Durable Object 的 `fetch()` 构建 Web 标准 fetch 处理器。应用层会在调用方
@@ -128,8 +125,6 @@ export function serverOptions(options: Options): ServerOptions {
     models: options.models,
     // 透传自定义 fetch
     fetch: options.fetch,
-    // Console 轮询默认关闭（便于空闲休眠），调用者可显式覆盖
-    console: { poll: false, ...options.console },
   }
 }
 

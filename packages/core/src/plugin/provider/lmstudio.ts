@@ -5,9 +5,7 @@ import { createLocalProviderPlugin } from "./local.js"
 
 // 定义 LM Studio /api/v1/models 返回的单个模型条目的 Schema（结构校验）
 const RemoteModel = Schema.Struct({
-  // 模型类型：只关心 llm（文本生成）与 embedding（向量）两种
-  type: Schema.Literals(["llm", "embedding"]),
-  // 模型唯一键（即模型 ID）
+  type: Schema.String,
   key: Schema.String,
   // 展示名称
   display_name: Schema.String,
@@ -19,13 +17,13 @@ const RemoteModel = Schema.Struct({
       config: Schema.Struct({ context_length: Schema.Int }),
     }),
   ),
-  // 该模型支持的最大上下文长度
-  max_context_length: Schema.Int,
-  // 能力声明（可选）：是否支持视觉输入、是否为工具调用训练过
+  // Null for decision models whose context is unknown.
+  max_context_length: Schema.NullOr(Schema.Int),
   capabilities: Schema.Struct({
     vision: Schema.Boolean,
     trained_for_tool_use: Schema.Boolean,
   }).pipe(Schema.optional),
+  has_vision_adapter: Schema.Boolean.pipe(Schema.optional),
 })
 
 // 定义整个响应体的 Schema：包含模型数组
@@ -50,7 +48,7 @@ export const make = createLocalProviderPlugin({
       const response = yield* client.getJson("/api/v1/models", Response)
       // 过滤出真正的文本生成模型且 key 非空，再按 key 字典序排序
       return response.models
-        .filter((model) => model.type === "llm" && model.key.length > 0)
+        .filter((model) => (model.type === "llm" || model.type === "decision") && model.key.length > 0)
         .toSorted((a, b) => a.key.localeCompare(b.key))
     }),
   // 把发现的远端模型条目映射为 OpenCode 的模型描述
@@ -61,11 +59,9 @@ export const make = createLocalProviderPlugin({
     name: item.display_name || item.key,
     // 模型家族取架构字段
     family: item.architecture,
-    // 工具调用能力取决于服务端训练声明
+    type: item.type === "decision" ? "decision" : "chat",
     tools: item.capabilities?.trained_for_tool_use,
-    // 视觉能力取服务端声明
-    vision: item.capabilities?.vision,
-    // 上下文长度：未加载任何实例时用最大值；否则取所有已加载实例配置中的最小值（实际生效值）
+    vision: item.capabilities?.vision ?? item.has_vision_adapter,
     context:
       item.loaded_instances.length === 0
         ? item.max_context_length

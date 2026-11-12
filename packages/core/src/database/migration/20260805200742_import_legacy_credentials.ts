@@ -78,7 +78,7 @@ export function importLegacyCredentials(tx: Parameters<DatabaseMigration.Migrati
     const input = Option.getOrUndefined(decodeJson(content))
     // 内容必须是对象（键为集成标识）且不能是数组，否则迁移失败
     if (typeof input !== "object" || input === null || Array.isArray(input)) {
-      return yield* Effect.fail(new Error("Legacy credential file must contain an object"))
+      return yield* Effect.logWarning("Skipped legacy credential file that is not a JSON object", { path: filepath })
     }
 
     // origins：收集本次导入中出现的 well-known 凭据来源集成

@@ -71,9 +71,7 @@ const isPublicEvent = (event: Event.Payload): event is EventManifest.ServerEvent
   EventManifest.isServer(event) || isRpcEvent(event)
 // make：为指定插件构建插件上下文（Plugin.Context）
 export const make = Effect.fn("PluginHost.make")(function* (plugin: Pick<Interface, "list">, pluginID: string) {
-  // 获取应用元信息
-  const app = yield* App.Metadata
-  // 逐个获取插件上下文所需的各服务
+  const app = yield* App.Service
   const agents = yield* Agent.Service
   const artifacts = yield* Artifact.Service
   const aisdk = yield* AISDK.Service
@@ -976,9 +974,7 @@ export const make = Effect.fn("PluginHost.make")(function* (plugin: Pick<Interfa
       switchModel: sessions.switchModel,
       // prompt：向会话发送提示
       prompt: sessions.prompt,
-      // generate：在会话中生成文本
-      generate: (input) => sessions.generate(input).pipe(Effect.map((text) => ({ text }))),
-      // command：执行会话命令（参数名映射 name -> command）
+      generate: sessions.generate,
       command: (input) => sessions.command({ ...input, command: input.name }),
       // compact：压缩会话
       compact: sessions.compact,

@@ -6,7 +6,7 @@ import path from "path"
 import { isDeepStrictEqual } from "node:util"
 // jsonc-parser：JSONC 的解析与修改工具
 import { applyEdits, modify, type ParseError, parse } from "jsonc-parser"
-import { Context, Effect, FiberMap, Layer, Option, PubSub, Schema, Semaphore, Stream } from "effect"
+import { Context, Effect, FiberMap, Layer, Option, PubSub, Ref, Schema, Semaphore, Stream } from "effect"
 import { Directory, Document, Info, type Patch, type Entry, Event } from "@opencode/schema/config"
 import { Credential } from "./credential.js"
 import { Bus } from "./bus.js"
@@ -38,12 +38,6 @@ export interface Interface {
   /** Returns location config documents and discovery sources from lowest to highest priority. */
   // 返回位置配置文档与发现来源，按优先级从低到高排列
   readonly entries: () => Effect.Effect<Entry[]>
-  /**
-   * The entries `entries()` returns, read synchronously. Transforms read this, so a reload that runs right after a
-   * config change, such as an integration replacing its document, sees the change before `config.updated` arrives.
-   */
-  // 同步读取 entries() 的当前结果；重载转换器用它，确保配置变更后立即可见
-  readonly snapshot: () => Entry[]
   /** Compatibility roots consumed by internal compatibility plugins. */
   // 供内部兼容插件消费的兼容根目录（claude/agents）
   readonly compatibility?: () => Effect.Effect<{
@@ -114,33 +108,26 @@ export const testLayer = (
 ) =>
   Layer.effectContext(
     Effect.gen(function* () {
-      // 可变的测试状态：静态条目与集成文档映射
-      const state = { entries: initial, integrations: new Map<string, ConfigIntegration.Document>() }
-      // 无界发布订阅，承载变更
+      const entries = yield* Ref.make(initial)
+      const integrations = yield* Ref.make(new Map<string, ConfigIntegration.Document>())
       const updates = yield* PubSub.unbounded<Watcher.Update>()
-      // 快照 = 集成文档 + 静态条目
-      const snapshot = () => [...state.integrations.values(), ...state.entries]
       const service = Test.of({
-        // 惰性取快照
-        entries: () => Effect.sync(snapshot),
-        snapshot,
+        entries: () =>
+          Effect.all([Ref.get(integrations), Ref.get(entries)]).pipe(
+            Effect.map(([documents, entries]) => [...documents.values(), ...entries]),
+          ),
         compatibility: () => Effect.succeed(compatibility),
         // 变更流
         changes: () => Stream.fromPubSub(updates),
-        setEntries: (next) =>
-          Effect.sync(() => {
-            // 直接替换条目
-            state.entries = next
-          }),
-        // 向订阅者广播一条更新
+        setEntries: (next) => Ref.set(entries, next),
         emitChange: (update) => PubSub.publish(updates, update).pipe(Effect.asVoid),
         integration: (integrationID, document) =>
-          Effect.sync(() => {
-            const next = new Map(state.integrations)
-            // 先移除旧文档
+          Ref.update(integrations, (current) => {
+            // Like config, keeps the document it holds when handed a deep-equal one.
+            if (isDeepStrictEqual(current.get(integrationID), document)) return current
+            const next = new Map(current)
             next.delete(integrationID)
-            // 有新文档则写入
-            state.integrations = document ? next.set(integrationID, document) : next
+            return document ? next.set(integrationID, document) : next
           }),
       })
       // 同时以 Service 与 Test 两个令牌注册同一实现
@@ -199,16 +186,17 @@ export const layer = (options?: Options) =>
         }
         // 规范化输入（别名、弃用字段等）
         const result = ConfigNormalize.normalize(input)
-        yield* Effect.forEach(result.diagnostics, (diagnostic) =>
-          Effect.logWarning("configuration normalization diagnostic", {
-            // 逐条记录规范化诊断
+        // Every reload repeats the routine notes on a config that loads. A rejected config or a dropped malformed
+        // setting is the user's to fix, so those stay warnings.
+        yield* Effect.forEach(result.diagnostics, (diagnostic) => {
+          const log = result.type === "rejected" || diagnostic.kind === "invalid" ? Effect.logWarning : Effect.logDebug
+          return log("configuration normalization diagnostic", {
             source,
             path: diagnostic.path[0] === "$" ? "$" : `$.${diagnostic.path.join(".")}`,
             kind: diagnostic.kind,
             action: diagnostic.message,
-          }),
-        )
-        // 规范化判定拒绝则放弃
+          })
+        })
         if (result.type === "rejected") return
         // 最终校验解码
         const info = Option.getOrUndefined(decodeInfo(result.encoded))
@@ -242,12 +230,10 @@ export const layer = (options?: Options) =>
         const credential = (yield* credentials.list(entry.integrationID)).at(-1)
         // 仅 key 型凭据能提供环境变量
         const variables = auth && credential?.value.type === "key" ? { [auth.env]: credential.value.key } : undefined
-        // A failed refresh, including a missing credential, keeps the last resolved config so remote providers
-        // and allowlists do not disappear; only removing the source clears it.
-        // 刷新失败（含缺凭据）时保留上次解析结果，避免远端 provider 与允许列表突然消失
-        const configs = yield* (
-          variables ? wellknown.resolve(entry, variables) : Effect.fail(new Error("No usable wellknown credential"))
-        ).pipe(
+        // Logging out drops the saved remote config, so the source supplies nothing until a fresh fetch succeeds.
+        if (!variables) return yield* wellknown.clearCached(entry.origin).pipe(Effect.as([]))
+        // A failed refresh keeps the last resolved config so remote providers and allowlists do not disappear.
+        const configs = yield* wellknown.resolve(entry, variables).pipe(
           Effect.catch((error) =>
             Effect.logWarning("failed to load wellknown config", { source: entry.origin, error }).pipe(
               // 失败时回退到缓存
@@ -626,8 +612,6 @@ export const layer = (options?: Options) =>
           // 返回当前条目
           return configs
         }),
-        // 同步快照
-        snapshot: () => configs,
         compatibility: () =>
           Effect.all({
             // 过滤出真实存在的 claude 兼容目录

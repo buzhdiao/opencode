@@ -207,6 +207,8 @@ export type MediaError =
 // 解析器服务接口：解析默认/指定模型、图像模型与决策模型
 export interface Interface {
   readonly resolve: (requested?: Ref) => Effect.Effect<Resolved | undefined, Error>
+  /** The model used when nothing is selected: the configured default, or the first available text model. */
+  readonly fallback: () => Effect.Effect<Info | undefined>
   readonly resolveModel: (model: Info, variant?: VariantID) => Effect.Effect<Resolved, Error>
   /** An enabled image model by ref, or undefined when no image model has that ref. */
   // resolveImage：按引用取已启用的图像模型；不存在则返回 undefined
@@ -341,11 +343,10 @@ const resolveCatalogModel = Effect.fn("ModelResolver.resolveCatalogModel")(funct
         compatibility: resolved.compatibility
           ? Object.assign({}, runtime.compatibility, Struct.omit(resolved.compatibility, CAPABILITY_KEYS))
           : runtime.compatibility,
-        // Timeouts and body encoding are transport policy, so they land on the route's HTTP defaults instead of package settings.
-        // 超时与请求体编码属于传输策略，因此写入路由的 HTTP 默认值而不是包设置
-        defaults: {
-          ...runtime.defaults,
-          ...mergeTransport(runtime.defaults, {
+        // Timeouts and body encoding are transport policy, so they land on the model's options instead of package settings.
+        options: {
+          ...runtime.options,
+          ...mergeTransport(runtime.options, {
             timeout: { total: timeouts.timeout, headers: timeouts.headerTimeout, chunk: timeouts.chunkTimeout },
             http: { encoding: Provider.encoding(configured) },
           }),
@@ -688,35 +689,36 @@ export const layer = Layer.effect(
       )
       // 找不到则返回 undefined
       if (!info) return undefined
-      // 准备凭据与运行时信息
-      const { credential, runtimeInfo } = yield* prepare(info, ref.variant)
-      // 构建媒体模型
-      return yield* fromCatalogMedia(runtimeInfo, is, credential, dependencies)
+      const { provider, credential, runtimeInfo } = yield* prepare(info, ref.variant)
+      // Same no-key rule as chat in `load`. A built image or decision model can't have its auth swapped like chat,
+      // so the package gets `apiKey: false` up front and builds the model without auth.
+      const keyless =
+        provider?.activation === "enabled" &&
+        credential === undefined &&
+        !hasConfiguredAuth(runtimeInfo) &&
+        usesAPIKeyAuth(runtimeInfo.package)
+      return yield* fromCatalogMedia(
+        keyless ? { ...runtimeInfo, settings: { ...runtimeInfo.settings, apiKey: false } } : runtimeInfo,
+        is,
+        credential,
+        dependencies,
+      )
+    })
+    const fallback = Effect.fn("ModelResolver.fallback")(function* () {
+      const model = yield* models.default()
+      if (model && hasPackage(model)) return model
+      return (yield* models.available()).find((model) => hasPackage(model) && Model.supportsText(model))
     })
     // 返回服务实现
     return Service.of({
       // resolve：解析默认或指定的文本模型
       resolve: Effect.fn("ModelResolver.resolve")(function* (requested) {
-        // 指定了引用则直接取该模型；未指定则取默认模型，默认模型没有包（无法独立运行）时退而求其次
-        const selected = requested
-          ? yield* models.get(requested.providerID, requested.id)
-          : yield* models
-              .default()
-              .pipe(
-                Effect.flatMap((model) =>
-                  model && hasPackage(model)
-                    ? Effect.succeed(model)
-                    : Effect.map(models.available(), (models) =>
-                        models.find((model) => hasPackage(model) && Model.supportsText(model)),
-                      ),
-                ),
-              )
-        // 找不到任何可选模型：返回 undefined
+        const selected = requested ? yield* models.get(requested.providerID, requested.id) : yield* fallback()
         if (!selected) return undefined
         // 加载选定的模型
         return yield* load(selected, requested?.variant)
       }),
-      // resolveModel：即上面的 load
+      fallback,
       resolveModel: load,
       // resolveImage：解析图像模型
       resolveImage: Effect.fn("ModelResolver.resolveImage")(function* (ref) {
@@ -732,9 +734,12 @@ export const layer = Layer.effect(
 
 // hasConfiguredAuth：模型设置里是否配置了任一认证字段（apiKey/authToken/accessToken）
 function hasConfiguredAuth(model: RuntimeInfo) {
-  return [model.settings?.apiKey, model.settings?.authToken, model.settings?.accessToken].some(
-    (value) => typeof value === "string" && value !== "",
-  )
+  return [
+    model.settings?.apiKey,
+    model.settings?.gatewayApiKey,
+    model.settings?.authToken,
+    model.settings?.accessToken,
+  ].some((value) => typeof value === "string" && value !== "")
 }
 
 // 使用 API key 认证的包名集合（AI SDK 与 OpenCode 提供商包）
@@ -762,6 +767,7 @@ const API_KEY_AUTH_PACKAGES: ReadonlySet<string> = new Set([
   "@opencode/ai/providers/deepseek",
   "@opencode/ai/providers/fireworks",
   "@opencode/ai/providers/openai-compatible",
+  "@opencode/ai/providers/openai-compatible/decisions",
   "@opencode/ai/providers/google",
   "@opencode/ai/providers/google/interactions",
   "@opencode/ai/providers/groq",

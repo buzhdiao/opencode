@@ -25,7 +25,6 @@ import { Model } from "../model.js"
 import { Provider } from "../provider.js"
 import { Command } from "../command.js"
 import { Config } from "../config.js"
-import { ConsoleAccess } from "../console-access.js"
 import { Credential } from "../credential.js"
 // llmClient：LLM 客户端服务节点
 import { llmClient } from "../effect/app-node-platform.js"
@@ -57,6 +56,7 @@ import { Environment } from "../environment/index.js"
 import { FileAccess } from "../file-access.js"
 import { FileMutation } from "../file-mutation.js"
 import { FileWrite } from "../file-write.js"
+import { Flag } from "../flag.js"
 import { Formatter } from "../formatter.js"
 import { Generate } from "../generate.js"
 import { Form } from "../form.js"
@@ -95,6 +95,7 @@ import { EditTool } from "../tool/plugin/edit.js"
 import { GlobTool } from "../tool/plugin/glob.js"
 import { GrepTool } from "../tool/plugin/grep.js"
 import { ImageGenerateTool } from "../tool/plugin/image-generate.js"
+import { McpEventTools } from "../tool/plugin/mcp-events.js"
 import { McpResourceTools } from "../tool/plugin/mcp-resource.js"
 import { OpenCodeTools } from "../tool/plugin/opencode.js"
 import { QuestionTool } from "../tool/plugin/question.js"
@@ -118,6 +119,7 @@ import { AgentPlugin } from "./agent.js"
 import BrowserPlugin from "@opencode/plugin-browser"
 import { CommandPlugin } from "./command.js"
 import { IdentityPlugin } from "./identity.js"
+import { ForkNoticePlugin } from "./fork-notice.js"
 import { PlanPlugin } from "./plan.js"
 import { GoalPlugin } from "./goal.js"
 import { ModelsDevPlugin } from "./models-dev.js"
@@ -140,13 +142,8 @@ const services = [
   // 逐项列出各服务标识（Context.Tag）
   Agent.Service,
   // Activation clears the ambient context, so built-ins see the configured build channel only through this.
-  // 激活会清空环境上下文，内置功能只能通过这里看到所配置的构建渠道。
-  App.Metadata,
-  // HTTP 基础客户端
+  App.Service,
   FetchHttpClient.Fetch,
-  // Console 访问选项
-  ConsoleAccess.Options,
-  // 以下为核心服务
   Artifact.Service,
   AppProcess.Service,
   Provider.Service,
@@ -159,6 +156,7 @@ const services = [
   FileAccess.Service,
   FileMutation.Service,
   FileWrite.Service,
+  Flag.Service,
   Formatter.Service,
   Generate.Service,
   LocationWatcherPolicy.Service,
@@ -209,7 +207,6 @@ export const requirements = LayerNode.group([
   // 逐项列出各服务的节点定义
   Agent.node,
   App.node,
-  ConsoleAccess.node,
   Artifact.node,
   AppProcess.node,
   Provider.node,
@@ -222,6 +219,7 @@ export const requirements = LayerNode.group([
   FileAccess.node,
   FileMutation.node,
   FileWrite.node,
+  Flag.node,
   Formatter.node,
   Generate.node,
   LocationWatcherPolicy.node,
@@ -236,6 +234,7 @@ export const requirements = LayerNode.group([
   InstructionDiscovery.node,
   Integration.node,
   Job.node,
+  Shell.daemonNode,
   KV.node,
   // LLM 客户端节点
   llmClient,
@@ -287,7 +286,7 @@ const pre = [
   VcsGitPlugin.Plugin,
   // agent 能力插件
   AgentPlugin.Plugin,
-  // Plan 模式插件
+  ForkNoticePlugin.Plugin,
   PlanPlugin.Plugin,
   // 命令插件
   CommandPlugin.Plugin,
@@ -318,6 +317,7 @@ const pre = [
   GrepTool.Plugin,
   ImageGenerateTool.Plugin,
   OpenCodeTools.Plugin,
+  McpEventTools.Plugin,
   McpResourceTools.Plugin,
   QuestionTool.Plugin,
   ReadTool.Plugin,

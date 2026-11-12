@@ -24,7 +24,7 @@ import { IntegrationConnection } from "../../integration/connection.js"
 import { Model } from "../../model.js"
 // 导入 OAuth 回调页面渲染工具
 import { OauthCallbackPage } from "../../oauth/page.js"
-// 导入 Provider 服务与 ID 常量
+import { OauthRedirect } from "../../oauth/redirect.js"
 import { Provider } from "../../provider.js"
 // 导入内部插件类型声明（仅类型）
 import type { PluginInternal } from "../internal.js"
@@ -266,9 +266,8 @@ export const GitLabPlugin = define({
             // 生成随机 state 防 CSRF
             const state = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url")
 
-            // Deferred 用于等待回调服务器收到授权码
-            const callback = yield* Deferred.make<{ code: string; response: ServerResponse }, Error>()
-            // 惰性加载 node:http
+            // `response` is the browser's pending callback request; a pasted redirect has none.
+            const callback = yield* Deferred.make<{ code: string; response?: ServerResponse }, Error>()
             const { createServer } = yield* Effect.promise(() => import("node:http"))
             // 创建回调服务器：只接受 /callback 的 GET 请求
             const server = createServer((request, response) => {
@@ -327,7 +326,7 @@ export const GitLabPlugin = define({
                 const respond = (error?: string) =>
                   Effect.sync(() =>
                     request.response
-                      .writeHead(error ? 400 : 200, { "Content-Type": "text/html" })
+                      ?.writeHead(error ? 400 : 200, { "Content-Type": "text/html" })
                       .end(
                         error
                           ? OauthCallbackPage.error(error, { provider: "GitLab" })
@@ -351,10 +350,10 @@ export const GitLabPlugin = define({
                   Effect.tap(() => respond()),
                   Effect.tapError((error) => respond(error.message)),
                   // Bun's server.closeAllConnections() leaves an unanswered callback response pending.
-                  // Bun 下中断时强制销毁悬空的回调响应
-                  Effect.onInterrupt(() => Effect.sync(() => request.response.destroy())),
+                  Effect.onInterrupt(() => Effect.sync(() => request.response?.destroy())),
                 )
               }),
+              submit: OauthRedirect.submit({ state, callback, received: (code) => ({ code }) }),
             }
           }),
       })

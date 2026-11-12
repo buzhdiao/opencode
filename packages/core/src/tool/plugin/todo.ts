@@ -81,10 +81,8 @@ export const Plugin = {
     // Internal plugins are not re-run on config changes, so reload the tool transform instead.
     // 内部插件不会因配置变化而重跑，这里改用观察器在配置变化时重新执行工具注册
     const loaded = yield* ConfigEntryObserver.observe(config, ctx.event, ctx.tool.reload())
-    // 获取特性开关解析器
-    const flags = yield* Flag.resolver
-    // 判断 todo 工具是否被启用
-    const enabled = () => flags(loaded.entries).todo.enabled
+    const flags = yield* Flag.Service
+    const enabled = () => flags.resolve(loaded.entries).todo.enabled
 
     // 注册工具：仅在启用时写入工具定义
     yield* ctx.tool

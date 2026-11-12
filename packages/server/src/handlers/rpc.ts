@@ -1,8 +1,5 @@
 // 引入 RPC 核心服务：调用插件注册的自定义方法
 import { Rpc } from "@opencode/core/rpc"
-// 引入插件服务：等待插件激活
-import { Plugin } from "@opencode/core/plugin"
-// 引入协议层错误：RPC 错误与 RPC 内部错误
 import { RpcError, RpcInternalError } from "@opencode/protocol/errors"
 // 引入 Effect 运行时
 import { Effect } from "effect"
@@ -16,9 +13,6 @@ export const RpcHandler = HttpApiBuilder.group(Api, "server.rpc", (handlers) =>
   // 处理 rpc.call：按 RPC ID 与方法名调用插件注册的方法
   handlers.handle("rpc.call", ({ params, payload }) =>
     Effect.gen(function* () {
-      // 等待插件激活完成（RPC 由插件注册）
-      yield* Plugin.awaitActivation
-      // 获取 RPC 服务
       const rpc = yield* Rpc.Service
       // 执行调用：入参为 RPC ID、方法名与请求负载
       const output = yield* rpc.call(params.rpcID, params.method, payload.input)

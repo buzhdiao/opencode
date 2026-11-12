@@ -22,7 +22,14 @@ ${hasMoreTools ? `The catalog is partial. Before calling a tool that is not list
 
 ## Code Mode tools (call only inside \`execute\`)`
 
-// 导出 render：把目录摘要渲染成完整的指令文本
+// Sent once, when tools arrive that the catalog cannot list in full, so the model learns about `search`.
+// prettier-ignore
+const searchNote = `You can also look up tools that aren't listed with the global \`search(...)\` function inside \`execute\`. Before calling a tool that is not listed, find it this way. Do not guess tool names. Each result's \`path\` is the complete call expression: write it out as code, for example \`await tools.ns.tool_name({ ... })\`. Do not use it as a key such as \`tools[path]\`.
+
+- ${searchSignature}`
+
+const UPDATE_BUDGET = 1_000
+
 export function render(catalog: CodeModeCatalog.Summary) {
   // 没有任何工具时返回专门说明：不要调用 execute
   if (catalog.total === 0)
@@ -33,134 +40,119 @@ export function render(catalog: CodeModeCatalog.Summary) {
     return [CodeModeCatalog.namespaceLine(namespace), ...namespace.entries.map((entry) => entry.line)]
   })
 
-  // 返回提示词：标题段（含是否需要 search 的说明）+ 工具清单
-  return `${prompt(catalog.shown < catalog.total)}
+  return `${prompt(!complete(catalog))}
 
 ${tools.join("\n")}`
 }
 
-// 导出 update：对比前后两次目录摘要，生成"最小必要"的变更提示
-export function update(previous: CodeModeCatalog.Summary, current: CodeModeCatalog.Summary) {
-  // 准备"整体替换"文本：告知旧目录作废，附上新目录全文
+// An update names what changed for the model: namespaces and tools that came or went, and signatures it was shown
+// that changed, even if they are no longer shown. Shown tools shifting because other namespaces came or went is left
+// out. New signatures share a fixed budget while the catalog is partial, and the rest are counted.
+export function update(
+  previous: CodeModeCatalog.Summary,
+  current: CodeModeCatalog.Summary,
+  lookup: (path: string) => CodeModeCatalog.Listing | undefined,
+) {
   const replacement = `The Code Mode tool catalog has changed. This catalog supersedes the previous Code Mode tool catalog.
 
 ${render(current)}`
-  // 新目录为空：直接用替换文本
-  if (current.total === 0) return replacement
-  // 判断前后目录是否都为"完整展示"（shown === total）
-  const previousComplete = previous.shown === previous.total
-  const currentComplete = current.shown === current.total
-  // 完整性发生变化（从完整变部分或反之）：需要整体替换
-  if (previousComplete !== currentComplete) return replacement
+  if (current.total === 0 || previous.total === 0) return replacement
 
-  // 先比较命名空间描述的差异（按命名空间名对齐）
-  const descriptions = Instructions.diffByKey(
-    previous.namespaces.filter((namespace) => namespace.description !== undefined),
-    current.namespaces.filter((namespace) => namespace.description !== undefined),
+  const namespaces = Instructions.diffByKey(
+    previous.namespaces,
+    current.namespaces,
     (namespace) => namespace.name,
     (before, after) => before.description !== after.description,
   )
-  // 描述有增删改：需要整体替换
-  if (descriptions.added.length > 0 || descriptions.removed.length > 0 || descriptions.changed.length > 0)
-    return replacement
-
-  // 再比较全部条目行的差异（按 path 对齐）
-  const diff = Instructions.diffByKey(
-    previous.namespaces.flatMap((namespace) => namespace.entries),
-    current.namespaces.flatMap((namespace) => namespace.entries),
-    (entry) => entry.path,
-    (before, after) => before.line !== after.line,
+  // A namespace whose description changed is restated as if new.
+  const restated = [...namespaces.added, ...namespaces.changed.map((change) => change.current)]
+  const unchanged = new Set(
+    current.namespaces
+      .map((namespace) => namespace.name)
+      .filter((name) => !restated.some((item) => item.name === name)),
   )
-  // 条目是否有任何变化
-  const entriesChanged = diff.added.length > 0 || diff.removed.length > 0 || diff.changed.length > 0
+  const kept = (path: string) => unchanged.has(path.split(".", 1)[0] ?? path)
+  const before = new Set(previous.namespaces.flatMap((namespace) => namespace.tools))
+  const after = new Set(current.namespaces.flatMap((namespace) => namespace.tools))
+  const added = [...after].filter((path) => kept(path) && !before.has(path))
+  const removed = [...before].filter((path) => kept(path) && !after.has(path))
+  const changed = previous.namespaces
+    .flatMap((namespace) => namespace.entries)
+    .filter((entry) => kept(entry.path) && after.has(entry.path))
+    .flatMap((entry) => {
+      const listing = lookup(entry.path)
+      return listing === undefined || listing.line === entry.line ? [] : [listing]
+    })
+  const budget = complete(current) ? Infinity : UPDATE_BUDGET / (restated.length + (added.length > 0 ? 1 : 0) || 1)
 
-  // 当前目录只展示了部分工具（部分目录模式）
-  if (!currentComplete) {
-    // 条目有变化：整体替换（部分模式下不做细粒度提示）
-    if (entriesChanged) return replacement
-    // 再比较各命名空间的工具数量差异
-    const namespaces = Instructions.diffByKey(
-      previous.namespaces,
-      current.namespaces,
-      (namespace) => namespace.name,
-      (before, after) => before.count !== after.count,
-    )
-    // 数量是否有任何增删改
-    const changed = namespaces.added.length > 0 || namespaces.removed.length > 0 || namespaces.changed.length > 0
-    // 没有任何变化却走到这里：仍需替换（保守处理）
-    if (!changed) return replacement
-
-    // 开始拼接增量提示文本
-    const parts = ["The Code Mode tool catalog has changed."]
-    // 有新增命名空间：列出名字与工具数
-    if (namespaces.added.length > 0) {
-      parts.push(
-        `New tool namespaces are available: ${namespaces.added
-          .map((namespace) => `\`${namespace.name}\` (${namespace.count} tools)`)
-          .join(", ")}.`,
-      )
-    }
-    // 有数量变化的命名空间：提示需要重新 search
-    if (namespaces.changed.length > 0) {
-      parts.push(
-        `The following namespace inventories changed; search them again before relying on previous results: ${namespaces.changed
-          .map((change) => `\`${change.current.name}\` now has ${change.current.count} tools`)
-          .join(", ")}.`,
-      )
-    }
-    // 有被移除的命名空间：明确禁止继续使用
-    if (namespaces.removed.length > 0) {
-      parts.push(
-        `The following tool namespaces are no longer available and must not be used: ${namespaces.removed
-          .map((namespace) => `\`${namespace.name}\``)
-          .join(", ")}.`,
-      )
-    }
-    // 把各段拼成增量文本
-    const delta = parts.join("\n\n")
-    // 增量文本更短则用增量，否则退回整体替换
-    if (delta.length < replacement.length) return delta
-    return replacement
-  }
-
-  // 完整目录模式下：条目没变则无需任何提示，返回整体替换文本（由调用方判断是否真正变化）
-  if (!entriesChanged) return replacement
-  // 开始拼接条目级增量提示
   const parts = ["The Code Mode tool catalog has changed."]
-  // 有新增工具：逐行列出其展示行
-  if (diff.added.length > 0) {
+  if (restated.length > 0) {
+    parts.push(
+      [
+        "New tools are available:",
+        ...restated.map((namespace) => {
+          const shown = fit(
+            namespace.tools.flatMap((path) => lookup(path) ?? []),
+            budget,
+          )
+          return [CodeModeCatalog.namespaceLine(namespace, shown.length), ...shown.map((entry) => entry.line)].join(
+            "\n",
+          )
+        }),
+      ].join("\n"),
+    )
+  }
+  if (added.length > 0) {
+    const shown = fit(
+      added.flatMap((path) => lookup(path) ?? []),
+      budget,
+    )
+    const rest = added.length - shown.length
     parts.push(
       [
         "New tools are available in addition to those previously listed:",
-        ...diff.added.map((entry) => entry.line),
+        ...shown.map((entry) => entry.line),
+        ...(rest === 0 ? [] : [`  - ${rest} more; search for them`]),
       ].join("\n"),
     )
   }
-  // 有变化的工具：声明新行覆盖旧行
-  if (diff.changed.length > 0) {
+  if (complete(previous) && !complete(current)) parts.push(searchNote)
+  if (changed.length > 0) {
     parts.push(
-      [
-        "Changed tool listings supersede the previously listed ones:",
-        ...diff.changed.map((change) => change.current.line),
-      ].join("\n"),
+      ["Changed tool listings supersede the previously listed ones:", ...changed.map((entry) => entry.line)].join("\n"),
     )
   }
-  // 有被移除的工具：以调用表达式的形式明确禁止
-  if (diff.removed.length > 0) {
+  if (removed.length > 0) {
     parts.push(
-      `The following tools are no longer available and must not be called: ${diff.removed
-        .map((entry) => toolExpression(entry.path))
+      `The following tools are no longer available and must not be called: ${removed.map(toolExpression).join(", ")}.`,
+    )
+  }
+  if (namespaces.removed.length > 0) {
+    parts.push(
+      `The following tool namespaces are no longer available and must not be used: ${namespaces.removed
+        .map((namespace) => `\`${namespace.name}\``)
         .join(", ")}.`,
     )
   }
-  // 把各段拼成增量文本
+  if (parts.length === 1) return undefined
   const delta = parts.join("\n\n")
   // 增量更短则用增量，否则退回整体替换
   if (delta.length < replacement.length) return delta
   return replacement
 }
 
-// 定义本指令段在指令集合中的键
+function complete(catalog: CodeModeCatalog.Summary) {
+  return catalog.namespaces.every((namespace) => namespace.entries.length === namespace.tools.length)
+}
+
+/** The leading listings whose cost fits `budget`. */
+function fit(listings: ReadonlyArray<CodeModeCatalog.Listing>, budget: number) {
+  const totals: number[] = []
+  for (const entry of listings) totals.push((totals.at(-1) ?? 0) + CodeModeCatalog.cost(entry.line))
+  const end = totals.findIndex((total) => total > budget)
+  return end === -1 ? listings : listings.slice(0, end)
+}
+
 const key = Instructions.Key.make("core/codemode")
 // 构建目录摘要的 JSON 编解码器（跨请求持久化/比较用）
 const codec = Schema.toCodecJson(CodeModeCatalog.Summary)
@@ -178,9 +170,9 @@ export const make = (inventory?: CodeModeCatalog.Inventory): Instructions.List =
     render: {
       // 初始渲染用 render
       initial: render,
-      // 变化时用 update 生成差异提示
-      changed: update,
-      // 被移除时的提示文本
+      // Rendered once, against the inventory that produced `current`, and stored with the update.
+      changed: (previous, current) =>
+        update(previous, current, inventory === undefined ? () => undefined : CodeModeCatalog.lookup(inventory)),
       removed: () => "Code Mode tools are no longer available. Do not use any previously listed Code Mode tools.",
     },
   })
